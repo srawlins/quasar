@@ -21,10 +21,54 @@ class InboxView extends StatelessWidget {
   final ValueChanged<InboxItem> onPrecomputeItem;
   final void Function(InboxItem item, String action) onItemAction;
 
+  Widget _buildScopeRow({
+    required String label,
+    required bool watchValue,
+    required bool autoValue,
+    required ValueChanged<bool> onWatchChanged,
+    required ValueChanged<bool> onAutoChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(fontSize: 12.2, color: Color(0xFFE6EDF3)),
+            ),
+          ),
+          SizedBox(
+            width: 68,
+            child: Center(
+              child: Checkbox(
+                visualDensity: VisualDensity.compact,
+                value: watchValue,
+                onChanged: (bool? v) => onWatchChanged(v ?? false),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 86,
+            child: Center(
+              child: Checkbox(
+                visualDensity: VisualDensity.compact,
+                value: autoValue,
+                onChanged: (bool? v) => onAutoChanged(v ?? false),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _showSettingsDialog(BuildContext context) async {
     final InboxSettings cfg = inbox.settings;
     String mode = cfg.mode;
     String effort = cfg.effort;
+    String authoredPrMode =
+        cfg.authoredPrMode == 'all_open' ? 'all_open' : 'feedback_only';
     final TextEditingController pollCtrl =
         TextEditingController(text: '${cfg.pollIntervalMinutes}');
     final TextEditingController maxCycleCtrl =
@@ -37,9 +81,24 @@ class InboxView extends StatelessWidget {
         TextEditingController(text: '${cfg.onlyUpdatedWithinDays}');
     final TextEditingController reposCtrl =
         TextEditingController(text: cfg.watchedRepos.join(', '));
+    final TextEditingController customQueryCtrl =
+        TextEditingController(text: cfg.customQuery);
+    final TextEditingController extraFlagsCtrl =
+        TextEditingController(text: cfg.extraSearchFlags);
     bool watchReq = cfg.watchReviewRequested;
-    bool watchInvolved = cfg.watchInvolvedPrs;
+    bool autoReq = cfg.autoReviewReviewRequested;
+    bool watchRevBy = cfg.watchReviewedBy;
+    bool autoRevBy = cfg.autoReviewReviewedBy;
+    bool watchComm = cfg.watchCommented;
+    bool autoComm = cfg.autoReviewCommented;
+    bool watchMent = cfg.watchMentioned;
+    bool autoMent = cfg.autoReviewMentioned;
     bool watchAuth = cfg.watchAuthoredPrs;
+    bool autoAuth = cfg.autoReviewAuthoredPrs;
+    bool watchRepos = cfg.watchWatchedRepos;
+    bool autoRepos = cfg.autoReviewWatchedRepos;
+    bool watchCustom = cfg.watchCustomQuery;
+    bool autoCustom = cfg.autoReviewCustomQuery;
     bool restrictRepos = cfg.restrictToWatchedRepos;
     bool includeDrafts = cfg.includeDrafts;
     bool commentsOnly = cfg.commentsOnly;
@@ -50,17 +109,221 @@ class InboxView extends StatelessWidget {
         builder: (BuildContext ctx, StateSetter setModal) => AlertDialog(
           title: const Text('⚙️ PR Inbox & Background Auto-Review Settings'),
           content: SizedBox(
-            width: 520,
+            width: 580,
             child: SingleChildScrollView(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: <Widget>[
                   const Text(
-                    'Configure trigger scope, cadence, and token caps so large queues trickle safely one PR at a time.',
+                    'Choose separately which PR flags sync into your Inbox (0 tokens) vs. which subset automatically runs background reviews.',
                     style: TextStyle(fontSize: 12.5, color: Color(0xFF8B949E)),
                   ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0D1117),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFF30363D)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        const Row(
+                          children: <Widget>[
+                            Expanded(
+                              child: Text(
+                                'GITHUB PR SOURCE / FLAG',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF8B949E),
+                                ),
+                              ),
+                            ),
+                            SizedBox(
+                              width: 68,
+                              child: Text(
+                                '📥 Inbox',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF8B949E),
+                                ),
+                              ),
+                            ),
+                            SizedBox(
+                              width: 86,
+                              child: Text(
+                                '⚡ Auto-Review',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF58A6FF),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Divider(height: 12, color: Color(0xFF30363D)),
+                        _buildScopeRow(
+                          label:
+                              'Requesting my review (review-requested:@me)',
+                          watchValue: watchReq,
+                          autoValue: autoReq,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchReq = v;
+                            if (!v) autoReq = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoReq = v;
+                            if (v) watchReq = true;
+                          }),
+                        ),
+                        _buildScopeRow(
+                          label:
+                              'Previously reviewed by me (reviewed-by:@me)',
+                          watchValue: watchRevBy,
+                          autoValue: autoRevBy,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchRevBy = v;
+                            if (!v) autoRevBy = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoRevBy = v;
+                            if (v) watchRevBy = true;
+                          }),
+                        ),
+                        _buildScopeRow(
+                          label: 'Commented on by me (commenter:@me)',
+                          watchValue: watchComm,
+                          autoValue: autoComm,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchComm = v;
+                            if (!v) autoComm = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoComm = v;
+                            if (v) watchComm = true;
+                          }),
+                        ),
+                        _buildScopeRow(
+                          label:
+                              'Mentioning / assigned to me (mentions:@me, assignee:@me)',
+                          watchValue: watchMent,
+                          autoValue: autoMent,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchMent = v;
+                            if (!v) autoMent = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoMent = v;
+                            if (v) watchMent = true;
+                          }),
+                        ),
+                        _buildScopeRow(
+                          label: 'My own open PRs (author:@me)',
+                          watchValue: watchAuth,
+                          autoValue: autoAuth,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchAuth = v;
+                            if (!v) autoAuth = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoAuth = v;
+                            if (v) watchAuth = true;
+                          }),
+                        ),
+                        _buildScopeRow(
+                          label:
+                              'Watched repositories below (when not restrict-only)',
+                          watchValue: watchRepos,
+                          autoValue: autoRepos,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchRepos = v;
+                            if (!v) autoRepos = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoRepos = v;
+                            if (v) watchRepos = true;
+                          }),
+                        ),
+                        _buildScopeRow(
+                          label: 'Custom GitHub search query below',
+                          watchValue: watchCustom,
+                          autoValue: autoCustom,
+                          onWatchChanged: (bool v) => setModal(() {
+                            watchCustom = v;
+                            if (!v) autoCustom = false;
+                          }),
+                          onAutoChanged: (bool v) => setModal(() {
+                            autoCustom = v;
+                            if (v) watchCustom = true;
+                          }),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: authoredPrMode,
+                    decoration: const InputDecoration(
+                      labelText: 'My Own PRs (author:@me) Trigger Mode',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: const <DropdownMenuItem<String>>[
+                      DropdownMenuItem<String>(
+                        value: 'feedback_only',
+                        child: Text(
+                          'Only when external comments / reviews exist',
+                        ),
+                      ),
+                      DropdownMenuItem<String>(
+                        value: 'all_open',
+                        child: Text('All my open PRs (self-review on push)'),
+                      ),
+                    ],
+                    onChanged: (String? v) =>
+                        setModal(() => authoredPrMode = v ?? 'feedback_only'),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: customQueryCtrl,
+                    decoration: const InputDecoration(
+                      labelText:
+                          'Custom GitHub Search Query (optional — supports @me)',
+                      hintText:
+                          'e.g. repo:acme/backend label:security -label:wip',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: extraFlagsCtrl,
+                    decoration: const InputDecoration(
+                      labelText:
+                          'Extra GitHub Search Flags Applied to All Queries (optional)',
+                      hintText:
+                          'e.g. -label:do-not-merge -author:app/dependabot',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: reposCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Watched Repos (optional owner/repo, ...)',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
                   Row(
                     children: <Widget>[
                       Expanded(
@@ -177,49 +440,7 @@ class InboxView extends StatelessWidget {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: reposCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'Watched Repos (optional owner/repo, ...)',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
                   const SizedBox(height: 8),
-                  CheckboxListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    value: watchReq,
-                    onChanged: (bool? v) =>
-                        setModal(() => watchReq = v ?? true),
-                    title: const Text(
-                      'Watch PRs requesting my review (review-requested:@me)',
-                      style: TextStyle(fontSize: 12.5),
-                    ),
-                  ),
-                  CheckboxListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    value: watchInvolved,
-                    onChanged: (bool? v) =>
-                        setModal(() => watchInvolved = v ?? true),
-                    title: const Text(
-                      'Watch PRs involving me — mentions, prior reviews, triage (involves:@me)',
-                      style: TextStyle(fontSize: 12.5),
-                    ),
-                  ),
-                  CheckboxListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    value: watchAuth,
-                    onChanged: (bool? v) =>
-                        setModal(() => watchAuth = v ?? true),
-                    title: const Text(
-                      'Watch my open PRs with new comments / changes requested',
-                      style: TextStyle(fontSize: 12.5),
-                    ),
-                  ),
                   CheckboxListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
@@ -227,7 +448,7 @@ class InboxView extends StatelessWidget {
                     onChanged: (bool? v) =>
                         setModal(() => restrictRepos = v ?? false),
                     title: const Text(
-                      'Restrict @me queue only to Watched Repos above',
+                      'Restrict @me queries only to Watched Repos above',
                       style: TextStyle(fontSize: 12.5),
                     ),
                   ),
@@ -274,15 +495,29 @@ class InboxView extends StatelessWidget {
     final Map<String, dynamic> payload = <String, dynamic>{
       'mode': mode,
       'effort': effort,
+      'authoredPrMode': authoredPrMode,
       'pollIntervalMinutes': int.tryParse(pollCtrl.text.trim()) ?? 15,
       'maxReviewsPerCycle': int.tryParse(maxCycleCtrl.text.trim()) ?? 1,
       'maxReviewsPerDay': int.tryParse(maxDayCtrl.text.trim()) ?? 6,
       'maxConcurrency': int.tryParse(concCtrl.text.trim()) ?? 1,
       'onlyUpdatedWithinDays': int.tryParse(recencyCtrl.text.trim()) ?? 14,
       'watchedRepos': reposCtrl.text.trim(),
+      'customQuery': customQueryCtrl.text.trim(),
+      'extraSearchFlags': extraFlagsCtrl.text.trim(),
       'watchReviewRequested': watchReq,
-      'watchInvolvedPrs': watchInvolved,
+      'autoReviewReviewRequested': autoReq,
+      'watchReviewedBy': watchRevBy,
+      'autoReviewReviewedBy': autoRevBy,
+      'watchCommented': watchComm,
+      'autoReviewCommented': autoComm,
+      'watchMentioned': watchMent,
+      'autoReviewMentioned': autoMent,
       'watchAuthoredPrs': watchAuth,
+      'autoReviewAuthoredPrs': autoAuth,
+      'watchWatchedRepos': watchRepos,
+      'autoReviewWatchedRepos': autoRepos,
+      'watchCustomQuery': watchCustom,
+      'autoReviewCustomQuery': autoCustom,
       'restrictToWatchedRepos': restrictRepos,
       'includeDrafts': includeDrafts,
       'commentsOnly': commentsOnly,
@@ -293,6 +528,8 @@ class InboxView extends StatelessWidget {
     concCtrl.dispose();
     recencyCtrl.dispose();
     reposCtrl.dispose();
+    customQueryCtrl.dispose();
+    extraFlagsCtrl.dispose();
 
     if (saved == true) {
       onSaveSettings(payload);
@@ -305,6 +542,24 @@ class InboxView extends StatelessWidget {
     final String dayCap = inbox.maxReviewsPerDay > 0
         ? '${inbox.reviewsRunToday}/${inbox.maxReviewsPerDay} today'
         : '${inbox.reviewsRunToday} today (∞)';
+    final List<String> autoActiveLabels = <String>[
+      if (cfg.autoReviewReviewRequested && cfg.watchReviewRequested) 'Requested',
+      if (cfg.autoReviewReviewedBy && cfg.watchReviewedBy) 'Reviewed',
+      if (cfg.autoReviewCommented && cfg.watchCommented) 'Commented',
+      if (cfg.autoReviewMentioned && cfg.watchMentioned) 'Mentioned',
+      if (cfg.autoReviewAuthoredPrs && cfg.watchAuthoredPrs) 'My PRs',
+      if (cfg.autoReviewWatchedRepos &&
+          cfg.watchWatchedRepos &&
+          cfg.watchedRepos.isNotEmpty)
+        'Watched Repos',
+      if (cfg.autoReviewCustomQuery &&
+          cfg.watchCustomQuery &&
+          cfg.customQuery.trim().isNotEmpty)
+        'Custom Query',
+    ];
+    final String autoSummary = cfg.mode == 'sync_queue_only'
+        ? 'Off (Sync Only)'
+        : (autoActiveLabels.isEmpty ? 'None' : autoActiveLabels.join(' + '));
 
     const List<({String key, String label, Color color})> groups =
         <({String key, String label, Color color})>[
@@ -414,7 +669,7 @@ class InboxView extends StatelessWidget {
                         onPressed: () => _showSettingsDialog(context),
                         icon: const Icon(Icons.settings_outlined, size: 15),
                         label: const Text(
-                          'Settings & Token Caps',
+                          'Settings & Auto-Review Flags',
                           style: TextStyle(fontSize: 12),
                         ),
                       ),
@@ -438,6 +693,7 @@ class InboxView extends StatelessWidget {
                         ? 'Mode: Sync Only (0 Tokens)'
                         : 'Mode: ${cfg.effort.toUpperCase()} Precompute',
                   ),
+                  _MetaChip(text: 'Auto-Review: $autoSummary'),
                   _MetaChip(text: 'Every ${cfg.pollIntervalMinutes}m'),
                   _MetaChip(text: 'Max ${cfg.maxReviewsPerCycle}/cycle'),
                   _MetaChip(text: 'Daily Cap: $dayCap'),
@@ -530,12 +786,15 @@ class InboxView extends StatelessWidget {
                                   ),
                                   const SizedBox(height: 3),
                                   Text(
-                                    (it.headSha.isNotEmpty ||
-                                            it.changedFilesCount > 0 ||
-                                            it.additions > 0 ||
-                                            it.deletions > 0)
-                                        ? '@${it.author} • +${it.additions}/-${it.deletions} (${it.changedFilesCount} files)'
-                                        : '@${it.author}',
+                                    <String>[
+                                      '@${it.author}',
+                                      if (it.roleLabel.isNotEmpty) it.roleLabel,
+                                      if (it.headSha.isNotEmpty ||
+                                          it.changedFilesCount > 0 ||
+                                          it.additions > 0 ||
+                                          it.deletions > 0)
+                                        '+${it.additions}/-${it.deletions} (${it.changedFilesCount} files)',
+                                    ].join(' • '),
                                     style: const TextStyle(
                                       fontFamily: 'monospace',
                                       fontSize: 11,

@@ -1740,18 +1740,37 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         { key: 'deleted', title: '🗑️ Deleted Reviews (Re-Queue or Re-Review)', cls: 'text-[var(--q-muted)]' },
       ];
 
+      const roleBadgeMap = {
+        reviewer: { text: 'Review Requested', cls: 'text-blue-300 border-blue-500/40' },
+        reviewed_by: { text: 'Reviewed', cls: 'text-[var(--q-muted)]' },
+        commented: { text: 'Commented', cls: 'text-[var(--q-muted)]' },
+        mentioned: { text: 'Mentioned/Assigned', cls: 'text-[var(--q-muted)]' },
+        involved: { text: 'Involved', cls: 'text-[var(--q-muted)]' },
+        custom_query: { text: 'Custom Query', cls: 'text-purple-300 border-purple-500/40' },
+        watched_repo: { text: 'Watched Repo', cls: 'text-[var(--q-muted)]' },
+      };
+      const autoActiveLabels = [];
+      if (cfg.autoReviewReviewRequested !== false && cfg.watchReviewRequested !== false) autoActiveLabels.push('Requested');
+      if (cfg.autoReviewReviewedBy && cfg.watchReviewedBy !== false) autoActiveLabels.push('Reviewed');
+      if (cfg.autoReviewCommented && cfg.watchCommented !== false) autoActiveLabels.push('Commented');
+      if (cfg.autoReviewMentioned && cfg.watchMentioned !== false) autoActiveLabels.push('Mentioned');
+      if (cfg.autoReviewAuthoredPrs && cfg.watchAuthoredPrs !== false) autoActiveLabels.push('My PRs');
+      if (cfg.autoReviewWatchedRepos && cfg.watchWatchedRepos !== false && (cfg.watchedRepos || []).length) autoActiveLabels.push('Watched Repos');
+      if (cfg.autoReviewCustomQuery && cfg.watchCustomQuery !== false && String(cfg.customQuery || '').trim()) autoActiveLabels.push('Custom Query');
+
       const groupsHtml = groupsDef.map((g) => {
         const gItems = items.filter((i) => i.inboxGroup === g.key);
         if (!gItems.length) return '';
         const rows = gItems.map((it) => {
           const isReady = it.status === 'ready' || it.status === 'quarantined';
+          const rb = roleBadgeMap[it.role];
           return `
             <div class="p-3 rounded-lg border border-[var(--q-border)] bg-black/25 flex flex-wrap items-center justify-between gap-3">
               <div class="space-y-1 min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-2 text-xs">
                   ${it.unread ? '<span class="q-badge text-emerald-300 border-emerald-500/40">● New</span>' : ''}
                   ${it.updatedSinceLastReview ? '<span class="q-badge text-amber-300 border-amber-500/40">🔄 Updated</span>' : ''}
-                  ${it.role === 'involved' ? '<span class="q-badge text-[var(--q-muted)]">Involved</span>' : ''}
+                  ${rb ? `<span class="q-badge ${rb.cls}">${esc(it.roleLabel || rb.text)}</span>` : ''}
                   <span class="font-bold">${esc(it.owner)}/${esc(it.repo)}#${it.number}: ${esc(it.title || '')}</span>
                   <span class="text-[var(--q-muted)] font-mono">${(it.headSha || it.changedFilesCount || it.additions || it.deletions) ? `+${it.additions || 0}/-${it.deletions || 0} (${it.changedFilesCount || 0} files) • ` : ''}@${esc(it.author || '')}</span>
                 </div>
@@ -1793,7 +1812,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 ${isRunning ? '⏸️ Pause Auto-Review' : '🚀 Enable Auto-Review'}
               </button>
               <button class="q-btn" onclick="syncInboxNow()">🔄 Sync Queue (0 Tokens)</button>
-              <button class="q-btn" onclick="openInboxSettingsModal()">⚙️ Settings & Token Caps</button>
+              <button class="q-btn" onclick="openInboxSettingsModal()">⚙️ Settings & Auto-Review Flags</button>
             </div>
           </div>
           <div class="flex flex-wrap gap-2 text-xs">
@@ -1801,6 +1820,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               ${isRunning ? `● Daemon Active (PID ${daemon.pid})` : '○ Daemon Paused'}
             </span>
             <span class="q-badge">Mode: ${cfg.mode === 'sync_queue_only' ? 'Sync Only (0 Tokens)' : `${esc((cfg.effort || 'high').toUpperCase())} Precompute`}</span>
+            <span class="q-badge text-blue-300 border-blue-500/40">Auto-Review: ${esc(cfg.mode === 'sync_queue_only' ? 'Off (Sync Only)' : (autoActiveLabels.join(' + ') || 'None'))}</span>
             <span class="q-badge">Every ${cfg.pollIntervalMinutes || 15}m</span>
             <span class="q-badge">Max ${cfg.maxReviewsPerCycle ?? 1}/cycle</span>
             <span class="q-badge">Daily Cap: ${esc(dayCapLabel)}</span>
@@ -1808,7 +1828,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           </div>
           ${inbox.lastSyncError ? `<div class="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/40 rounded p-2.5">⚠️ ${esc(inbox.lastSyncError)}</div>` : ''}
         </div>
-        ${groupsHtml || `<div class="q-card p-6 text-center text-xs text-[var(--q-muted)]">No open PRs in your Inbox yet. Click <b>🔄 Sync Queue (0 Tokens)</b> to pull your GitHub review queue, or <b>⚙️ Settings & Token Caps</b> to configure watched repositories.</div>`}
+        ${groupsHtml || `<div class="q-card p-6 text-center text-xs text-[var(--q-muted)]">No open PRs in your Inbox yet. Click <b>🔄 Sync Queue (0 Tokens)</b> to pull your GitHub review queue, or <b>⚙️ Settings & Auto-Review Flags</b> to configure watched sources.</div>`}
       `;
     }
 
@@ -1879,20 +1899,108 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       await refreshState(STATE?.activeSession?.sessionId);
     }
 
+    function syncInboxPairCheck(watchId, autoId, changedAuto) {
+      const wEl = document.getElementById(watchId);
+      const aEl = document.getElementById(autoId);
+      if (!wEl || !aEl) return;
+      if (changedAuto && aEl.checked) wEl.checked = true;
+      if (!changedAuto && !wEl.checked) aEl.checked = false;
+    }
+
     function openInboxSettingsModal() {
       const cfg = STATE?.inbox?.settings || {};
+      const watchReq = cfg.watchReviewRequested !== false;
+      const autoReq = watchReq && cfg.autoReviewReviewRequested !== false;
+      const watchRevBy = cfg.watchReviewedBy !== undefined ? Boolean(cfg.watchReviewedBy) : (cfg.watchInvolvedPrs !== false);
+      const autoRevBy = watchRevBy && Boolean(cfg.autoReviewReviewedBy);
+      const watchComm = cfg.watchCommented !== undefined ? Boolean(cfg.watchCommented) : (cfg.watchInvolvedPrs !== false);
+      const autoComm = watchComm && Boolean(cfg.autoReviewCommented);
+      const watchMent = cfg.watchMentioned !== undefined ? Boolean(cfg.watchMentioned) : (cfg.watchInvolvedPrs !== false);
+      const autoMent = watchMent && Boolean(cfg.autoReviewMentioned);
+      const watchAuth = cfg.watchAuthoredPrs !== false;
+      const autoAuth = watchAuth && Boolean(cfg.autoReviewAuthoredPrs);
+      const watchRepos = cfg.watchWatchedRepos !== false;
+      const autoRepos = watchRepos && Boolean(cfg.autoReviewWatchedRepos);
+      const watchCustom = cfg.watchCustomQuery !== false;
+      const autoCustom = watchCustom && Boolean(cfg.autoReviewCustomQuery);
+      const authoredMode = cfg.authoredPrMode === 'all_open' ? 'all_open' : 'feedback_only';
+
       showModal(`
         <div class="text-sm font-bold">⚙️ PR Inbox & Background Auto-Review Settings</div>
         <p class="text-xs text-[var(--q-muted)]">
-          Control trigger scope, cadence, and token-consumption caps so initial backfills trickle safely one PR at a time.
+          Choose separately which PRs sync into your Inbox (<b>0 tokens</b>) vs. which subset automatically runs background reviews.
         </p>
-        <div class="space-y-2.5 text-xs max-h-[65vh] overflow-y-auto pr-1">
+        <div class="space-y-3 text-xs max-h-[70vh] overflow-y-auto pr-1">
+          <div class="rounded-lg border border-[var(--q-border)] bg-black/30 p-2.5 space-y-2">
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 font-semibold text-[11px] uppercase tracking-wider text-[var(--q-muted)] border-b border-[var(--q-border)] pb-1.5">
+              <span>GitHub PR Source / Flag</span>
+              <span class="text-center" title="Poll from GitHub into Inbox (0 LLM tokens)">📥 Inbox</span>
+              <span class="text-center text-blue-300" title="Automatically pre-compute review in background">⚡ Auto-Review</span>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <span>Requesting my review (<code>review-requested:@me</code>)</span>
+              <div class="text-center"><input id="inbWatchReq" type="checkbox" ${watchReq ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchReq','inbAutoReq',false)" /></div>
+              <div class="text-center"><input id="inbAutoReq" type="checkbox" ${autoReq ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchReq','inbAutoReq',true)" /></div>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <span>Previously reviewed by me (<code>reviewed-by:@me</code>)</span>
+              <div class="text-center"><input id="inbWatchRevBy" type="checkbox" ${watchRevBy ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchRevBy','inbAutoRevBy',false)" /></div>
+              <div class="text-center"><input id="inbAutoRevBy" type="checkbox" ${autoRevBy ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchRevBy','inbAutoRevBy',true)" /></div>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <span>Commented on by me (<code>commenter:@me</code>)</span>
+              <div class="text-center"><input id="inbWatchComm" type="checkbox" ${watchComm ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchComm','inbAutoComm',false)" /></div>
+              <div class="text-center"><input id="inbAutoComm" type="checkbox" ${autoComm ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchComm','inbAutoComm',true)" /></div>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <span>Mentioning or assigned to me (<code>mentions:@me</code> / <code>assignee:@me</code>)</span>
+              <div class="text-center"><input id="inbWatchMent" type="checkbox" ${watchMent ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchMent','inbAutoMent',false)" /></div>
+              <div class="text-center"><input id="inbAutoMent" type="checkbox" ${autoMent ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchMent','inbAutoMent',true)" /></div>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span>My own open PRs (<code>author:@me</code>):</span>
+                <select id="inbAuthMode" class="bg-black/50 border border-[var(--q-border)] rounded px-1.5 py-0.5 text-[11px]">
+                  <option value="feedback_only" ${authoredMode !== 'all_open' ? 'selected' : ''}>Only with external feedback</option>
+                  <option value="all_open" ${authoredMode === 'all_open' ? 'selected' : ''}>All open PRs (self-review)</option>
+                </select>
+              </div>
+              <div class="text-center"><input id="inbWatchAuth" type="checkbox" ${watchAuth ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchAuth','inbAutoAuth',false)" /></div>
+              <div class="text-center"><input id="inbAutoAuth" type="checkbox" ${autoAuth ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchAuth','inbAutoAuth',true)" /></div>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <span>Watched repositories below (when not restrict-only)</span>
+              <div class="text-center"><input id="inbWatchRepos" type="checkbox" ${watchRepos ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchRepos','inbAutoRepos',false)" /></div>
+              <div class="text-center"><input id="inbAutoRepos" type="checkbox" ${autoRepos ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchRepos','inbAutoRepos',true)" /></div>
+            </div>
+            <div class="grid grid-cols-[1fr_76px_86px] items-center gap-2 py-0.5">
+              <span>Custom GitHub search query below</span>
+              <div class="text-center"><input id="inbWatchCustom" type="checkbox" ${watchCustom ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchCustom','inbAutoCustom',false)" /></div>
+              <div class="text-center"><input id="inbAutoCustom" type="checkbox" ${autoCustom ? 'checked' : ''} onchange="syncInboxPairCheck('inbWatchCustom','inbAutoCustom',true)" /></div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-2">
+            <div>
+              <label class="block font-semibold mb-1">Custom GitHub Search Query (optional — supports <code>@me</code>)</label>
+              <input id="inbCustomQuery" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" placeholder="e.g. repo:acme/backend label:security -label:wip" value="${esc(cfg.customQuery || '')}" />
+            </div>
+            <div>
+              <label class="block font-semibold mb-1">Extra GitHub Search Flags Applied to All Queries (optional)</label>
+              <input id="inbExtraFlags" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" placeholder="e.g. -label:do-not-merge -author:app/dependabot" value="${esc(cfg.extraSearchFlags || '')}" />
+            </div>
+            <div>
+              <label class="block font-semibold mb-1">Watched Repos (optional comma-separated owner/repo)</label>
+              <input id="inbRepos" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" placeholder="e.g. acme/backend, acme/app" value="${esc((cfg.watchedRepos || []).join(', '))}" />
+            </div>
+          </div>
+
           <div class="grid grid-cols-2 gap-2">
             <div>
               <label class="block font-semibold mb-1">Watcher Mode</label>
               <select id="inbMode" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">
-                <option value="auto_precompute" ${cfg.mode !== 'sync_queue_only' ? 'selected' : ''}>Auto-Precompute Reviews</option>
-                <option value="sync_queue_only" ${cfg.mode === 'sync_queue_only' ? 'selected' : ''}>Sync Queue Only (0 Tokens)</option>
+                <option value="auto_precompute" ${cfg.mode !== 'sync_queue_only' ? 'selected' : ''}>Auto-Precompute Enabled Sources</option>
+                <option value="sync_queue_only" ${cfg.mode === 'sync_queue_only' ? 'selected' : ''}>Sync Queue Only (0 Tokens Global)</option>
               </select>
             </div>
             <div>
@@ -1928,14 +2036,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               <input id="inbRecency" type="number" min="0" max="365" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2" value="${cfg.onlyUpdatedWithinDays ?? 14}" />
             </div>
           </div>
-          <div>
-            <label class="block font-semibold mb-1">Watched Repos (optional comma-separated owner/repo)</label>
-            <input id="inbRepos" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" placeholder="e.g. acme/backend, acme/app" value="${esc((cfg.watchedRepos || []).join(', '))}" />
-          </div>
-          <label class="flex items-center gap-2"><input id="inbReq" type="checkbox" ${cfg.watchReviewRequested !== false ? 'checked' : ''} /> <span>Watch PRs requesting my review (<code>review-requested:@me</code>)</span></label>
-          <label class="flex items-center gap-2"><input id="inbInvolved" type="checkbox" ${cfg.watchInvolvedPrs !== false ? 'checked' : ''} /> <span>Watch PRs involving me — mentions, prior reviews, triage (<code>involves:@me</code>)</span></label>
-          <label class="flex items-center gap-2"><input id="inbAuth" type="checkbox" ${cfg.watchAuthoredPrs !== false ? 'checked' : ''} /> <span>Watch my open PRs with new comments / changes requested</span></label>
-          <label class="flex items-center gap-2"><input id="inbRestrict" type="checkbox" ${cfg.restrictToWatchedRepos ? 'checked' : ''} /> <span>Restrict <code>@me</code> queue only to Watched Repos above</span></label>
+          <label class="flex items-center gap-2"><input id="inbRestrict" type="checkbox" ${cfg.restrictToWatchedRepos ? 'checked' : ''} /> <span>Restrict <code>@me</code> queries only to Watched Repos above</span></label>
           <label class="flex items-center gap-2"><input id="inbDrafts" type="checkbox" ${cfg.includeDrafts ? 'checked' : ''} /> <span>Include Draft PRs</span></label>
           <label class="flex items-center gap-2"><input id="inbCommentsOnly" type="checkbox" ${cfg.commentsOnly ? 'checked' : ''} /> <span>Comments-Only format (skip Study Guide & Tour)</span></label>
         </div>
@@ -1956,9 +2057,23 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         maxConcurrency: Number(document.getElementById('inbConc')?.value || 1),
         onlyUpdatedWithinDays: Number(document.getElementById('inbRecency')?.value ?? 14),
         watchedRepos: document.getElementById('inbRepos')?.value || '',
-        watchReviewRequested: Boolean(document.getElementById('inbReq')?.checked),
-        watchInvolvedPrs: Boolean(document.getElementById('inbInvolved')?.checked),
-        watchAuthoredPrs: Boolean(document.getElementById('inbAuth')?.checked),
+        customQuery: document.getElementById('inbCustomQuery')?.value || '',
+        extraSearchFlags: document.getElementById('inbExtraFlags')?.value || '',
+        authoredPrMode: document.getElementById('inbAuthMode')?.value || 'feedback_only',
+        watchReviewRequested: Boolean(document.getElementById('inbWatchReq')?.checked),
+        autoReviewReviewRequested: Boolean(document.getElementById('inbAutoReq')?.checked),
+        watchReviewedBy: Boolean(document.getElementById('inbWatchRevBy')?.checked),
+        autoReviewReviewedBy: Boolean(document.getElementById('inbAutoRevBy')?.checked),
+        watchCommented: Boolean(document.getElementById('inbWatchComm')?.checked),
+        autoReviewCommented: Boolean(document.getElementById('inbAutoComm')?.checked),
+        watchMentioned: Boolean(document.getElementById('inbWatchMent')?.checked),
+        autoReviewMentioned: Boolean(document.getElementById('inbAutoMent')?.checked),
+        watchAuthoredPrs: Boolean(document.getElementById('inbWatchAuth')?.checked),
+        autoReviewAuthoredPrs: Boolean(document.getElementById('inbAutoAuth')?.checked),
+        watchWatchedRepos: Boolean(document.getElementById('inbWatchRepos')?.checked),
+        autoReviewWatchedRepos: Boolean(document.getElementById('inbAutoRepos')?.checked),
+        watchCustomQuery: Boolean(document.getElementById('inbWatchCustom')?.checked),
+        autoReviewCustomQuery: Boolean(document.getElementById('inbAutoCustom')?.checked),
         restrictToWatchedRepos: Boolean(document.getElementById('inbRestrict')?.checked),
         includeDrafts: Boolean(document.getElementById('inbDrafts')?.checked),
         commentsOnly: Boolean(document.getElementById('inbCommentsOnly')?.checked),

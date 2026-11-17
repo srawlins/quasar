@@ -74,13 +74,34 @@ INBOX_ETAG_CACHE_PATH = os.path.join(INBOX_DIR, "etag_cache.json")
 _ETAG_LOCK = threading.Lock()
 _ETAG_MEM_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _ETAG_DIRTY = False
+_LAST_SEARCH_200_TS = 0.0
 
 DEFAULT_INBOX_SETTINGS: Dict[str, Any] = {
     "enabled": False,
     "mode": "auto_precompute",  # "auto_precompute" | "sync_queue_only"
+    # Inbox Sync (0 LLM tokens) per GitHub PR source:
     "watchReviewRequested": True,
+    "watchReviewedBy": True,
+    "watchCommented": True,
+    "watchMentioned": True,
     "watchAuthoredPrs": True,
-    "watchInvolvedPrs": True,
+    "watchWatchedRepos": True,
+    "watchCustomQuery": True,
+    "watchInvolvedPrs": True,  # legacy aggregate alias (reviewedBy || commented || mentioned)
+    # Background Auto-Review (spends LLM tokens) per GitHub PR source:
+    # Only `review-requested:@me` is enabled for auto-review by default!
+    "autoReviewReviewRequested": True,
+    "autoReviewReviewedBy": False,
+    "autoReviewCommented": False,
+    "autoReviewMentioned": False,
+    "autoReviewAuthoredPrs": False,
+    "autoReviewWatchedRepos": False,
+    "autoReviewCustomQuery": False,
+    # Authored PR trigger mode: "feedback_only" (only when external comments/reviews exist) | "all_open"
+    "authoredPrMode": "feedback_only",
+    # Custom GitHub search query & global extra qualifiers:
+    "customQuery": "",
+    "extraSearchFlags": "",
     "watchedRepos": [],
     "restrictToWatchedRepos": False,
     "includeDrafts": False,
@@ -94,6 +115,38 @@ DEFAULT_INBOX_SETTINGS: Dict[str, Any] = {
     "incrementalUpdates": True,
     "notifyWhenReady": True,
 }
+
+ROLE_PRIORITY: Dict[str, int] = {
+    "author": 0,
+    "reviewer": 1,
+    "reviewed_by": 2,
+    "commented": 3,
+    "mentioned": 4,
+    "involved": 4,
+    "custom_query": 5,
+    "watched_repo": 6,
+}
+
+ROLE_SHORT_LABELS: Dict[str, str] = {
+    "author": "My PR",
+    "reviewer": "Review Requested",
+    "reviewed_by": "Reviewed by @me",
+    "commented": "Commented",
+    "mentioned": "Mentioned/Assigned",
+    "involved": "Involved",
+    "custom_query": "Custom Query",
+    "watched_repo": "Watched Repo",
+}
+
+_WATCH_AUTO_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("watchReviewRequested", "autoReviewReviewRequested"),
+    ("watchReviewedBy", "autoReviewReviewedBy"),
+    ("watchCommented", "autoReviewCommented"),
+    ("watchMentioned", "autoReviewMentioned"),
+    ("watchAuthoredPrs", "autoReviewAuthoredPrs"),
+    ("watchWatchedRepos", "autoReviewWatchedRepos"),
+    ("watchCustomQuery", "autoReviewCustomQuery"),
+)
 
 
 def _now_utc() -> datetime.datetime:
@@ -128,8 +181,47 @@ def normalize_inbox_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out["watchReviewRequested"] = bool(raw["watchReviewRequested"])
     if "watchAuthoredPrs" in raw:
         out["watchAuthoredPrs"] = bool(raw["watchAuthoredPrs"])
+
+    # Backwards compatibility: if legacy `watchInvolvedPrs` was stored without granular keys,
+    # inherit its value for `watchReviewedBy`, `watchCommented`, and `watchMentioned`.
     if "watchInvolvedPrs" in raw:
-        out["watchInvolvedPrs"] = bool(raw["watchInvolvedPrs"])
+        legacy_inv = bool(raw["watchInvolvedPrs"])
+        for gk in ("watchReviewedBy", "watchCommented", "watchMentioned"):
+            if gk not in raw:
+                out[gk] = legacy_inv
+
+    for k in (
+        "watchReviewedBy",
+        "watchCommented",
+        "watchMentioned",
+        "watchWatchedRepos",
+        "watchCustomQuery",
+        "autoReviewReviewRequested",
+        "autoReviewReviewedBy",
+        "autoReviewCommented",
+        "autoReviewMentioned",
+        "autoReviewAuthoredPrs",
+        "autoReviewWatchedRepos",
+        "autoReviewCustomQuery",
+    ):
+        if k in raw:
+            out[k] = bool(raw[k])
+
+    # Auto-review requires syncing that category into the Inbox
+    for wk, ak in _WATCH_AUTO_PAIRS:
+        if out[ak]:
+            out[wk] = True
+    out["watchInvolvedPrs"] = bool(
+        out["watchReviewedBy"] or out["watchCommented"] or out["watchMentioned"]
+    )
+
+    if str(raw.get("authoredPrMode") or "").strip().lower() in ("feedback_only", "all_open"):
+        out["authoredPrMode"] = str(raw["authoredPrMode"]).strip().lower()
+    if "customQuery" in raw:
+        out["customQuery"] = re.sub(r"\s+", " ", str(raw.get("customQuery") or "")).strip()
+    if "extraSearchFlags" in raw:
+        out["extraSearchFlags"] = re.sub(r"\s+", " ", str(raw.get("extraSearchFlags") or "")).strip()
+
     if "watchedRepos" in raw:
         val = raw["watchedRepos"]
         if isinstance(val, str):
@@ -179,6 +271,102 @@ def normalize_inbox_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def is_role_watch_enabled(role: str, settings: Dict[str, Any]) -> bool:
+    r = str(role or "reviewer")
+    if r == "author":
+        return bool(settings.get("watchAuthoredPrs", True))
+    if r == "reviewer":
+        return bool(settings.get("watchReviewRequested", True))
+    if r == "reviewed_by":
+        return bool(settings.get("watchReviewedBy", True))
+    if r == "commented":
+        return bool(settings.get("watchCommented", True))
+    if r == "mentioned":
+        return bool(settings.get("watchMentioned", True))
+    if r == "involved":
+        return bool(
+            settings.get("watchReviewedBy", True)
+            or settings.get("watchCommented", True)
+            or settings.get("watchMentioned", True)
+        )
+    if r == "watched_repo":
+        return bool(
+            settings.get("watchWatchedRepos", True)
+            and settings.get("watchedRepos")
+            and not settings.get("restrictToWatchedRepos")
+        )
+    if r == "custom_query":
+        return bool(
+            settings.get("watchCustomQuery", True)
+            and str(settings.get("customQuery") or "").strip()
+        )
+    return True
+
+
+def is_role_auto_review_enabled(role: str, settings: Dict[str, Any]) -> bool:
+    r = str(role or "reviewer")
+    if not is_role_watch_enabled(r, settings):
+        return False
+    if r == "author":
+        return bool(settings.get("autoReviewAuthoredPrs", False))
+    if r == "reviewer":
+        return bool(settings.get("autoReviewReviewRequested", True))
+    if r == "reviewed_by":
+        return bool(settings.get("autoReviewReviewedBy", False))
+    if r == "commented":
+        return bool(settings.get("autoReviewCommented", False))
+    if r == "mentioned":
+        return bool(settings.get("autoReviewMentioned", False))
+    if r == "involved":
+        return bool(
+            settings.get("autoReviewReviewedBy", False)
+            or settings.get("autoReviewCommented", False)
+            or settings.get("autoReviewMentioned", False)
+        )
+    if r == "watched_repo":
+        return bool(settings.get("autoReviewWatchedRepos", False))
+    if r == "custom_query":
+        return bool(settings.get("autoReviewCustomQuery", False))
+    return False
+
+
+def get_item_roles(item: Dict[str, Any]) -> List[str]:
+    raw_roles = item.get("matchedRoles")
+    roles: List[str] = []
+    if isinstance(raw_roles, list):
+        for r in raw_roles:
+            rs = str(r or "").strip()
+            if rs and rs not in roles:
+                roles.append(rs)
+    primary = str(item.get("role") or "reviewer").strip()
+    if primary and primary not in roles:
+        roles.insert(0, primary)
+    roles.sort(key=lambda r: ROLE_PRIORITY.get(r, 9))
+    return roles or ["reviewer"]
+
+
+def is_item_watch_enabled(item: Dict[str, Any], settings: Dict[str, Any]) -> bool:
+    return any(is_role_watch_enabled(r, settings) for r in get_item_roles(item))
+
+
+def is_item_auto_review_enabled(item: Dict[str, Any], settings: Dict[str, Any]) -> bool:
+    if item.get("manualAutoReviewQueued"):
+        return True
+    return any(is_role_auto_review_enabled(r, settings) for r in get_item_roles(item))
+
+
+def format_item_roles_label(item: Dict[str, Any]) -> str:
+    roles = get_item_roles(item)
+    return " + ".join(ROLE_SHORT_LABELS.get(r, r) for r in roles)
+
+
+def _expand_github_me_tokens(expr: str, login: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(expr or "")).strip()
+    if not cleaned:
+        return ""
+    return re.sub(r"(?<=:)@me\b", login, cleaned, flags=re.IGNORECASE)
+
+
 def load_inbox_settings() -> Dict[str, Any]:
     os.makedirs(INBOX_DIR, exist_ok=True)
     if not os.path.isfile(INBOX_SETTINGS_PATH):
@@ -193,7 +381,26 @@ def load_inbox_settings() -> Dict[str, Any]:
 def save_inbox_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     current = load_inbox_settings()
     merged_raw = dict(current)
-    merged_raw.update(updates or {})
+    upd = dict(updates or {})
+    # Support legacy `watchInvolvedPrs` updates when granular keys aren't explicitly provided
+    if "watchInvolvedPrs" in upd:
+        inv_val = bool(upd["watchInvolvedPrs"])
+        for gk, ak in (
+            ("watchReviewedBy", "autoReviewReviewedBy"),
+            ("watchCommented", "autoReviewCommented"),
+            ("watchMentioned", "autoReviewMentioned"),
+        ):
+            if gk not in upd:
+                upd[gk] = inv_val
+            if not inv_val and ak not in upd:
+                upd[ak] = False
+    # Turning off Inbox Sync for a category also turns off Auto-Review unless explicitly turned on
+    for wk, ak in _WATCH_AUTO_PAIRS:
+        if wk in upd and not bool(upd[wk]) and not bool(upd.get(ak, False)):
+            upd[ak] = False
+        elif ak in upd and bool(upd[ak]):
+            upd[wk] = True
+    merged_raw.update(upd)
     norm = normalize_inbox_settings(merged_raw)
     norm["updatedAt"] = _now_iso()
     _atomic_write_json(INBOX_SETTINGS_PATH, norm)
@@ -312,16 +519,21 @@ def _gh_api_get(path_or_url: str, token: str, timeout: float = 20.0, flush_etag:
     """GitHub REST GET with automatic `If-None-Match` (`ETag`) caching.
     Unchanged resources return `HTTP 304 Not Modified`, consuming 0 GitHub rate-limit quota.
     """
-    global _ETAG_DIRTY
+    global _ETAG_DIRTY, _LAST_SEARCH_200_TS
     url = (
         path_or_url
         if path_or_url.startswith("https://")
         else f"https://api.github.com/{path_or_url.lstrip('/')}"
     )
+    is_search_url = "/search/issues" in url
     cache = _load_etag_cache()
     with _ETAG_LOCK:
         cached_entry = cache.get(url)
         cached_etag = str((cached_entry or {}).get("etag") or "")
+        if is_search_url and not cached_etag and _LAST_SEARCH_200_TS > 0:
+            elapsed = time.time() - _LAST_SEARCH_200_TS
+            if elapsed < 0.25:
+                time.sleep(0.25 - elapsed)
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -337,12 +549,14 @@ def _gh_api_get(path_or_url: str, token: str, timeout: float = 20.0, flush_etag:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
             new_etag = str(resp.headers.get("ETag") or "").strip()
-            if new_etag:
-                with _ETAG_LOCK:
+            with _ETAG_LOCK:
+                if is_search_url:
+                    _LAST_SEARCH_200_TS = time.time()
+                if new_etag:
                     cache[url] = {"etag": new_etag, "data": parsed, "ts": time.time()}
                     _ETAG_DIRTY = True
-                if flush_etag:
-                    _flush_etag_cache()
+            if new_etag and flush_etag:
+                _flush_etag_cache()
             return parsed
     except urllib.error.HTTPError as exc:
         if exc.code == 304 and isinstance(cached_entry, dict) and "data" in cached_entry:
@@ -403,25 +617,67 @@ def sync_github_queue(
     restrict_repos = bool(cfg.get("restrictToWatchedRepos") and watched_repos)
     draft_qual = "" if cfg.get("includeDrafts") else " -is:draft"
     repo_qual = " " + " ".join(f"repo:{r}" for r in watched_repos[:15]) if restrict_repos else ""
+    extra_flags = _expand_github_me_tokens(str(cfg.get("extraSearchFlags") or ""), login)
+    extra_qual = f" {extra_flags}" if extra_flags else ""
+    authored_all_open = str(cfg.get("authoredPrMode") or "feedback_only") == "all_open"
 
     queries: List[Tuple[str, str]] = []
     if cfg.get("watchAuthoredPrs", True):
-        queries.append(("author", f"is:pr is:open author:{login}{draft_qual}{repo_qual}"))
+        queries.append(("author", f"is:pr is:open author:{login}{draft_qual}{repo_qual}{extra_qual}"))
     if cfg.get("watchReviewRequested", True):
-        queries.append(("reviewer", f"is:pr is:open review-requested:{login}{draft_qual}{repo_qual}"))
-    if cfg.get("watchInvolvedPrs", True):
-        queries.append(("involved", f"is:pr is:open involves:{login} -author:{login}{draft_qual}{repo_qual}"))
-    if watched_repos and not restrict_repos:
+        queries.append(
+            ("reviewer", f"is:pr is:open review-requested:{login} -author:{login}{draft_qual}{repo_qual}{extra_qual}")
+        )
+    if cfg.get("watchReviewedBy", True):
+        queries.append(
+            ("reviewed_by", f"is:pr is:open reviewed-by:{login} -author:{login}{draft_qual}{repo_qual}{extra_qual}")
+        )
+    if cfg.get("watchCommented", True):
+        queries.append(
+            ("commented", f"is:pr is:open commenter:{login} -author:{login}{draft_qual}{repo_qual}{extra_qual}")
+        )
+    if cfg.get("watchMentioned", True):
+        queries.append(
+            ("mentioned", f"is:pr is:open mentions:{login} -author:{login}{draft_qual}{repo_qual}{extra_qual}")
+        )
+        queries.append(
+            ("mentioned", f"is:pr is:open assignee:{login} -author:{login}{draft_qual}{repo_qual}{extra_qual}")
+        )
+    if watched_repos and not restrict_repos and cfg.get("watchWatchedRepos", True):
         extra_repo_q = " ".join(f"repo:{r}" for r in watched_repos[:12])
-        queries.append(("watched_repo", f"is:pr is:open -author:{login}{draft_qual} {extra_repo_q}"))
+        queries.append(
+            ("watched_repo", f"is:pr is:open -author:{login}{draft_qual} {extra_repo_q}{extra_qual}")
+        )
+    raw_custom_q = _expand_github_me_tokens(str(cfg.get("customQuery") or ""), login)
+    if raw_custom_q and cfg.get("watchCustomQuery", True):
+        cq_parts: List[str] = []
+        if not re.search(r"\b(?:is|type):pr\b", raw_custom_q, re.IGNORECASE):
+            cq_parts.append("is:pr")
+        if not re.search(r"\b(?:is:(?:open|closed|merged)|state:(?:open|closed))\b", raw_custom_q, re.IGNORECASE):
+            cq_parts.append("is:open")
+        cq_parts.append(raw_custom_q)
+        if draft_qual and not re.search(r"(?:^|\s)-?(?:is:draft|draft:(?:true|false))\b", raw_custom_q, re.IGNORECASE):
+            cq_parts.append(draft_qual.strip())
+        if repo_qual and not re.search(r"\brepo:", raw_custom_q, re.IGNORECASE):
+            cq_parts.append(repo_qual.strip())
+        if extra_flags:
+            cq_parts.append(extra_flags)
+        queries.append(("custom_query", " ".join(p for p in cq_parts if p)))
 
-    role_priority = {"author": 0, "reviewer": 1, "involved": 2, "watched_repo": 3}
+    role_priority = ROLE_PRIORITY
     scope_sig = json.dumps(
         [
             login,
             bool(cfg.get("watchAuthoredPrs", True)),
+            str(cfg.get("authoredPrMode") or "feedback_only"),
             bool(cfg.get("watchReviewRequested", True)),
-            bool(cfg.get("watchInvolvedPrs", True)),
+            bool(cfg.get("watchReviewedBy", True)),
+            bool(cfg.get("watchCommented", True)),
+            bool(cfg.get("watchMentioned", True)),
+            bool(cfg.get("watchWatchedRepos", True)),
+            bool(cfg.get("watchCustomQuery", True)),
+            raw_custom_q,
+            extra_flags,
             watched_repos,
             restrict_repos,
             bool(cfg.get("includeDrafts")),
@@ -462,21 +718,27 @@ def sync_github_queue(
                     owner, repo = m_repo.group(1), m_repo.group(2)
                     item_id = f"{owner}-{repo}-pr-{pr_num}"
                     prev_disc = discovered.get(item_id)
-                    if (
-                        prev_disc is None
-                        or role_priority.get(role, 9) < role_priority.get(str(prev_disc.get("role")), 9)
-                    ):
+                    if prev_disc is None:
                         discovered[item_id] = {
                             "owner": owner,
                             "repo": repo,
                             "number": pr_num,
                             "role": role,
+                            "matchedRoles": [role],
                             "title": str(issue.get("title") or f"PR #{pr_num}"),
                             "html_url": str(issue.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_num}"),
                             "author": str((issue.get("user") or {}).get("login") or ""),
                             "issue_updated_at": str(issue.get("updated_at") or _now_iso()),
                             "issue_comments": int(issue.get("comments") or 0),
                         }
+                    else:
+                        m_roles: List[str] = list(prev_disc.get("matchedRoles") or [str(prev_disc.get("role") or role)])
+                        if role not in m_roles:
+                            m_roles.append(role)
+                        m_roles.sort(key=lambda r: role_priority.get(r, 9))
+                        prev_disc["matchedRoles"] = m_roles
+                        if role_priority.get(role, 9) < role_priority.get(str(prev_disc.get("role")), 9):
+                            prev_disc["role"] = role
                 if len(items) < 100:
                     break
                 if not do_full_sweep and prev_synced_dt is not None:
@@ -608,6 +870,11 @@ def sync_github_queue(
             and cached_upd == info["issue_updated_at"]
             and (not has_prior_review_state or bool(existing.get("headSha")))
             and not (info["role"] == "author" and existing.get("role") != "author")
+            and not (
+                info["role"] == "author"
+                and not authored_all_open
+                and "hasExternalFeedback" not in existing
+            )
         ):
             unchanged_entries.append((item_id, info))
             continue
@@ -629,13 +896,20 @@ def sync_github_queue(
     for item_id, info in unchanged_entries:
         existing = dict(items_map[item_id])
         role = str(info["role"])
+        matched_roles = list(info.get("matchedRoles") or [role])
         head_sha = str(existing.get("headSha") or "")
         fingerprint = str(existing.get("currentFingerprint") or head_sha)
-        bucket_hint = (
-            str(existing.get("bucketHint") or "author_action_needed")
-            if role == "author"
-            else "reviewer"
-        )
+        if role == "author":
+            if authored_all_open:
+                bucket_hint = "author_action_needed"
+            elif "hasExternalFeedback" in existing:
+                bucket_hint = (
+                    "author_action_needed" if existing.get("hasExternalFeedback") else "waiting_on_reviewers"
+                )
+            else:
+                bucket_hint = str(existing.get("bucketHint") or "author_action_needed")
+        else:
+            bucket_hint = "reviewer"
         new_status, updated_since_review, item_dir = _reconcile_status(
             existing, item_id, role, head_sha, fingerprint, bucket_hint
         )
@@ -643,6 +917,7 @@ def sync_github_queue(
         existing["url"] = info["html_url"]
         existing["author"] = info["author"]
         existing["role"] = role
+        existing["matchedRoles"] = matched_roles
         existing["bucketHint"] = bucket_hint
         existing["ghIssueUpdatedAt"] = info["issue_updated_at"]
         existing["updatedSinceLastReview"] = updated_since_review
@@ -665,11 +940,17 @@ def sync_github_queue(
     for item_id, info in list_only_entries:
         existing = items_map.get(item_id) or {}
         role = str(info["role"])
+        matched_roles = list(info.get("matchedRoles") or [role])
         head_sha = str(existing.get("headSha") or "")
         fingerprint = str(existing.get("currentFingerprint") or head_sha)
-        bucket_hint = "waiting_on_reviewers" if (role == "author" and info["issue_comments"] == 0) else (
-            "author_action_needed" if role == "author" else "reviewer"
-        )
+        if role == "author":
+            bucket_hint = (
+                "author_action_needed"
+                if (authored_all_open or info["issue_comments"] > 0)
+                else "waiting_on_reviewers"
+            )
+        else:
+            bucket_hint = "reviewer"
         new_status, updated_since_review, item_dir = _reconcile_status(
             existing, item_id, role, head_sha, fingerprint, bucket_hint
         )
@@ -683,6 +964,7 @@ def sync_github_queue(
             "url": info["html_url"],
             "author": info["author"],
             "role": role,
+            "matchedRoles": matched_roles,
             "bucketHint": bucket_hint,
             "headSha": head_sha,
             "additions": int(existing.get("additions") or 0),
@@ -724,6 +1006,7 @@ def sync_github_queue(
             return iid, {
                 "pr": pr_obj,
                 "role": role,
+                "matchedRoles": list(info.get("matchedRoles") or [role]),
                 "owner": own,
                 "repo": rep,
                 "issue_updated_at": info["issue_updated_at"],
@@ -746,6 +1029,7 @@ def sync_github_queue(
             continue
         pr_obj = detail["pr"]
         role = detail["role"]
+        matched_roles = list(detail.get("matchedRoles") or [role])
         owner = detail["owner"]
         repo = detail["repo"]
         pr_num = int(pr_obj.get("number") or 0)
@@ -778,12 +1062,17 @@ def sync_github_queue(
         )
         latest_rev_id = str(external_reviews[-1].get("id") or "") if external_reviews else ""
 
+        has_external_feedback = False
         if role == "author":
             has_external_feedback = (
                 review_comments_cnt > 0 or changes_requested or len(external_reviews) > 0
             )
             fingerprint = f"{head_sha}:rc={review_comments_cnt}:ic={issue_comments_cnt}:rv={latest_rev_id}"
-            bucket_hint = "author_action_needed" if has_external_feedback else "waiting_on_reviewers"
+            bucket_hint = (
+                "author_action_needed"
+                if (authored_all_open or has_external_feedback)
+                else "waiting_on_reviewers"
+            )
         else:
             fingerprint = head_sha
             bucket_hint = "reviewer"
@@ -803,7 +1092,9 @@ def sync_github_queue(
             "url": html_url,
             "author": author_login,
             "role": role,
+            "matchedRoles": matched_roles,
             "bucketHint": bucket_hint,
+            "hasExternalFeedback": has_external_feedback,
             "baseRefName": base_ref,
             "headRefName": head_ref,
             "headSha": head_sha,
@@ -836,8 +1127,10 @@ def sync_github_queue(
 
     for item_id, info in deferred_batch:
         existing = items_map.get(item_id)
+        m_roles = list(info.get("matchedRoles") or [info["role"]])
         if isinstance(existing, dict):
             existing["role"] = info["role"]
+            existing["matchedRoles"] = m_roles
             existing["openInQueue"] = True
             existing["ghIssueUpdatedAt"] = ""
         else:
@@ -850,7 +1143,12 @@ def sync_github_queue(
                 "url": info["html_url"],
                 "author": info["author"],
                 "role": info["role"],
-                "bucketHint": "author_action_needed" if info["role"] == "author" else "reviewer",
+                "matchedRoles": m_roles,
+                "bucketHint": (
+                    "author_action_needed"
+                    if (info["role"] == "author" and (authored_all_open or info["issue_comments"] > 0))
+                    else ("waiting_on_reviewers" if info["role"] == "author" else "reviewer")
+                ),
                 "headSha": "",
                 "additions": 0,
                 "deletions": 0,
@@ -1697,7 +1995,14 @@ def run_precompute_for_item(
         it["analyzedEffort"] = effort
         it["completedAt"] = _now_iso()
         it["unread"] = True
-        for k in ("lastError", "failureCount", "retryAfter", "failedFingerprint", "skipReason"):
+        for k in (
+            "lastError",
+            "failureCount",
+            "retryAfter",
+            "failedFingerprint",
+            "skipReason",
+            "manualAutoReviewQueued",
+        ):
             it.pop(k, None)
     save_inbox_state(st)
     return {"ok": True, "itemId": item_id, "status": "ready"}
@@ -1725,6 +2030,7 @@ def select_eligible_items_for_cycle(
         return [], "daily_cap_reached"
 
     cutoff_days = int(settings.get("onlyUpdatedWithinDays") or 0)
+    authored_all_open = str(settings.get("authoredPrMode") or "feedback_only") == "all_open"
     now = _now_utc()
 
     candidates: List[Tuple[int, str, str]] = []
@@ -1733,9 +2039,26 @@ def select_eligible_items_for_cycle(
             continue
         if item.get("dismissed"):
             continue
-        if item.get("status") != "queued":
+        if not is_item_watch_enabled(item, settings) and not item.get("manualAutoReviewQueued"):
             continue
-        if item.get("bucketHint") == "waiting_on_reviewers":
+        role = str(item.get("role") or "reviewer")
+        eff_status = str(item.get("status") or "queued")
+        if role == "author":
+            if authored_all_open and eff_status == "waiting_on_reviewers":
+                eff_status = "queued"
+            elif (
+                not authored_all_open
+                and eff_status == "queued"
+                and item.get("hasExternalFeedback") is False
+                and int(item.get("issueCommentsCount") or 0) == 0
+            ):
+                eff_status = "waiting_on_reviewers"
+        if eff_status != "queued":
+            continue
+        if not authored_all_open and item.get("bucketHint") == "waiting_on_reviewers":
+            continue
+        if not is_item_auto_review_enabled(item, settings):
+            item["skipReason"] = f"Inbox-only ({format_item_roles_label(item)} auto-review is off)"
             continue
         if cutoff_days > 0:
             upd_dt = _parse_iso_dt(str(item.get("updatedAt") or ""))
@@ -1758,18 +2081,23 @@ def select_eligible_items_for_cycle(
                 item["skipReason"] = f"Error cooldown ({mins_left}m left — click ⚡ to retry)"
                 continue
         item.pop("skipReason", None)
-        # Priority: 0 = updated since last review or changes requested, 1 = author PR w/ comments,
-        #           2 = explicit review-requested:@me, 3 = involves:@me, 4 = watched repo
-        if item.get("updatedSinceLastReview") or item.get("changesRequested"):
+        roles_set = set(get_item_roles(item))
+        if item.get("updatedSinceLastReview") or item.get("changesRequested") or item.get("manualAutoReviewQueued"):
             prio = 0
-        elif item.get("role") == "author":
+        elif role == "author":
             prio = 1
-        elif item.get("role") == "reviewer":
+        elif "reviewer" in roles_set:
             prio = 2
-        elif item.get("role") == "involved":
+        elif "reviewed_by" in roles_set:
             prio = 3
-        else:
+        elif "commented" in roles_set:
             prio = 4
+        elif "mentioned" in roles_set or "involved" in roles_set:
+            prio = 5
+        elif "custom_query" in roles_set:
+            prio = 6
+        else:
+            prio = 7
         candidates.append((prio, str(item.get("updatedAt") or ""), iid))
 
     # Sort highest priority first, then most recently updated first
@@ -2086,6 +2414,7 @@ def build_inbox_payload() -> Dict[str, Any]:
     settings = load_inbox_settings()
     state = load_inbox_state()
     daemon = load_daemon_status()
+    authored_all_open = str(settings.get("authoredPrMode") or "feedback_only") == "all_open"
 
     items_list: List[Dict[str, Any]] = []
     for _, raw_item in (state.get("items") or {}).items():
@@ -2096,6 +2425,34 @@ def build_inbox_payload() -> Dict[str, Any]:
         it = dict(raw_item)
         status = str(it.get("status") or "queued")
         role = str(it.get("role") or "reviewer")
+        if status != "ready" and status != "analyzing" and not is_item_watch_enabled(it, settings) and not it.get("manualAutoReviewQueued"):
+            continue
+
+        # Immediately reflect authoredPrMode ("all_open" vs "feedback_only") without waiting for next poll
+        if role == "author":
+            if authored_all_open and status == "waiting_on_reviewers":
+                status = "queued"
+                it["status"] = "queued"
+            elif (
+                not authored_all_open
+                and status == "queued"
+                and it.get("hasExternalFeedback") is False
+                and int(it.get("issueCommentsCount") or 0) == 0
+            ):
+                status = "waiting_on_reviewers"
+                it["status"] = "waiting_on_reviewers"
+
+        auto_enabled = is_item_auto_review_enabled(it, settings)
+        it["autoReviewEnabled"] = auto_enabled
+        it["roleLabel"] = format_item_roles_label(it)
+        prev_skip = str(it.get("skipReason") or "")
+        if status == "queued":
+            if not auto_enabled:
+                if not prev_skip or prev_skip.startswith("Inbox-only ("):
+                    it["skipReason"] = f"Inbox-only ({it['roleLabel']} auto-review is off)"
+            elif prev_skip.startswith("Inbox-only ("):
+                it.pop("skipReason", None)
+
         if status == "quarantined":
             group = "quarantined"
         elif status == "analyzing":
@@ -2567,6 +2924,7 @@ def requeue_inbox_item(item_id: str) -> Dict[str, Any]:
         it["status"] = "queued"
         it["dismissed"] = False
         it["openInQueue"] = True
+        it["manualAutoReviewQueued"] = True
         it.pop("deletedAt", None)
         it.pop("deletedAtSha", None)
         it.pop("reviewedHeadSha", None)
@@ -2643,12 +3001,39 @@ def main() -> None:
     parser.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Background review effort")
     parser.add_argument("--mode", choices=["auto_precompute", "sync_queue_only"], default=None, help="Watcher mode")
     parser.add_argument("--watched-repos", default=None, help="Comma-separated owner/repo watchlist")
-    parser.add_argument("--watch-requested", dest="watch_requested", action="store_true", default=None, help="Watch PRs requesting your review (review-requested:@me)")
-    parser.add_argument("--no-watch-requested", dest="watch_requested", action="store_false", help="Stop watching review-requested:@me PRs")
-    parser.add_argument("--watch-authored", dest="watch_authored", action="store_true", default=None, help="Watch your open authored PRs")
-    parser.add_argument("--no-watch-authored", dest="watch_authored", action="store_false", help="Stop watching your open authored PRs")
-    parser.add_argument("--watch-involved", dest="watch_involved", action="store_true", default=None, help="Watch open PRs involving @me (mentions, prior reviews, triage)")
-    parser.add_argument("--no-watch-involved", dest="watch_involved", action="store_false", help="Stop watching involves:@me PRs")
+    parser.add_argument("--watch-requested", dest="watch_requested", action="store_true", default=None, help="Sync PRs requesting your review (review-requested:@me) to Inbox")
+    parser.add_argument("--no-watch-requested", dest="watch_requested", action="store_false", help="Stop syncing review-requested:@me PRs")
+    parser.add_argument("--auto-review-requested", dest="auto_review_requested", action="store_true", default=None, help="Auto-review PRs requesting your review (review-requested:@me)")
+    parser.add_argument("--no-auto-review-requested", dest="auto_review_requested", action="store_false", help="Do not auto-review review-requested:@me PRs (sync only)")
+    parser.add_argument("--watch-reviewed-by", dest="watch_reviewed_by", action="store_true", default=None, help="Sync PRs you previously reviewed (reviewed-by:@me) to Inbox")
+    parser.add_argument("--no-watch-reviewed-by", dest="watch_reviewed_by", action="store_false", help="Stop syncing reviewed-by:@me PRs")
+    parser.add_argument("--auto-review-reviewed-by", dest="auto_review_reviewed_by", action="store_true", default=None, help="Auto-review PRs you previously reviewed (reviewed-by:@me)")
+    parser.add_argument("--no-auto-review-reviewed-by", dest="auto_review_reviewed_by", action="store_false", help="Do not auto-review reviewed-by:@me PRs")
+    parser.add_argument("--watch-commented", dest="watch_commented", action="store_true", default=None, help="Sync PRs you commented on (commenter:@me) to Inbox")
+    parser.add_argument("--no-watch-commented", dest="watch_commented", action="store_false", help="Stop syncing commenter:@me PRs")
+    parser.add_argument("--auto-review-commented", dest="auto_review_commented", action="store_true", default=None, help="Auto-review PRs you commented on (commenter:@me)")
+    parser.add_argument("--no-auto-review-commented", dest="auto_review_commented", action="store_false", help="Do not auto-review commenter:@me PRs")
+    parser.add_argument("--watch-mentioned", dest="watch_mentioned", action="store_true", default=None, help="Sync PRs mentioning or assigned to @me (mentions:@me / assignee:@me) to Inbox")
+    parser.add_argument("--no-watch-mentioned", dest="watch_mentioned", action="store_false", help="Stop syncing mentions:@me / assignee:@me PRs")
+    parser.add_argument("--auto-review-mentioned", dest="auto_review_mentioned", action="store_true", default=None, help="Auto-review PRs mentioning or assigned to @me")
+    parser.add_argument("--no-auto-review-mentioned", dest="auto_review_mentioned", action="store_false", help="Do not auto-review mentions:@me / assignee:@me PRs")
+    parser.add_argument("--watch-authored", dest="watch_authored", action="store_true", default=None, help="Sync your open authored PRs (author:@me) to Inbox")
+    parser.add_argument("--no-watch-authored", dest="watch_authored", action="store_false", help="Stop syncing your open authored PRs")
+    parser.add_argument("--auto-review-authored", dest="auto_review_authored", action="store_true", default=None, help="Auto-review your open authored PRs")
+    parser.add_argument("--no-auto-review-authored", dest="auto_review_authored", action="store_false", help="Do not auto-review your open authored PRs")
+    parser.add_argument("--authored-mode", choices=["feedback_only", "all_open"], default=None, help="When authored PRs enter active queue: feedback_only or all_open")
+    parser.add_argument("--watch-watched-repos", dest="watch_watched_repos", action="store_true", default=None, help="Sync open PRs from watchedRepos to Inbox")
+    parser.add_argument("--no-watch-watched-repos", dest="watch_watched_repos", action="store_false", help="Stop syncing all open PRs from watchedRepos")
+    parser.add_argument("--auto-review-watched-repos", dest="auto_review_watched_repos", action="store_true", default=None, help="Auto-review open PRs from watchedRepos")
+    parser.add_argument("--no-auto-review-watched-repos", dest="auto_review_watched_repos", action="store_false", help="Do not auto-review open PRs from watchedRepos")
+    parser.add_argument("--custom-query", default=None, help="Custom GitHub PR search query / flags (e.g. 'repo:acme/backend label:security -label:wip')")
+    parser.add_argument("--watch-custom-query", dest="watch_custom_query", action="store_true", default=None, help="Sync PRs matching --custom-query to Inbox")
+    parser.add_argument("--no-watch-custom-query", dest="watch_custom_query", action="store_false", help="Disable syncing --custom-query PRs")
+    parser.add_argument("--auto-review-custom-query", dest="auto_review_custom_query", action="store_true", default=None, help="Auto-review PRs matching --custom-query")
+    parser.add_argument("--no-auto-review-custom-query", dest="auto_review_custom_query", action="store_false", help="Do not auto-review --custom-query PRs")
+    parser.add_argument("--extra-flags", default=None, help="Extra GitHub search qualifiers appended to all queries (e.g. '-label:do-not-merge -author:app/dependabot')")
+    parser.add_argument("--watch-involved", dest="watch_involved", action="store_true", default=None, help="Legacy alias: sync reviewed-by, commenter, and mentions/assignee PRs")
+    parser.add_argument("--no-watch-involved", dest="watch_involved", action="store_false", help="Legacy alias: stop syncing reviewed-by, commenter, and mentions/assignee PRs")
     parser.add_argument("--sync-now", action="store_true", help="Poll GitHub queue now without running LLM reviews (0 tokens)")
     parser.add_argument("--run-cycle", action="store_true", help="Run one sync + quota-guarded pre-review cycle and exit")
     parser.add_argument("--precompute-item", default="", help="Explicitly pre-compute a specific Inbox item ID now")
@@ -2700,12 +3085,42 @@ def main() -> None:
         updates["mode"] = args.mode
     if args.watched_repos is not None:
         updates["watchedRepos"] = args.watched_repos
-    if args.watch_requested is not None:
-        updates["watchReviewRequested"] = bool(args.watch_requested)
-    if args.watch_authored is not None:
-        updates["watchAuthoredPrs"] = bool(args.watch_authored)
     if args.watch_involved is not None:
         updates["watchInvolvedPrs"] = bool(args.watch_involved)
+    if args.watch_requested is not None:
+        updates["watchReviewRequested"] = bool(args.watch_requested)
+    if args.auto_review_requested is not None:
+        updates["autoReviewReviewRequested"] = bool(args.auto_review_requested)
+    if args.watch_reviewed_by is not None:
+        updates["watchReviewedBy"] = bool(args.watch_reviewed_by)
+    if args.auto_review_reviewed_by is not None:
+        updates["autoReviewReviewedBy"] = bool(args.auto_review_reviewed_by)
+    if args.watch_commented is not None:
+        updates["watchCommented"] = bool(args.watch_commented)
+    if args.auto_review_commented is not None:
+        updates["autoReviewCommented"] = bool(args.auto_review_commented)
+    if args.watch_mentioned is not None:
+        updates["watchMentioned"] = bool(args.watch_mentioned)
+    if args.auto_review_mentioned is not None:
+        updates["autoReviewMentioned"] = bool(args.auto_review_mentioned)
+    if args.watch_authored is not None:
+        updates["watchAuthoredPrs"] = bool(args.watch_authored)
+    if args.auto_review_authored is not None:
+        updates["autoReviewAuthoredPrs"] = bool(args.auto_review_authored)
+    if args.authored_mode is not None:
+        updates["authoredPrMode"] = args.authored_mode
+    if args.watch_watched_repos is not None:
+        updates["watchWatchedRepos"] = bool(args.watch_watched_repos)
+    if args.auto_review_watched_repos is not None:
+        updates["autoReviewWatchedRepos"] = bool(args.auto_review_watched_repos)
+    if args.custom_query is not None:
+        updates["customQuery"] = args.custom_query
+    if args.watch_custom_query is not None:
+        updates["watchCustomQuery"] = bool(args.watch_custom_query)
+    if args.auto_review_custom_query is not None:
+        updates["autoReviewCustomQuery"] = bool(args.auto_review_custom_query)
+    if args.extra_flags is not None:
+        updates["extraSearchFlags"] = args.extra_flags
 
     if args.configure or updates:
         saved = save_inbox_settings(updates)

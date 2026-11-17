@@ -408,8 +408,26 @@ flowchart LR
 
       expect(find.text('Max 1/cycle'), findsOneWidget);
       expect(find.text('Daily Cap: 2/6 today'), findsOneWidget);
+      expect(find.text('Auto-Review: Requested'), findsOneWidget);
       expect(find.textContaining('acme/api#101: Add retry jitter'), findsOneWidget);
       expect(find.text('📖 Open in 0s'), findsOneWidget);
+
+      await tester.tap(find.text('Settings & Auto-Review Flags'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Requesting my review (review-requested:@me)'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Commented on by me (commenter:@me)'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Previously reviewed by me (reviewed-by:@me)'),
+        findsOneWidget,
+      );
+      expect(find.text('My own open PRs (author:@me)'), findsOneWidget);
     },
   );
 }

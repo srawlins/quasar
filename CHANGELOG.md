@@ -2,6 +2,15 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.6.1] - 2026-11-17
+
+### Added
+- **Granular PR Source Flags & Separate `📥 Inbox` vs. `⚡ Auto-Review` Controls**:
+  - Split PR Inbox discovery and background auto-review toggles independently per GitHub source across `inbox_watcher.py`, VS Code (`quasar.configureInboxWatcher`), `quasar-web`, the standalone Flutter app, and `quasar watch`:
+    - `review-requested:@me` (**Auto-Review ON** by default)
+    - `reviewed-by:@me`, `commenter:@me`, `mentions:@me` / `assignee:@me`, `author:@me`, `watchedRepos`, and `customQuery` (**0-token Inbox Sync ON, Auto-Review OFF** by default until opted in).
+  - Added multi-role attribution (`matchedRoles` / `roleLabel`, e.g. `Review Requested + Reviewed by @me`), `authoredPrMode` (`feedback_only` vs. `all_open` self-review on push), custom GitHub search queries (`customQuery` with `@me` token expansion), and global `extraSearchFlags` (with non-`304` search pacing to protect against GitHub secondary rate limits).
+
 ## [1.6.0] - 2026-11-16
 
 ### Added

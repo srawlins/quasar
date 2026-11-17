@@ -1749,8 +1749,23 @@ const DEFAULT_INBOX_SETTINGS = {
   enabled: false,
   mode: 'auto_precompute',
   watchReviewRequested: true,
+  watchReviewedBy: true,
+  watchCommented: true,
+  watchMentioned: true,
   watchAuthoredPrs: true,
+  watchWatchedRepos: true,
+  watchCustomQuery: true,
   watchInvolvedPrs: true,
+  autoReviewReviewRequested: true,
+  autoReviewReviewedBy: false,
+  autoReviewCommented: false,
+  autoReviewMentioned: false,
+  autoReviewAuthoredPrs: false,
+  autoReviewWatchedRepos: false,
+  autoReviewCustomQuery: false,
+  authoredPrMode: 'feedback_only',
+  customQuery: '',
+  extraSearchFlags: '',
   watchedRepos: [],
   restrictToWatchedRepos: false,
   includeDrafts: false,
@@ -1764,12 +1779,90 @@ const DEFAULT_INBOX_SETTINGS = {
   notifyWhenReady: true,
 };
 
+const INBOX_ROLE_SHORT_LABELS = {
+  author: 'My PR',
+  reviewer: 'Review Requested',
+  reviewed_by: 'Reviewed by @me',
+  commented: 'Commented',
+  mentioned: 'Mentioned/Assigned',
+  involved: 'Involved',
+  custom_query: 'Custom Query',
+  watched_repo: 'Watched Repo',
+};
+
+function isInboxRoleWatchEnabled(role, settings) {
+  const r = String(role || 'reviewer');
+  if (r === 'author') return settings.watchAuthoredPrs !== false;
+  if (r === 'reviewer') return settings.watchReviewRequested !== false;
+  if (r === 'reviewed_by') return settings.watchReviewedBy !== false;
+  if (r === 'commented') return settings.watchCommented !== false;
+  if (r === 'mentioned') return settings.watchMentioned !== false;
+  if (r === 'involved') {
+    return (
+      settings.watchReviewedBy !== false ||
+      settings.watchCommented !== false ||
+      settings.watchMentioned !== false
+    );
+  }
+  if (r === 'watched_repo') {
+    return (
+      settings.watchWatchedRepos !== false &&
+      Array.isArray(settings.watchedRepos) &&
+      settings.watchedRepos.length > 0 &&
+      !settings.restrictToWatchedRepos
+    );
+  }
+  if (r === 'custom_query') {
+    return settings.watchCustomQuery !== false && Boolean(String(settings.customQuery || '').trim());
+  }
+  return true;
+}
+
+function isInboxRoleAutoReviewEnabled(role, settings) {
+  const r = String(role || 'reviewer');
+  if (!isInboxRoleWatchEnabled(r, settings)) return false;
+  if (r === 'author') return Boolean(settings.autoReviewAuthoredPrs);
+  if (r === 'reviewer') return settings.autoReviewReviewRequested !== false;
+  if (r === 'reviewed_by') return Boolean(settings.autoReviewReviewedBy);
+  if (r === 'commented') return Boolean(settings.autoReviewCommented);
+  if (r === 'mentioned') return Boolean(settings.autoReviewMentioned);
+  if (r === 'involved') {
+    return Boolean(
+      settings.autoReviewReviewedBy ||
+        settings.autoReviewCommented ||
+        settings.autoReviewMentioned
+    );
+  }
+  if (r === 'watched_repo') return Boolean(settings.autoReviewWatchedRepos);
+  if (r === 'custom_query') return Boolean(settings.autoReviewCustomQuery);
+  return false;
+}
+
+function getInboxItemRoles(it) {
+  const out = [];
+  if (Array.isArray(it.matchedRoles)) {
+    for (const r of it.matchedRoles) {
+      const rs = String(r || '').trim();
+      if (rs && !out.includes(rs)) out.push(rs);
+    }
+  }
+  const primary = String(it.role || 'reviewer').trim();
+  if (primary && !out.includes(primary)) out.unshift(primary);
+  return out.length ? out : ['reviewer'];
+}
+
 function loadInboxPayloadSync() {
   let settings = { ...DEFAULT_INBOX_SETTINGS };
   if (fs.existsSync(INBOX_SETTINGS_PATH)) {
     try {
       const raw = JSON.parse(fs.readFileSync(INBOX_SETTINGS_PATH, 'utf-8'));
       if (raw && typeof raw === 'object') {
+        if ('watchInvolvedPrs' in raw) {
+          const leg = Boolean(raw.watchInvolvedPrs);
+          for (const gk of ['watchReviewedBy', 'watchCommented', 'watchMentioned']) {
+            if (!(gk in raw)) settings[gk] = leg;
+          }
+        }
         settings = { ...settings, ...raw };
       }
     } catch (_) { }
@@ -1808,6 +1901,7 @@ function loadInboxPayloadSync() {
     } catch (_) { }
   }
 
+  const authoredAllOpen = String(settings.authoredPrMode || 'feedback_only') === 'all_open';
   const itemsList = [];
   const rawItems = state.items && typeof state.items === 'object' ? state.items : {};
   for (const rawIt of Object.values(rawItems)) {
@@ -1815,8 +1909,43 @@ function loadInboxPayloadSync() {
     if (rawIt.openInQueue === false && rawIt.status !== 'ready') continue;
     if (rawIt.dismissed) continue;
     const it = { ...rawIt };
-    const st = String(it.status || 'queued');
+    let st = String(it.status || 'queued');
     const role = String(it.role || 'reviewer');
+    const roles = getInboxItemRoles(it);
+    const watchOn = roles.some((r) => isInboxRoleWatchEnabled(r, settings));
+    if (st !== 'ready' && st !== 'analyzing' && !watchOn && !it.manualAutoReviewQueued) continue;
+
+    if (role === 'author') {
+      if (authoredAllOpen && st === 'waiting_on_reviewers') {
+        st = 'queued';
+        it.status = 'queued';
+      } else if (
+        !authoredAllOpen &&
+        st === 'queued' &&
+        it.hasExternalFeedback === false &&
+        Number(it.issueCommentsCount || 0) === 0
+      ) {
+        st = 'waiting_on_reviewers';
+        it.status = 'waiting_on_reviewers';
+      }
+    }
+
+    const autoOn = Boolean(
+      it.manualAutoReviewQueued || roles.some((r) => isInboxRoleAutoReviewEnabled(r, settings))
+    );
+    it.autoReviewEnabled = autoOn;
+    it.roleLabel = roles.map((r) => INBOX_ROLE_SHORT_LABELS[r] || r).join(' + ');
+    const prevSkip = String(it.skipReason || '');
+    if (st === 'queued') {
+      if (!autoOn) {
+        if (!prevSkip || prevSkip.startsWith('Inbox-only (')) {
+          it.skipReason = `Inbox-only (${it.roleLabel} auto-review is off)`;
+        }
+      } else if (prevSkip.startsWith('Inbox-only (')) {
+        delete it.skipReason;
+      }
+    }
+
     if (st === 'quarantined') it.inboxGroup = 'quarantined';
     else if (st === 'analyzing') it.inboxGroup = 'in_progress';
     else if (st === 'ready' && role === 'author') it.inboxGroup = 'author_action_needed';
@@ -2194,10 +2323,14 @@ class InboxTreeProvider {
         const roleLabelMap = {
           author: 'Author (@me)',
           reviewer: 'Review Requested (@me)',
+          reviewed_by: 'Reviewed by @me',
+          commented: 'Commented on by @me',
+          mentioned: 'Mentioned / Assigned (@me)',
           involved: 'Involved (@me)',
+          custom_query: 'Custom GitHub Query',
           watched_repo: 'Watched Repo',
         };
-        const roleLabel = roleLabelMap[it.role] || String(it.role || 'reviewer');
+        const roleLabel = it.roleLabel || roleLabelMap[it.role] || String(it.role || 'reviewer');
         const diffTipSuffix = hasDiffStats
           ? ` • **Diff**: \`+${it.additions || 0} / -${it.deletions || 0}\` (${it.changedFilesCount || 0} files)`
           : '';
@@ -8021,12 +8154,30 @@ function activate(context) {
         const snap = loadInboxPayloadSync();
         const cfg = snap.settings;
         const isRunning = Boolean(snap.daemon && snap.daemon.running);
-        const scopeParts = [];
-        if (cfg.watchReviewRequested !== false) scopeParts.push('Assigned to @me');
-        if (cfg.watchInvolvedPrs !== false) scopeParts.push('Involving @me');
-        if (cfg.watchAuthoredPrs !== false) scopeParts.push('My PRs w/ comments');
-        if (Array.isArray(cfg.watchedRepos) && cfg.watchedRepos.length > 0) {
-          scopeParts.push(`${cfg.watchedRepos.length} repo(s)`);
+        const syncParts = [];
+        if (cfg.watchReviewRequested !== false) syncParts.push('Requested');
+        if (cfg.watchReviewedBy !== false) syncParts.push('Reviewed');
+        if (cfg.watchCommented !== false) syncParts.push('Commented');
+        if (cfg.watchMentioned !== false) syncParts.push('Mentioned');
+        if (cfg.watchAuthoredPrs !== false) syncParts.push('My PRs');
+        if (Array.isArray(cfg.watchedRepos) && cfg.watchedRepos.length > 0 && cfg.watchWatchedRepos !== false && !cfg.restrictToWatchedRepos) {
+          syncParts.push(`${cfg.watchedRepos.length} repo(s)`);
+        }
+        if (String(cfg.customQuery || '').trim() && cfg.watchCustomQuery !== false) {
+          syncParts.push('Custom Query');
+        }
+
+        const autoParts = [];
+        if (cfg.autoReviewReviewRequested !== false && cfg.watchReviewRequested !== false) autoParts.push('Requested');
+        if (cfg.autoReviewReviewedBy && cfg.watchReviewedBy !== false) autoParts.push('Reviewed');
+        if (cfg.autoReviewCommented && cfg.watchCommented !== false) autoParts.push('Commented');
+        if (cfg.autoReviewMentioned && cfg.watchMentioned !== false) autoParts.push('Mentioned');
+        if (cfg.autoReviewAuthoredPrs && cfg.watchAuthoredPrs !== false) autoParts.push('My PRs');
+        if (cfg.autoReviewWatchedRepos && cfg.watchWatchedRepos !== false && Array.isArray(cfg.watchedRepos) && cfg.watchedRepos.length > 0) {
+          autoParts.push('Watched Repos');
+        }
+        if (cfg.autoReviewCustomQuery && cfg.watchCustomQuery !== false && String(cfg.customQuery || '').trim()) {
+          autoParts.push('Custom Query');
         }
 
         const menuItems = [
@@ -8046,6 +8197,40 @@ function activate(context) {
             description: snap.lastSyncedAt ? `Last synced: ${snap.lastSyncedAt}` : 'Not synced yet',
             detail: 'Polls GitHub REST API for matching open PRs without running any model tokens',
             act: 'sync_now',
+          },
+          {
+            label: `$(zap) Auto-Review Sources (Spends Tokens): ${
+              cfg.mode === 'sync_queue_only' ? 'Off (Sync Only Mode)' : autoParts.join(' + ') || 'None'
+            }`,
+            description: 'Choose which PR flags automatically run background reviews (default: Requesting @me only)',
+            act: 'auto_scope',
+          },
+          {
+            label: `$(inbox) Inbox Sync Sources (0 Tokens): ${syncParts.join(' + ') || 'None'}${
+              cfg.includeDrafts ? ' (incl. drafts)' : ''
+            }`,
+            description: 'Choose which PR flags enter your Inbox for 0-token visibility & manual ⚡ pre-review',
+            act: 'sync_scope',
+          },
+          {
+            label: `$(git-pull-request) My Own PRs Trigger Mode: ${
+              cfg.authoredPrMode === 'all_open'
+                ? 'All Open PRs (Self-Review on Push)'
+                : 'Only When External Comments / Reviews Exist'
+            }`,
+            description: 'Control when author:@me PRs enter your active review queue',
+            act: 'authored_mode',
+          },
+          {
+            label: `$(search) Custom GitHub Search Query & Extra Flags`,
+            description:
+              [
+                cfg.customQuery ? `Query: ${cfg.customQuery}` : '',
+                cfg.extraSearchFlags ? `Extra: ${cfg.extraSearchFlags}` : '',
+              ]
+                .filter(Boolean)
+                .join(' • ') || 'None configured (click to set custom GitHub qualifiers)',
+            act: 'custom_flags',
           },
           {
             label: `$(sliders) Watcher Mode: ${cfg.mode === 'sync_queue_only'
@@ -8072,16 +8257,10 @@ function activate(context) {
             act: 'poll_interval',
           },
           {
-            label: `$(zap) Background Effort & Format: ${String(cfg.effort || 'high').toUpperCase()} • ${cfg.commentsOnly ? 'Comments Only' : 'Full CliffsNotes + Tour'
+            label: `$(flame) Background Effort & Format: ${String(cfg.effort || 'high').toUpperCase()} • ${cfg.commentsOnly ? 'Comments Only' : 'Full CliffsNotes + Tour'
               }`,
             description: 'Default effort level and output format for background pre-reviews',
             act: 'effort',
-          },
-          {
-            label: `$(target) Trigger Scope: ${scopeParts.join(' + ') || 'None'}${cfg.includeDrafts ? ' (incl. drafts)' : ''
-              }`,
-            description: 'Choose which PRs enter your Inbox (Assigned to @me, Authored PRs, Drafts)',
-            act: 'scope',
           },
           {
             label: `$(repo) Watched Repositories Filter / Extra Repos (${(cfg.watchedRepos || []).length
@@ -8200,8 +8379,77 @@ function activate(context) {
             ]);
             refreshInboxUI(false);
           }
-        } else if (picked.act === 'scope') {
-          const scopePicks = await vscode.window.showQuickPick(
+        } else if (picked.act === 'auto_scope') {
+          const autoPicks = await vscode.window.showQuickPick(
+            [
+              {
+                label: 'Incoming PRs Requesting My Review (review-requested:@me) — Recommended',
+                picked: cfg.autoReviewReviewRequested !== false && cfg.watchReviewRequested !== false,
+                key: 'autoReviewReviewRequested',
+                watchKey: 'watchReviewRequested',
+              },
+              {
+                label: "PRs I've Previously Reviewed (reviewed-by:@me)",
+                picked: Boolean(cfg.autoReviewReviewedBy && cfg.watchReviewedBy !== false),
+                key: 'autoReviewReviewedBy',
+                watchKey: 'watchReviewedBy',
+              },
+              {
+                label: "PRs I've Commented On (commenter:@me)",
+                picked: Boolean(cfg.autoReviewCommented && cfg.watchCommented !== false),
+                key: 'autoReviewCommented',
+                watchKey: 'watchCommented',
+              },
+              {
+                label: 'PRs Mentioning or Assigned to Me (mentions:@me / assignee:@me)',
+                picked: Boolean(cfg.autoReviewMentioned && cfg.watchMentioned !== false),
+                key: 'autoReviewMentioned',
+                watchKey: 'watchMentioned',
+              },
+              {
+                label: 'My Own Open PRs (author:@me)',
+                picked: Boolean(cfg.autoReviewAuthoredPrs && cfg.watchAuthoredPrs !== false),
+                key: 'autoReviewAuthoredPrs',
+                watchKey: 'watchAuthoredPrs',
+              },
+              {
+                label: 'Open PRs in Watched Repositories (watchedRepos)',
+                picked: Boolean(cfg.autoReviewWatchedRepos && cfg.watchWatchedRepos !== false),
+                key: 'autoReviewWatchedRepos',
+                watchKey: 'watchWatchedRepos',
+              },
+              {
+                label: 'PRs Matching Custom GitHub Search Query (customQuery)',
+                picked: Boolean(cfg.autoReviewCustomQuery && cfg.watchCustomQuery !== false),
+                key: 'autoReviewCustomQuery',
+                watchKey: 'watchCustomQuery',
+              },
+            ],
+            {
+              canPickMany: true,
+              title: '⚡ Select Which PR Sources Automatically Run Background Reviews (Spends Tokens)',
+              placeHolder: 'Unchecked sources can still sync into your Inbox for 0 tokens and manual ⚡ clicks',
+            }
+          );
+          if (autoPicks) {
+            const chosenKeys = new Set(autoPicks.map((p) => p.key));
+            const patch = {
+              autoReviewReviewRequested: chosenKeys.has('autoReviewReviewRequested'),
+              autoReviewReviewedBy: chosenKeys.has('autoReviewReviewedBy'),
+              autoReviewCommented: chosenKeys.has('autoReviewCommented'),
+              autoReviewMentioned: chosenKeys.has('autoReviewMentioned'),
+              autoReviewAuthoredPrs: chosenKeys.has('autoReviewAuthoredPrs'),
+              autoReviewWatchedRepos: chosenKeys.has('autoReviewWatchedRepos'),
+              autoReviewCustomQuery: chosenKeys.has('autoReviewCustomQuery'),
+            };
+            for (const p of autoPicks) {
+              if (p.watchKey) patch[p.watchKey] = true;
+            }
+            await runInboxWatcher(['--configure', '--settings-json', JSON.stringify(patch)]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'sync_scope') {
+          const syncPicks = await vscode.window.showQuickPick(
             [
               {
                 label: 'Incoming PRs Requesting My Review (review-requested:@me)',
@@ -8209,14 +8457,34 @@ function activate(context) {
                 key: 'watchReviewRequested',
               },
               {
-                label: 'Open PRs Involving @me — Mentions, Prior Reviews, Triage (involves:@me)',
-                picked: cfg.watchInvolvedPrs !== false,
-                key: 'watchInvolvedPrs',
+                label: "PRs I've Previously Reviewed (reviewed-by:@me)",
+                picked: cfg.watchReviewedBy !== false,
+                key: 'watchReviewedBy',
               },
               {
-                label: 'My Open PRs With New Comments / Changes Requested (author:@me)',
+                label: "PRs I've Commented On (commenter:@me)",
+                picked: cfg.watchCommented !== false,
+                key: 'watchCommented',
+              },
+              {
+                label: 'PRs Mentioning or Assigned to Me (mentions:@me / assignee:@me)',
+                picked: cfg.watchMentioned !== false,
+                key: 'watchMentioned',
+              },
+              {
+                label: 'My Own Open PRs (author:@me)',
                 picked: cfg.watchAuthoredPrs !== false,
                 key: 'watchAuthoredPrs',
+              },
+              {
+                label: 'Open PRs in Watched Repositories (when not restrict-only)',
+                picked: cfg.watchWatchedRepos !== false,
+                key: 'watchWatchedRepos',
+              },
+              {
+                label: 'PRs Matching Custom GitHub Search Query',
+                picked: cfg.watchCustomQuery !== false,
+                key: 'watchCustomQuery',
               },
               {
                 label: 'Include Draft PRs',
@@ -8226,22 +8494,94 @@ function activate(context) {
             ],
             {
               canPickMany: true,
-              title: 'Select Which PR Categories Enter Your Inbox',
+              title: '📥 Select Which PR Categories Sync Into Your Inbox (0 Tokens)',
             }
           );
-          if (scopePicks) {
-            const chosenKeys = new Set(scopePicks.map((p) => p.key));
+          if (syncPicks) {
+            const chosenKeys = new Set(syncPicks.map((p) => p.key));
             await runInboxWatcher([
               '--configure',
               '--settings-json',
               JSON.stringify({
                 watchReviewRequested: chosenKeys.has('watchReviewRequested'),
-                watchInvolvedPrs: chosenKeys.has('watchInvolvedPrs'),
+                watchReviewedBy: chosenKeys.has('watchReviewedBy'),
+                watchCommented: chosenKeys.has('watchCommented'),
+                watchMentioned: chosenKeys.has('watchMentioned'),
                 watchAuthoredPrs: chosenKeys.has('watchAuthoredPrs'),
+                watchWatchedRepos: chosenKeys.has('watchWatchedRepos'),
+                watchCustomQuery: chosenKeys.has('watchCustomQuery'),
                 includeDrafts: chosenKeys.has('includeDrafts'),
               }),
             ]);
             refreshInboxUI(false);
+          }
+        } else if (picked.act === 'authored_mode') {
+          const modePick = await vscode.window.showQuickPick(
+            [
+              {
+                label: '💬 Only When External Comments / Reviews Exist (Default)',
+                description: 'Sits quietly in Waiting until a reviewer comments or requests changes',
+                val: 'feedback_only',
+              },
+              {
+                label: '🔬 All My Open PRs (Self-Review on Push)',
+                description: 'Queues all your open PRs (including 0-comment PRs) as commits are pushed',
+                val: 'all_open',
+              },
+            ],
+            { title: 'My Own PRs (author:@me) Trigger Mode' }
+          );
+          if (modePick) {
+            await runInboxWatcher([
+              '--configure',
+              '--settings-json',
+              JSON.stringify({ authoredPrMode: modePick.val }),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'custom_flags') {
+          const cq = await vscode.window.showInputBox({
+            title: 'Custom GitHub PR Search Query (Optional)',
+            prompt:
+              'Standalone GitHub search query to include (supports @me; leave empty to disable)',
+            value: String(cfg.customQuery || ''),
+            placeHolder: 'e.g. repo:acme/backend label:security -label:wip',
+          });
+          if (cq !== undefined) {
+            const ef = await vscode.window.showInputBox({
+              title: 'Extra GitHub Search Flags Applied to All Queries (Optional)',
+              prompt:
+                'Appended to every Inbox search query (e.g. exclude bots or specific labels)',
+              value: String(cfg.extraSearchFlags || ''),
+              placeHolder: 'e.g. -label:do-not-merge -author:app/dependabot',
+            });
+            if (ef !== undefined) {
+              const patch = {
+                customQuery: cq.trim(),
+                extraSearchFlags: ef.trim(),
+              };
+              if (cq.trim()) {
+                const autoChoice = await vscode.window.showQuickPick(
+                  [
+                    {
+                      label: '📥 Sync Custom Query PRs to Inbox Only (0 Tokens)',
+                      auto: false,
+                    },
+                    {
+                      label: '⚡ Sync AND Auto-Review Custom Query PRs in Background',
+                      auto: true,
+                    },
+                  ],
+                  { title: 'How Should Custom Query PRs Be Handled?' }
+                );
+                if (autoChoice) {
+                  patch.watchCustomQuery = true;
+                  patch.autoReviewCustomQuery = autoChoice.auto;
+                }
+              }
+              await runInboxWatcher(['--configure', '--settings-json', JSON.stringify(patch)]);
+              refreshInboxUI(false);
+            }
           }
         } else if (picked.act === 'repos') {
           const repoStr = await vscode.window.showInputBox({

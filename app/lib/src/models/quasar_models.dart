@@ -61,8 +61,23 @@ class InboxSettings {
     required this.enabled,
     required this.mode,
     required this.watchReviewRequested,
+    this.watchReviewedBy = true,
+    this.watchCommented = true,
+    this.watchMentioned = true,
     required this.watchAuthoredPrs,
+    this.watchWatchedRepos = true,
+    this.watchCustomQuery = true,
     this.watchInvolvedPrs = true,
+    this.autoReviewReviewRequested = true,
+    this.autoReviewReviewedBy = false,
+    this.autoReviewCommented = false,
+    this.autoReviewMentioned = false,
+    this.autoReviewAuthoredPrs = false,
+    this.autoReviewWatchedRepos = false,
+    this.autoReviewCustomQuery = false,
+    this.authoredPrMode = 'feedback_only',
+    this.customQuery = '',
+    this.extraSearchFlags = '',
     required this.watchedRepos,
     required this.restrictToWatchedRepos,
     required this.includeDrafts,
@@ -80,12 +95,46 @@ class InboxSettings {
   factory InboxSettings.fromJson(Map<String, dynamic> json) {
     final List<dynamic> rawRepos =
         (json['watchedRepos'] as List<dynamic>?) ?? const <dynamic>[];
+    final bool legacyInvolved = json['watchInvolvedPrs'] != false;
+    final bool watchReq = json['watchReviewRequested'] != false;
+    final bool watchRevBy = json.containsKey('watchReviewedBy')
+        ? json['watchReviewedBy'] == true
+        : legacyInvolved;
+    final bool watchComm = json.containsKey('watchCommented')
+        ? json['watchCommented'] == true
+        : legacyInvolved;
+    final bool watchMent = json.containsKey('watchMentioned')
+        ? json['watchMentioned'] == true
+        : legacyInvolved;
+    final bool watchAuth = json['watchAuthoredPrs'] != false;
+    final bool watchRepos = json['watchWatchedRepos'] != false;
+    final bool watchCustom = json['watchCustomQuery'] != false;
     return InboxSettings(
       enabled: json['enabled'] == true,
       mode: '${json['mode'] ?? 'auto_precompute'}',
-      watchReviewRequested: json['watchReviewRequested'] != false,
-      watchAuthoredPrs: json['watchAuthoredPrs'] != false,
-      watchInvolvedPrs: json['watchInvolvedPrs'] != false,
+      watchReviewRequested: watchReq,
+      watchReviewedBy: watchRevBy,
+      watchCommented: watchComm,
+      watchMentioned: watchMent,
+      watchAuthoredPrs: watchAuth,
+      watchWatchedRepos: watchRepos,
+      watchCustomQuery: watchCustom,
+      watchInvolvedPrs: watchRevBy || watchComm || watchMent,
+      autoReviewReviewRequested:
+          watchReq && (json['autoReviewReviewRequested'] != false),
+      autoReviewReviewedBy:
+          watchRevBy && (json['autoReviewReviewedBy'] == true),
+      autoReviewCommented: watchComm && (json['autoReviewCommented'] == true),
+      autoReviewMentioned: watchMent && (json['autoReviewMentioned'] == true),
+      autoReviewAuthoredPrs:
+          watchAuth && (json['autoReviewAuthoredPrs'] == true),
+      autoReviewWatchedRepos:
+          watchRepos && (json['autoReviewWatchedRepos'] == true),
+      autoReviewCustomQuery:
+          watchCustom && (json['autoReviewCustomQuery'] == true),
+      authoredPrMode: '${json['authoredPrMode'] ?? 'feedback_only'}',
+      customQuery: '${json['customQuery'] ?? ''}',
+      extraSearchFlags: '${json['extraSearchFlags'] ?? ''}',
       watchedRepos: rawRepos
           .map((dynamic e) => '$e'.trim())
           .where((String s) => s.isNotEmpty)
@@ -109,8 +158,23 @@ class InboxSettings {
   final bool enabled;
   final String mode;
   final bool watchReviewRequested;
+  final bool watchReviewedBy;
+  final bool watchCommented;
+  final bool watchMentioned;
   final bool watchAuthoredPrs;
+  final bool watchWatchedRepos;
+  final bool watchCustomQuery;
   final bool watchInvolvedPrs;
+  final bool autoReviewReviewRequested;
+  final bool autoReviewReviewedBy;
+  final bool autoReviewCommented;
+  final bool autoReviewMentioned;
+  final bool autoReviewAuthoredPrs;
+  final bool autoReviewWatchedRepos;
+  final bool autoReviewCustomQuery;
+  final String authoredPrMode;
+  final String customQuery;
+  final String extraSearchFlags;
   final List<String> watchedRepos;
   final bool restrictToWatchedRepos;
   final bool includeDrafts;
@@ -135,6 +199,7 @@ class InboxItem {
     required this.url,
     required this.author,
     required this.role,
+    this.roleLabel = '',
     required this.status,
     required this.inboxGroup,
     required this.additions,
@@ -161,6 +226,7 @@ class InboxItem {
       url: '${json['url'] ?? ''}',
       author: '${json['author'] ?? ''}',
       role: '${json['role'] ?? 'reviewer'}',
+      roleLabel: '${json['roleLabel'] ?? ''}',
       status: '${json['status'] ?? 'queued'}',
       inboxGroup: '${json['inboxGroup'] ?? 'queued'}',
       additions: (json['additions'] as num?)?.toInt() ?? 0,
@@ -188,6 +254,7 @@ class InboxItem {
   final String url;
   final String author;
   final String role;
+  final String roleLabel;
   final String status;
   final String inboxGroup;
   final int additions;
