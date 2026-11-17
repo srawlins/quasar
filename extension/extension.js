@@ -2445,6 +2445,8 @@ class CliffsNotesTreeProvider {
             (s.cliffsNotes && s.cliffsNotes.tldr ? `${s.cliffsNotes.tldr}\n\n` : '') +
             `*Click to load this review session into the current window.*`
         );
+        item.contextValue = 'past-review-item';
+        item.pastReviewEntry = entry;
         item.command = {
           command: 'quasar.switchPastReview',
           title: 'Load Past Review Session',
@@ -2515,6 +2517,7 @@ class CliffsNotesTreeProvider {
           vscode.TreeItemCollapsibleState.Expanded
         );
         pastNode.iconPath = new vscode.ThemeIcon('history');
+        pastNode.contextValue = 'past-reviews-group';
         pastNode.nodeType = 'past-reviews-root';
         pastNode.pastReviews = pastReviews;
         emptyRootItems.push(pastNode);
@@ -2693,6 +2696,7 @@ class CliffsNotesTreeProvider {
         );
         pastNode.description = 'Switch to any previous PR or branch review';
         pastNode.iconPath = new vscode.ThemeIcon('history');
+        pastNode.contextValue = 'past-reviews-group';
         pastNode.nodeType = 'past-reviews-root';
         pastNode.pastReviews = pastReviews;
         rootItems.push(pastNode);
@@ -8277,9 +8281,18 @@ function activate(context) {
         },
         {
           label: `$(history) Past Reviews / Switch Review Session (${pastReviews.length} saved)...`,
-          description: 'Browse and reopen any previous PR or local branch review',
+          description: 'Browse, reopen, or delete any previous PR or local branch review',
           command: 'quasar.switchPastReview',
         },
+        ...(pastReviews.length > 0
+          ? [
+              {
+                label: '$(trash) Delete / Prune Saved Reviews...',
+                description: 'Delete selected past reviews, prune older than N days, or clear all',
+                command: 'quasar.manageSavedReviews',
+              },
+            ]
+          : []),
         {
           label: '$(organization) Add / Manage Review Subagents (review-*)...',
           description: (() => {
@@ -12656,6 +12669,13 @@ function activate(context) {
                 'Keeps the existing CliffsNotes & findings without re-running the AI, resetting read stops, fix checkboxes, and comment statuses back to their initial state.',
               mode: 'soft_reset',
             },
+            {
+              label: '$(trash) Delete Active Review Permanently',
+              description: `Close ${targetLabel} and permanently remove from History, Inbox & Snapshots`,
+              detail:
+                'Closes review tabs and deletes all saved session data and snapshots for this PR/branch (without touching your learned preferences).',
+              mode: 'delete_permanent',
+            },
           ],
           {
             title: `Reset or Close Quasar Review (${targetLabel})`,
@@ -12715,6 +12735,31 @@ function activate(context) {
         return;
       }
 
+      if (mode === 'delete_permanent') {
+        const revId = getSessionArchiveId(session) || String(session.sessionId || '');
+        const confirm = await vscode.window.showWarningMessage(
+          `Permanently delete saved review for ${targetLabel}?`,
+          { modal: true },
+          'Delete Permanently'
+        );
+        if (confirm !== 'Delete Permanently') return;
+        await closeQuasarReviewTabs(session);
+        for (const oldThread of activeCommentThreads.values()) {
+          try {
+            oldThread.dispose();
+          } catch (_) {}
+        }
+        activeCommentThreads.clear();
+        activeThreadMeta.clear();
+        await runInboxWatcher(['--delete-review', revId], 15000);
+        lastSessionId = null;
+        lastAnalysisStatus = null;
+        refreshAllUI(false);
+        refreshInboxUI(false);
+        vscode.window.showInformationMessage(`🗑️ Permanently deleted review for ${targetLabel}.`);
+        return;
+      }
+
       if (mode === 'rerun') {
         const savedRepoDir = session.repoDir || pr.localRepoDir || getWindowWorkspaceRoot();
         const savedBranch = pr.headRefName || 'HEAD';
@@ -12744,9 +12789,172 @@ function activate(context) {
     })
   );
 
+  function formatBytesHuman(bytes) {
+    const n = Number(bytes || 0);
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.deleteReview', async (arg) => {
+      let reviewId = '';
+      let labelHint = '';
+      if (typeof arg === 'string') {
+        reviewId = arg;
+      } else if (arg && arg.pastReviewEntry) {
+        reviewId = arg.pastReviewEntry.id;
+        labelHint = arg.label || reviewId;
+      } else if (arg && arg.inboxItem) {
+        reviewId = arg.inboxItem.id;
+        labelHint = `${arg.inboxItem.repo}#${arg.inboxItem.number}`;
+      } else if (arg && arg.id) {
+        reviewId = String(arg.id);
+        labelHint = arg.title || reviewId;
+      }
+      if (!reviewId) {
+        await vscode.commands.executeCommand('quasar.manageSavedReviews');
+        return;
+      }
+
+      const activeSess = loadActiveSession();
+      const isCurrentActive = Boolean(
+        activeSess &&
+          (getSessionArchiveId(activeSess) === reviewId || String(activeSess.sessionId || '') === reviewId)
+      );
+      if (isCurrentActive) {
+        await closeQuasarReviewTabs(activeSess);
+        for (const oldThread of activeCommentThreads.values()) {
+          try {
+            oldThread.dispose();
+          } catch (_) {}
+        }
+        activeCommentThreads.clear();
+        activeThreadMeta.clear();
+        lastSessionId = null;
+        lastAnalysisStatus = null;
+      }
+
+      const res = await runInboxWatcher(['--delete-review', reviewId], 15000);
+      refreshAllUI(false);
+      refreshInboxUI(false);
+      if (res && res.ok) {
+        vscode.window.showInformationMessage(
+          `🗑️ Deleted review ${labelHint || reviewId} (freed ${formatBytesHuman(res.freedBytes)}).`
+        );
+      } else {
+        vscode.window.showErrorMessage(
+          `Could not delete review: ${(res && res.error) || 'Unknown error'}`
+        );
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.manageSavedReviews', async () => {
+      const listRes = await runInboxWatcher(['--list-reviews'], 10000);
+      const reviews = (listRes && Array.isArray(listRes.reviews) ? listRes.reviews : []);
+      if (reviews.length === 0) {
+        vscode.window.showInformationMessage('No saved Quasar reviews found on disk.');
+        return;
+      }
+      const totalBytes = reviews.reduce((acc, r) => acc + Number(r.diskBytes || 0), 0);
+      const modePick = await vscode.window.showQuickPick(
+        [
+          {
+            label: '$(checklist) Select Specific Reviews to Delete...',
+            description: `${reviews.length} saved (${formatBytesHuman(totalBytes)} total)`,
+            mode: 'select',
+          },
+          {
+            label: '$(calendar) Prune Reviews Older Than 30 Days',
+            description: `${reviews.filter((r) => !r.inActiveWorkspace && Number(r.ageDays || 0) >= 30).length} matching`,
+            mode: 'prune_30',
+          },
+          {
+            label: '$(calendar) Prune Reviews Older Than 14 Days',
+            description: `${reviews.filter((r) => !r.inActiveWorkspace && Number(r.ageDays || 0) >= 14).length} matching`,
+            mode: 'prune_14',
+          },
+          {
+            label: '$(calendar) Prune Reviews Older Than 7 Days',
+            description: `${reviews.filter((r) => !r.inActiveWorkspace && Number(r.ageDays || 0) >= 7).length} matching`,
+            mode: 'prune_7',
+          },
+          {
+            label: '$(trash) Delete ALL Past Reviews (Keep Active Window Only)',
+            description: 'Clears History, Inbox cache & old Snapshots while keeping your learned preferences',
+            mode: 'all_inactive',
+          },
+        ],
+        {
+          title: `🗑️ Delete / Prune Saved Quasar Reviews (${reviews.length} saved • ${formatBytesHuman(totalBytes)})`,
+          placeHolder: 'Choose how you want to clean up old reviews and snapshots',
+        }
+      );
+      if (!modePick) return;
+
+      if (modePick.mode === 'select') {
+        const items = reviews.map((r) => ({
+          label: `${r.number ? '$(git-pull-request)' : '$(git-branch)'} ${r.title || r.id}`,
+          description: `${r.repo || ''}${r.inActiveWorkspace ? ' • (Active)' : ''} • ${r.ageDays}d old • ${formatBytesHuman(
+            r.diskBytes
+          )}`,
+          reviewId: r.id,
+        }));
+        const selected = await vscode.window.showQuickPick(items, {
+          canPickMany: true,
+          title: 'Select Reviews to Permanently Delete',
+          placeHolder: 'Check one or more saved reviews and press Enter to delete them',
+        });
+        if (!selected || selected.length === 0) return;
+        let freed = 0;
+        for (const item of selected) {
+          const r = await runInboxWatcher(['--delete-review', item.reviewId], 15000);
+          freed += Number((r && r.freedBytes) || 0);
+        }
+        refreshAllUI(false);
+        refreshInboxUI(false);
+        vscode.window.showInformationMessage(
+          `🗑️ Deleted ${selected.length} review(s) (freed ${formatBytesHuman(freed)}).`
+        );
+        return;
+      }
+
+      if (modePick.mode === 'all_inactive') {
+        const confirm = await vscode.window.showWarningMessage(
+          'Delete all past Quasar reviews and snapshots (except any currently open review)? Learned preferences are preserved.',
+          { modal: true },
+          'Delete All Past Reviews'
+        );
+        if (confirm !== 'Delete All Past Reviews') return;
+        const res = await runInboxWatcher(['--delete-all-reviews'], 20000);
+        refreshAllUI(false);
+        refreshInboxUI(false);
+        vscode.window.showInformationMessage(
+          `🗑️ Deleted ${(res && res.deletedCount) || 0} review(s) (freed ${formatBytesHuman(
+            res && res.freedBytes
+          )}).`
+        );
+        return;
+      }
+
+      const daysMap = { prune_30: '30', prune_14: '14', prune_7: '7' };
+      const days = daysMap[modePick.mode] || '30';
+      const res = await runInboxWatcher(['--prune-days', days], 20000);
+      refreshAllUI(false);
+      refreshInboxUI(false);
+      vscode.window.showInformationMessage(
+        `🗑️ Pruned ${(res && res.deletedCount) || 0} review(s) older than ${days} days (freed ${formatBytesHuman(
+          res && res.freedBytes
+        )}).`
+      );
+    })
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.switchPastReview', async (providedEntry) => {
-      const pastReviews = listPastReviews();
+      let pastReviews = listPastReviews();
       if (pastReviews.length === 0) {
         vscode.window.showInformationMessage('No past Quasar review sessions found yet.');
         return;
@@ -12759,45 +12967,93 @@ function activate(context) {
         providedEntry && providedEntry.session ? providedEntry : null;
 
       if (!chosen) {
-        const pickItems = pastReviews.map((entry) => {
-          const s = entry.session || {};
-          const p = s.pr || {};
-          const isCurrent = Boolean(currentId && entry.id === currentId);
-          const titleStr = p.number
-            ? `PR #${p.number}: ${p.title || entry.id}`
-            : p.title || `Branch: ${p.headRefName || entry.id}`;
-          const stopsCount = (s.chapters || []).reduce(
-            (acc, ch) => acc + ((ch.stops || []).length || 0),
-            0
-          );
-          const threadsCount = (s.threads || []).filter((t) => t.status !== 'dismissed').length;
-          const dateStr = entry.updatedMs
-            ? new Date(entry.updatedMs).toLocaleString(undefined, {
-                month: 'short',
-                day: 'numeric',
-                hour: 'numeric',
-                minute: '2-digit',
-              })
-            : '';
-          return {
-            label: `${p.number ? '$(git-pull-request)' : '$(git-branch)'} ${titleStr}`,
-            description: `${p.repo || ''}${dateStr ? ` • ${dateStr}` : ''}${
-              isCurrent ? ' • (Active in this window)' : ''
-            }`,
-            detail: `${stopsCount} tour stop(s) • ${threadsCount} comment(s) • +${
-              p.additions || 0
-            }/-${p.deletions || 0}${
-              s.cliffsNotes && s.cliffsNotes.tldr ? ` — ${s.cliffsNotes.tldr.slice(0, 120)}` : ''
-            }`,
-            entry,
-          };
-        });
+        const trashBtn = {
+          iconPath: new vscode.ThemeIcon('trash'),
+          tooltip: 'Delete this saved review permanently',
+        };
+        const buildPickItems = (entries) => {
+          const rows = entries.map((entry) => {
+            const s = entry.session || {};
+            const p = s.pr || {};
+            const isCurrent = Boolean(currentId && entry.id === currentId);
+            const titleStr = p.number
+              ? `PR #${p.number}: ${p.title || entry.id}`
+              : p.title || `Branch: ${p.headRefName || entry.id}`;
+            const stopsCount = (s.chapters || []).reduce(
+              (acc, ch) => acc + ((ch.stops || []).length || 0),
+              0
+            );
+            const threadsCount = (s.threads || []).filter((t) => t.status !== 'dismissed').length;
+            const dateStr = entry.updatedMs
+              ? new Date(entry.updatedMs).toLocaleString(undefined, {
+                  month: 'short',
+                  day: 'numeric',
+                  hour: 'numeric',
+                  minute: '2-digit',
+                })
+              : '';
+            return {
+              label: `${p.number ? '$(git-pull-request)' : '$(git-branch)'} ${titleStr}`,
+              description: `${p.repo || ''}${dateStr ? ` • ${dateStr}` : ''}${
+                isCurrent ? ' • (Active in this window)' : ''
+              }`,
+              detail: `${stopsCount} tour stop(s) • ${threadsCount} comment(s) • +${
+                p.additions || 0
+              }/-${p.deletions || 0}${
+                s.cliffsNotes && s.cliffsNotes.tldr ? ` — ${s.cliffsNotes.tldr.slice(0, 120)}` : ''
+              }`,
+              buttons: [trashBtn],
+              entry,
+            };
+          });
+          rows.push({
+            label: '$(trash) Delete / Prune Old Reviews...',
+            description: 'Bulk-delete selected reviews, prune > 30d, or clear all',
+            action: 'manage_delete',
+          });
+          return rows;
+        };
 
-        const selected = await vscode.window.showQuickPick(pickItems, {
-          title: `🕘 Quasar: Past Reviews (${pastReviews.length} saved)`,
-          placeHolder: 'Select any previous PR or local branch review to open in this window',
+        const selected = await new Promise((resolve) => {
+          const qp = vscode.window.createQuickPick();
+          qp.title = `🕘 Quasar: Past Reviews (${pastReviews.length} saved)`;
+          qp.placeholder = 'Click a review to open it, or click the 🗑️ icon on the right to delete it';
+          qp.items = buildPickItems(pastReviews);
+          let resolved = false;
+          qp.onDidTriggerItemButton(async (ev) => {
+            if (ev.item && ev.item.entry) {
+              await vscode.commands.executeCommand('quasar.deleteReview', {
+                pastReviewEntry: ev.item.entry,
+                label: ev.item.label.replace(/^\$\([^)]+\)\s*/, ''),
+              });
+              pastReviews = listPastReviews();
+              if (pastReviews.length === 0) {
+                resolved = true;
+                qp.hide();
+                resolve(null);
+              } else {
+                qp.title = `🕘 Quasar: Past Reviews (${pastReviews.length} saved)`;
+                qp.items = buildPickItems(pastReviews);
+              }
+            }
+          });
+          qp.onDidAccept(() => {
+            resolved = true;
+            const sel = qp.selectedItems[0] || null;
+            qp.hide();
+            resolve(sel);
+          });
+          qp.onDidHide(() => {
+            qp.dispose();
+            if (!resolved) resolve(null);
+          });
+          qp.show();
         });
         if (!selected) return;
+        if (selected.action === 'manage_delete') {
+          await vscode.commands.executeCommand('quasar.manageSavedReviews');
+          return;
+        }
         chosen = selected.entry;
       }
 

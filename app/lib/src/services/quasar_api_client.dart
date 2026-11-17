@@ -300,4 +300,20 @@ class QuasarApiClient {
       'action': action,
     });
   }
+
+  Future<Map<String, dynamic>> deleteReview(String sessionId) async {
+    return _postJson('/api/delete-review', <String, dynamic>{
+      'sessionId': sessionId,
+    });
+  }
+
+  Future<Map<String, dynamic>> pruneReviews({
+    double olderThanDays = 30,
+    bool deleteAll = false,
+  }) async {
+    return _postJson('/api/delete-review', <String, dynamic>{
+      'olderThanDays': olderThanDays,
+      'deleteAll': deleteAll,
+    });
+  }
 }

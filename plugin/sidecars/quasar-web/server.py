@@ -1358,6 +1358,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           <span class="text-xs font-normal text-[var(--q-muted)]">Web</span>
         </span>
         <select id="sessionSelect" class="bg-black/30 border border-[var(--q-border)] rounded px-2.5 py-1 text-xs max-w-xs truncate" title="Switch active or past review session"></select>
+        <button class="q-btn" onclick="openManageReviewsModal()" title="Delete or prune saved reviews">🗑️</button>
         <button class="q-btn" onclick="startTutorial()" title="Load the interactive sandbox PR tutorial">🎓 Tutorial</button>
         <button class="q-btn" onclick="openNewReviewModal()" title="Review a GitHub PR URL or local git branch">➕ New Review</button>
       </div>
@@ -3153,6 +3154,66 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    async function openManageReviewsModal() {
+      const sessions = STATE?.sessions || [];
+      if (!sessions.length) {
+        showToast('No saved reviews on disk.');
+        return;
+      }
+      const rowsHtml = sessions.map((s) => `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border:1px solid var(--q-border);border-radius:6px;background:rgba(0,0,0,0.2);">
+          <div style="min-width:0;flex:1;">
+            <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(s.title || s.id)}</div>
+            <div style="font-size:11px;color:var(--q-muted);">${esc(s.repo || '')}${s.updatedAt ? ' • ' + esc(String(s.updatedAt).slice(0, 10)) : ''}</div>
+          </div>
+          <button class="q-btn" onclick="deleteReviewWeb('${esc(s.sessionId || s.id)}')">🗑️ Delete</button>
+        </div>
+      `).join('');
+      openModal(`
+        <h3>🗑️ Delete / Prune Saved Reviews (${sessions.length})</h3>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;">
+          <button class="q-btn" onclick="pruneReviewsWeb(30)">Prune &gt; 30d</button>
+          <button class="q-btn" onclick="pruneReviewsWeb(14)">Prune &gt; 14d</button>
+          <button class="q-btn" onclick="pruneReviewsWeb(7)">Prune &gt; 7d</button>
+          <button class="q-btn" onclick="pruneReviewsWeb(0, true)">🗑️ Delete All Past Reviews</button>
+        </div>
+        <div style="max-height:300px;overflow-y:auto;display:grid;gap:6px;margin-bottom:12px;">
+          ${rowsHtml}
+        </div>
+        <div class="modal-footer" style="display:flex;justify-content:flex-end;">
+          <button class="btn" onclick="closeModal()">Done</button>
+        </div>
+      `);
+    }
+
+    async function deleteReviewWeb(sessionId) {
+      const res = await apiCall('/api/delete-review', 'POST', { sessionId });
+      if (res && res.ok) {
+        await refreshState();
+        showToast(`🗑️ Deleted review ${sessionId}`);
+        openManageReviewsModal();
+      } else {
+        showToast(res?.error || 'Failed to delete review', true);
+      }
+    }
+
+    async function pruneReviewsWeb(days, deleteAll = false) {
+      if (deleteAll && !confirm('Delete all past Quasar reviews and snapshots (keeping any active session & learned preferences)?')) {
+        return;
+      }
+      const res = await apiCall('/api/delete-review', 'POST', {
+        olderThanDays: days,
+        deleteAll: Boolean(deleteAll),
+      });
+      if (res && res.ok) {
+        closeModal();
+        await refreshState();
+        showToast(`🗑️ Deleted ${res.deletedCount || 0} review(s)!`);
+      } else {
+        showToast(res?.error || 'Failed to prune reviews', true);
+      }
+    }
+
     async function overrideQuarantine() {
       if (!confirm('Override Security / Prompt-Injection Quarantine? Only proceed if you manually inspected all flagged lines in the read-only diff and confirmed they are benign.')) {
         return;
@@ -4226,10 +4287,40 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                         st["items"][item_id]["status"] = "waiting_on_author"
                         st["items"][item_id]["unread"] = False
                     elif act == "dismiss":
+                        import shutil
+
+                        shutil.rmtree(os.path.join(inbox_watcher.INBOX_ITEMS_DIR, item_id), ignore_errors=True)
                         st["items"][item_id]["dismissed"] = True
                         st["items"][item_id]["unread"] = False
+                        st["items"][item_id].pop("analyzedFingerprint", None)
+                    elif act == "delete":
+                        inbox_watcher.delete_stored_review(item_id, include_active_workspace=True, dismiss_in_inbox=True)
+                        self._send_json(200, inbox_watcher.build_inbox_payload())
+                        return
                     inbox_watcher.save_inbox_state(st)
                 self._send_json(200, inbox_watcher.build_inbox_payload())
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if pathname == "/api/delete-review":
+            try:
+                import inbox_watcher  # type: ignore
+
+                target_sid = str(data.get("sessionId") or "").strip()
+                if target_sid:
+                    res = inbox_watcher.delete_stored_review(
+                        target_sid,
+                        include_active_workspace=bool(data.get("includeActive", True)),
+                        dismiss_in_inbox=True,
+                    )
+                else:
+                    res = inbox_watcher.prune_old_reviews(
+                        older_than_days=float(data.get("olderThanDays") or 30.0),
+                        delete_all=bool(data.get("deleteAll", False)),
+                        keep_active_workspaces=not bool(data.get("includeActive", False)),
+                    )
+                self._send_json(200 if res.get("ok") else 400, res)
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
             return

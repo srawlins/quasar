@@ -545,6 +545,174 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
     branchCtrl.dispose();
   }
 
+  Future<void> _openManageReviewsDialog() async {
+    final List<SessionSummary> initial =
+        List<SessionSummary>.from(_state?.sessions ?? const <SessionSummary>[]);
+    if (initial.isEmpty) {
+      _showSnack('No saved reviews found.');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) => StatefulBuilder(
+        builder: (BuildContext ctx2, void Function(void Function()) setModal) {
+          final List<SessionSummary> rows =
+              _state?.sessions ?? initial;
+          return AlertDialog(
+            backgroundColor: const Color(0xFF161B22),
+            title: Text(
+              '🗑️ Delete / Prune Saved Reviews (${rows.length})',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            content: SizedBox(
+              width: 520,
+              height: 360,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    children: <Widget>[
+                      OutlinedButton(
+                        onPressed: () async {
+                          final Map<String, dynamic> r =
+                              await _api.pruneReviews(olderThanDays: 30);
+                          await _refreshState();
+                          setModal(() {});
+                          _showSnack(
+                            '🗑️ Pruned ${r['deletedCount'] ?? 0} review(s) > 30d!',
+                          );
+                        },
+                        child: const Text('Prune > 30d'),
+                      ),
+                      OutlinedButton(
+                        onPressed: () async {
+                          final Map<String, dynamic> r =
+                              await _api.pruneReviews(olderThanDays: 14);
+                          await _refreshState();
+                          setModal(() {});
+                          _showSnack(
+                            '🗑️ Pruned ${r['deletedCount'] ?? 0} review(s) > 14d!',
+                          );
+                        },
+                        child: const Text('Prune > 14d'),
+                      ),
+                      OutlinedButton(
+                        onPressed: () async {
+                          final Map<String, dynamic> r =
+                              await _api.pruneReviews(olderThanDays: 7);
+                          await _refreshState();
+                          setModal(() {});
+                          _showSnack(
+                            '🗑️ Pruned ${r['deletedCount'] ?? 0} review(s) > 7d!',
+                          );
+                        },
+                        child: const Text('Prune > 7d'),
+                      ),
+                      OutlinedButton(
+                        onPressed: () async {
+                          final Map<String, dynamic> r =
+                              await _api.pruneReviews(deleteAll: true);
+                          await _refreshState();
+                          if (ctx2.mounted) {
+                            Navigator.of(ctx2).pop();
+                          }
+                          _showSnack(
+                            '🗑️ Deleted ${r['deletedCount'] ?? 0} past review(s)!',
+                          );
+                        },
+                        child: const Text('Delete All Past'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: ListView.separated(
+                      itemCount: rows.length,
+                      separatorBuilder: (_, _) => const SizedBox(height: 6),
+                      itemBuilder: (BuildContext _, int idx) {
+                        final SessionSummary s = rows[idx];
+                        return Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF0D1117),
+                            borderRadius: BorderRadius.circular(7),
+                            border: Border.all(color: const Color(0xFF30363D)),
+                          ),
+                          child: Row(
+                            children: <Widget>[
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: <Widget>[
+                                    Text(
+                                      s.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    Text(
+                                      '${s.repo}${s.updatedAt.isNotEmpty ? ' • ${s.updatedAt.split('T').first}' : ''}',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: Color(0xFF8B949E),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: 'Delete review',
+                                icon: const Icon(
+                                  Icons.delete_outline,
+                                  size: 17,
+                                  color: Color(0xFFF85149),
+                                ),
+                                onPressed: () async {
+                                  await _api.deleteReview(s.sessionId);
+                                  if (_selectedSessionId == s.sessionId) {
+                                    _selectedSessionId = null;
+                                  }
+                                  await _refreshState();
+                                  if ((_state?.sessions ?? const <SessionSummary>[])
+                                      .isEmpty) {
+                                    if (ctx2.mounted) {
+                                      Navigator.of(ctx2).pop();
+                                    }
+                                  } else {
+                                    setModal(() {});
+                                  }
+                                  _showSnack('🗑️ Deleted ${s.title}');
+                                },
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(ctx2).pop(),
+                child: const Text('Done'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _showPublishDialog(ReviewSession sess) async {
     String event = 'PENDING';
     final TextEditingController summaryCtrl =
@@ -846,6 +1014,19 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                     ),
                   ),
                 ),
+              if (sessions.isNotEmpty) ...<Widget>[
+                const SizedBox(width: 4),
+                IconButton(
+                  tooltip: 'Delete / Prune Saved Reviews',
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(
+                    Icons.delete_outline,
+                    size: 18,
+                    color: Color(0xFF8B949E),
+                  ),
+                  onPressed: _openManageReviewsDialog,
+                ),
+              ],
             ],
           ),
 

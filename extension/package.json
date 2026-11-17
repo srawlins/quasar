@@ -387,6 +387,18 @@
         "title": "Past Reviews / Switch Review Session...",
         "category": "Quasar",
         "icon": "$(history)"
+      },
+      {
+        "command": "quasar.deleteReview",
+        "title": "Delete Saved Review",
+        "category": "Quasar",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "quasar.manageSavedReviews",
+        "title": "Delete / Prune Saved Reviews...",
+        "category": "Quasar",
+        "icon": "$(trash)"
       }
     ],
     "keybindings": [
@@ -471,6 +483,11 @@
           "command": "quasar.switchPastReview",
           "when": "view == quasar.cliffsNotesTree",
           "group": "2_history@1"
+        },
+        {
+          "command": "quasar.manageSavedReviews",
+          "when": "view == quasar.cliffsNotesTree",
+          "group": "2_history@2"
         },
         {
           "command": "quasar.resetReview",
@@ -583,6 +600,26 @@
           "command": "quasar.dismissInboxItem",
           "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued || viewItem == inbox-item-quarantined)",
           "group": "1_inbox@3"
+        },
+        {
+          "command": "quasar.deleteReview",
+          "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued || viewItem == inbox-item-quarantined)",
+          "group": "1_inbox@4"
+        },
+        {
+          "command": "quasar.deleteReview",
+          "when": "view == quasar.cliffsNotesTree && viewItem == past-review-item",
+          "group": "inline@1"
+        },
+        {
+          "command": "quasar.deleteReview",
+          "when": "view == quasar.cliffsNotesTree && viewItem == past-review-item",
+          "group": "1_history@1"
+        },
+        {
+          "command": "quasar.manageSavedReviews",
+          "when": "view == quasar.cliffsNotesTree && viewItem == past-reviews-group",
+          "group": "inline@1"
         },
         {
           "command": "quasar.resetReview",

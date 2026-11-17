@@ -1762,6 +1762,283 @@ def run_daemon_loop() -> None:
                 break
 
 
+def _dir_size_bytes(path: str) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except Exception:
+            return 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except Exception:
+                pass
+    return total
+
+
+def _canonical_review_id(sess: Dict[str, Any], fallback_id: str = "") -> str:
+    raw_id = str(sess.get("sessionId") or "").strip()
+    if not raw_id:
+        pr = sess.get("pr") or {}
+        if pr.get("number") and str(pr.get("owner") or "") != "local":
+            raw_id = f"{pr.get('owner', 'gh')}-{pr.get('repo', 'repo')}-pr-{pr.get('number')}"
+        elif pr.get("headRefName"):
+            raw_id = f"local-{pr.get('repo', 'repo')}-{pr.get('headRefName')}"
+        else:
+            raw_id = fallback_id
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_id).strip("-")
+
+
+def list_stored_reviews() -> List[Dict[str, Any]]:
+    """Lists all stored reviews across History, Inbox staging, and Active Workspaces."""
+    records: Dict[str, Dict[str, Any]] = {}
+    snaps_root = os.path.join(REVIEW_STATE_DIR, "snapshots")
+    now_ts = time.time()
+
+    def _merge_sess(path: str, kind: str, folder_id: str = "") -> None:
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                sess = json.load(f)
+        except Exception:
+            return
+        if not isinstance(sess, dict):
+            return
+        rid = _canonical_review_id(sess, folder_id)
+        if not rid:
+            return
+        pr = sess.get("pr") or {}
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0.0
+        rec = records.get(rid)
+        if rec is None:
+            title = (
+                f"PR #{pr['number']}: {pr.get('title', '')}"
+                if pr.get("number")
+                else (pr.get("title") or f"Branch: {pr.get('headRefName', rid)}")
+            )
+            rec = {
+                "id": rid,
+                "sessionId": rid,
+                "title": title,
+                "repo": str(pr.get("repo") or ""),
+                "owner": str(pr.get("owner") or ""),
+                "number": int(pr.get("number") or 0) if str(pr.get("number") or "").isdigit() else 0,
+                "updatedAt": str(sess.get("updatedAt") or ""),
+                "mtime": mtime,
+                "inHistory": False,
+                "inInbox": False,
+                "inActiveWorkspace": False,
+                "historyDirs": [],
+                "inboxDirs": [],
+                "workspaceDirs": [],
+            }
+            records[rid] = rec
+        else:
+            if mtime > float(rec.get("mtime") or 0.0):
+                rec["mtime"] = mtime
+                if sess.get("updatedAt"):
+                    rec["updatedAt"] = str(sess["updatedAt"])
+        parent_dir = os.path.dirname(os.path.abspath(path))
+        if kind == "history":
+            rec["inHistory"] = True
+            if parent_dir not in rec["historyDirs"]:
+                rec["historyDirs"].append(parent_dir)
+        elif kind == "inbox":
+            rec["inInbox"] = True
+            if parent_dir not in rec["inboxDirs"]:
+                rec["inboxDirs"].append(parent_dir)
+        elif kind == "workspace":
+            rec["inActiveWorkspace"] = True
+            if parent_dir not in rec["workspaceDirs"]:
+                rec["workspaceDirs"].append(parent_dir)
+
+    if os.path.isdir(HISTORY_STATE_DIR):
+        for entry in os.listdir(HISTORY_STATE_DIR):
+            _merge_sess(os.path.join(HISTORY_STATE_DIR, entry, "session.json"), "history", entry)
+    if os.path.isdir(INBOX_ITEMS_DIR):
+        for entry in os.listdir(INBOX_ITEMS_DIR):
+            _merge_sess(os.path.join(INBOX_ITEMS_DIR, entry, "active_session.json"), "inbox", entry)
+    if os.path.isdir(WORKSPACES_STATE_DIR):
+        for entry in os.listdir(WORKSPACES_STATE_DIR):
+            _merge_sess(os.path.join(WORKSPACES_STATE_DIR, entry, "active_session.json"), "workspace", entry)
+
+    out: List[Dict[str, Any]] = []
+    for rid, rec in records.items():
+        disk_bytes = 0
+        for d in rec["historyDirs"] + rec["inboxDirs"]:
+            disk_bytes += _dir_size_bytes(d)
+        if os.path.isdir(snaps_root):
+            for sname in os.listdir(snaps_root):
+                if sname == rid or sname.startswith(f"{rid}-"):
+                    disk_bytes += _dir_size_bytes(os.path.join(snaps_root, sname))
+        rec["diskBytes"] = disk_bytes
+        rec["ageDays"] = round(max(0.0, (now_ts - float(rec.get("mtime") or now_ts)) / 86400.0), 1)
+        out.append(rec)
+
+    out.sort(key=lambda r: float(r.get("mtime") or 0.0), reverse=True)
+    return out
+
+
+def delete_stored_review(
+    review_id: str,
+    include_active_workspace: bool = True,
+    dismiss_in_inbox: bool = True,
+) -> Dict[str, Any]:
+    """Permanently deletes a stored review across `history/`, `inbox/items/`, `snapshots/`,
+    and (when `include_active_workspace=True`) any active workspace holding that session.
+    """
+    clean_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", (review_id or "").strip()).strip("-")
+    if not clean_id or "/" in clean_id or ".." in clean_id:
+        return {"ok": False, "error": f"Invalid review ID: '{review_id}'"}
+
+    freed_bytes = 0
+    removed_paths: List[str] = []
+
+    def _rm_dir(d_path: str) -> None:
+        nonlocal freed_bytes
+        if os.path.isdir(d_path):
+            freed_bytes += _dir_size_bytes(d_path)
+            shutil.rmtree(d_path, ignore_errors=True)
+            removed_paths.append(d_path)
+
+    # 1. History directories matching clean_id (either folder name or session.json sessionId)
+    if os.path.isdir(HISTORY_STATE_DIR):
+        _rm_dir(os.path.join(HISTORY_STATE_DIR, clean_id))
+        for entry in list(os.listdir(HISTORY_STATE_DIR)):
+            cand_dir = os.path.join(HISTORY_STATE_DIR, entry)
+            cand_json = os.path.join(cand_dir, "session.json")
+            if os.path.isfile(cand_json):
+                try:
+                    s_obj = json.load(open(cand_json, "r", encoding="utf-8"))
+                    if _canonical_review_id(s_obj, entry) == clean_id:
+                        _rm_dir(cand_dir)
+                except Exception:
+                    pass
+
+    # 2. Inbox staged item directory + state.json update
+    _rm_dir(os.path.join(INBOX_ITEMS_DIR, clean_id))
+    if os.path.isfile(INBOX_STATE_PATH):
+        st = load_inbox_state()
+        items = st.get("items") or {}
+        if clean_id in items:
+            if dismiss_in_inbox and items[clean_id].get("openInQueue", True):
+                items[clean_id]["dismissed"] = True
+                items[clean_id]["unread"] = False
+                items[clean_id]["status"] = "queued"
+                items[clean_id].pop("analyzedFingerprint", None)
+                items[clean_id].pop("tldr", None)
+                items[clean_id].pop("findingsCount", None)
+            else:
+                items.pop(clean_id, None)
+            save_inbox_state(st)
+
+    # 3. Snapshots (`snapshots/<clean_id>` and `snapshots/<clean_id>-*`)
+    snaps_root = os.path.join(REVIEW_STATE_DIR, "snapshots")
+    if os.path.isdir(snaps_root):
+        for sname in list(os.listdir(snaps_root)):
+            if sname == clean_id or sname.startswith(f"{clean_id}-"):
+                _rm_dir(os.path.join(snaps_root, sname))
+
+    # 4. Active workspaces holding this session
+    if include_active_workspace and os.path.isdir(WORKSPACES_STATE_DIR):
+        for entry in list(os.listdir(WORKSPACES_STATE_DIR)):
+            ws_dir = os.path.join(WORKSPACES_STATE_DIR, entry)
+            ws_sess = os.path.join(ws_dir, "active_session.json")
+            if not os.path.isfile(ws_sess):
+                continue
+            try:
+                s_obj = json.load(open(ws_sess, "r", encoding="utf-8"))
+            except Exception:
+                continue
+            if _canonical_review_id(s_obj) == clean_id:
+                for fn in (
+                    "active_session.json",
+                    "cliffs_notes.md",
+                    "pr_context.json",
+                    "pr.diff",
+                    "delta.diff",
+                    "incremental_base.json",
+                    "prior_session_for_delta.json",
+                    "quarantined_context.json",
+                    "quasar_review.html",
+                ):
+                    fp = os.path.join(ws_dir, fn)
+                    if os.path.isfile(fp):
+                        freed_bytes += _dir_size_bytes(fp)
+                        try:
+                            os.unlink(fp)
+                            removed_paths.append(fp)
+                        except Exception:
+                            pass
+
+    return {
+        "ok": True,
+        "deletedId": clean_id,
+        "removedPathsCount": len(removed_paths),
+        "freedBytes": freed_bytes,
+    }
+
+
+def prune_old_reviews(
+    older_than_days: float = 30.0,
+    delete_all: bool = False,
+    keep_active_workspaces: bool = True,
+) -> Dict[str, Any]:
+    """Deletes stored reviews older than `older_than_days` (or all stored reviews when `delete_all=True`),
+    plus any orphaned snapshot folders.
+    """
+    stored = list_stored_reviews()
+    deleted_ids: List[str] = []
+    freed_bytes = 0
+
+    for rec in stored:
+        if keep_active_workspaces and rec.get("inActiveWorkspace"):
+            continue
+        if delete_all or float(rec.get("ageDays") or 0.0) >= float(older_than_days):
+            res = delete_stored_review(
+                rec["id"],
+                include_active_workspace=not keep_active_workspaces,
+                dismiss_in_inbox=True,
+            )
+            if res.get("ok"):
+                deleted_ids.append(rec["id"])
+                freed_bytes += int(res.get("freedBytes") or 0)
+
+    # Also clean up orphaned snapshot directories not referenced by any remaining stored review
+    remaining_ids = {r["id"] for r in list_stored_reviews()}
+    snaps_root = os.path.join(REVIEW_STATE_DIR, "snapshots")
+    if os.path.isdir(snaps_root):
+        now_ts = time.time()
+        for sname in list(os.listdir(snaps_root)):
+            s_path = os.path.join(snaps_root, sname)
+            if not os.path.isdir(s_path):
+                continue
+            belongs = any(sname == rid or sname.startswith(f"{rid}-") for rid in remaining_ids)
+            if not belongs:
+                try:
+                    age_d = (now_ts - os.path.getmtime(s_path)) / 86400.0
+                except Exception:
+                    age_d = 999.0
+                if delete_all or age_d >= float(older_than_days):
+                    freed_bytes += _dir_size_bytes(s_path)
+                    shutil.rmtree(s_path, ignore_errors=True)
+
+    return {
+        "ok": True,
+        "deletedCount": len(deleted_ids),
+        "deletedIds": deleted_ids,
+        "freedBytes": freed_bytes,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Quasar Background Auto-Review Daemon & Multi-PR Inbox.")
     parser.add_argument("--get-state", action="store_true", help="Print full Inbox payload JSON")
@@ -1787,7 +2064,12 @@ def main() -> None:
     parser.add_argument("--activate-session", default="", help="Activate any completed session JSON path into the workspace in 0s")
     parser.add_argument("--check-session-freshness", action="store_true", help="Check if the workspace's active_session.json is behind the PR's latest GitHub HEAD SHA")
     parser.add_argument("--mark-reviewed", action="store_true", help="Mark an Inbox item as reviewed at its current HEAD SHA")
-    parser.add_argument("--dismiss-item", action="store_true", help="Dismiss/hide an Inbox item")
+    parser.add_argument("--dismiss-item", action="store_true", help="Dismiss/hide an Inbox item and clean up its staged files")
+    parser.add_argument("--list-reviews", action="store_true", help="List all stored reviews across History, Inbox, and Workspaces")
+    parser.add_argument("--delete-review", default="", help="Permanently delete a stored review ID across History, Inbox, Snapshots, and Workspaces")
+    parser.add_argument("--prune-days", type=float, default=None, help="Delete stored reviews and snapshots older than N days")
+    parser.add_argument("--delete-all-reviews", action="store_true", help="Delete all stored reviews and snapshots")
+    parser.add_argument("--include-active", action="store_true", help="Also delete reviews currently open in active workspaces when pruning")
     parser.add_argument("--item-id", default="", help="Target Inbox item ID")
     parser.add_argument("--workspace-dir", default=None, help="Target workspace directory for --activate")
     parser.add_argument("--start-daemon", action="store_true", help="Start background watcher daemon")
@@ -1920,12 +2202,37 @@ def main() -> None:
         print(json.dumps(build_inbox_payload(), indent=2))
         return
 
+    if args.list_reviews:
+        reviews = list_stored_reviews()
+        print(json.dumps({"ok": True, "count": len(reviews), "reviews": reviews}, indent=2))
+        return
+
+    if args.delete_review:
+        res = delete_stored_review(
+            args.delete_review.strip(),
+            include_active_workspace=True,
+            dismiss_in_inbox=True,
+        )
+        print(json.dumps(res, indent=2))
+        return
+
+    if args.delete_all_reviews or args.prune_days is not None:
+        res = prune_old_reviews(
+            older_than_days=float(args.prune_days if args.prune_days is not None else 0.0),
+            delete_all=bool(args.delete_all_reviews),
+            keep_active_workspaces=not bool(args.include_active),
+        )
+        print(json.dumps(res, indent=2))
+        return
+
     if args.dismiss_item and args.item_id:
-        st = load_inbox_state()
         iid = args.item_id.strip()
+        shutil.rmtree(os.path.join(INBOX_ITEMS_DIR, iid), ignore_errors=True)
+        st = load_inbox_state()
         if iid in st.get("items", {}):
             st["items"][iid]["dismissed"] = True
             st["items"][iid]["unread"] = False
+            st["items"][iid].pop("analyzedFingerprint", None)
             save_inbox_state(st)
         print(json.dumps(build_inbox_payload(), indent=2))
         return
