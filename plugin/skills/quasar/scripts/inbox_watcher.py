@@ -503,6 +503,11 @@ def sync_github_queue(
                     continue
             old_item["openInQueue"] = False
 
+    daemon_now = load_daemon_status()
+    active_daemon_ids = (
+        set(daemon_now.get("activeItemIds") or []) if daemon_now.get("running") else set()
+    )
+
     def _reconcile_status(
         existing: Dict[str, Any],
         item_id: str,
@@ -524,7 +529,16 @@ def sync_github_queue(
                 or (prev_status == "deleted" and prev_deleted_sha and prev_deleted_sha != head_sha)
             )
         )
+        still_actively_analyzing = False
         if prev_status == "analyzing":
+            if item_id in active_daemon_ids:
+                still_actively_analyzing = True
+            else:
+                started_dt = _parse_iso_dt(str(existing.get("startedAt") or ""))
+                if started_dt is not None and (now_utc - started_dt).total_seconds() < 180:
+                    still_actively_analyzing = True
+
+        if still_actively_analyzing:
             new_status = "analyzing"
         elif prev_status == "deleted":
             new_status = "deleted"
@@ -1401,6 +1415,11 @@ def run_precompute_for_item(
     if not item:
         return {"ok": False, "error": f"Inbox item '{item_id}' not found."}
 
+    if not count_against_daily_budget:
+        for k in ("failureCount", "retryAfter", "failedFingerprint", "skipReason", "lastError"):
+            item.pop(k, None)
+        save_inbox_state(st)
+
     # Only dig into `/pulls/{num}` ahead of `collect_pr_context.py` if local completed sessions exist
     # (so we can adopt a matching manual review for 0 tokens or stage an incremental delta base).
     # Otherwise, `collect_pr_context.py` fetches PR metadata once in Step 1 with zero duplicate calls!
@@ -1553,11 +1572,11 @@ def run_precompute_for_item(
     real_repo = os.path.realpath(repo_dir) if (repo_dir and os.path.isdir(repo_dir)) else ""
 
     allow_rules = [
-        r"command(regex:^python3\s+.*skills/quasar/scripts/.*)",
+        r"command(regex:^([^\n]*\s)?python3\s+.*skills/quasar/scripts/.*)",
         "command(git)",
         f"read_file({real_state_dir}/)",
+        f"write_file({real_state_dir}/)",
         f"write_file({real_item_dir}/)",
-        f"write_file({os.path.join(real_state_dir, 'history')}/)",
         f"read_file({real_plugin_dir}/)",
         f"read_file({real_agents_dir}/)",
     ]
@@ -1583,7 +1602,7 @@ def run_precompute_for_item(
         f"- Isolated Session Dir: `{item_dir}`\n\n"
         f"Using the `quasar` skill on `{effort}` effort:\n"
         f"1. Do NOT re-run `collect_pr_context.py` and do NOT call `ask_question`.\n"
-        f"2. Run Phase 2 (`{effort}` effort {'incremental delta ' if is_inc_run else ''}analysis, honoring `review_lenses` and `blindDiff: true` in `{item_dir}/pr_context.json`).\n"
+        f"2. Run Phase 2 (`{effort}` effort {'incremental delta ' if is_inc_run else ''}analysis, honoring `review_lenses` and `blindDiff: true` in `{item_dir}/pr_context.json`; keep intermediate subagent-wait replies to one short line).\n"
         f"3. Write `review_synthesis.json` to `{item_dir}/review_synthesis.json` and publish STRICTLY to the isolated session dir:\n"
         f'   `python3 "{publish_script}" --input "{item_dir}/review_synthesis.json" --session-dir "{item_dir}"{co_flag}`'
     )
@@ -1598,29 +1617,70 @@ def run_precompute_for_item(
     agy_cmd.append(f"--settings={session_settings}")
     agy_cmd.append(f"--print={prompt}")
 
+    timeout_by_effort = {"low": 1200, "medium": 1800, "high": 2400}
+    timeout_sec = timeout_by_effort.get(effort, 2400)
     log_path = os.path.join(item_dir, "precompute.log")
     run_cwd = real_repo if (real_repo and os.path.isdir(real_repo)) else item_dir
+    run_start_ts = time.time()
     try:
         with open(log_path, "w", encoding="utf-8") as lf:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 agy_cmd,
                 cwd=run_cwd,
                 env=env,
                 stdout=lf,
                 stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
                 text=True,
-                timeout=900,
+                start_new_session=True,
             )
+            published_at_ts: Optional[float] = None
+            while proc.poll() is None:
+                time.sleep(3.0)
+                if os.path.isfile(session_file) and os.path.getmtime(session_file) >= run_start_ts:
+                    if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
+                        if published_at_ts is None:
+                            published_at_ts = time.time()
+                        elif time.time() - published_at_ts > 20.0:
+                            # `publish_review_session.py` already wrote the completed session; reap lingering CLI
+                            try:
+                                os.killpg(proc.pid, signal.SIGTERM)
+                            except Exception:
+                                proc.terminate()
+                            break
+                if time.time() - run_start_ts > timeout_sec:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
+                        break
+                    raise TimeoutError(f"Background pre-review timed out after {timeout_sec // 60}m")
         metrics = _extract_session_metrics(session_file)
-        if metrics.get("analysisStatus") != "ready" and proc.returncode != 0:
-            raise RuntimeError(f"agy exited with code {proc.returncode}")
+        if metrics.get("analysisStatus") != "ready":
+            rc = proc.returncode if proc.returncode is not None else -1
+            raise RuntimeError(f"agy exited (code {rc}) before publishing ready session")
     except Exception as exc:
         if has_prior_backup and os.path.isfile(prior_backup_path):
             shutil.copy2(prior_backup_path, session_file)
         st = load_inbox_state()
         if item_id in st.get("items", {}):
-            st["items"][item_id]["status"] = "queued"
-            st["items"][item_id]["lastError"] = str(exc)[:300]
+            it_err = st["items"][item_id]
+            it_err["status"] = "queued"
+            it_err["lastError"] = str(exc)[:300]
+            fails = int(it_err.get("failureCount") or 0) + 1
+            it_err["failureCount"] = fails
+            it_err["failedFingerprint"] = str(
+                it_err.get("currentFingerprint") or it_err.get("headSha") or it_err.get("updatedAt") or "fp"
+            )
+            cooldown_min = min(360, 30 * (2 ** (fails - 1)))
+            it_err["retryAfter"] = (
+                _now_utc() + datetime.timedelta(minutes=cooldown_min)
+            ).isoformat()
             save_inbox_state(st)
         return {"ok": False, "error": str(exc)}
 
@@ -1637,7 +1697,8 @@ def run_precompute_for_item(
         it["analyzedEffort"] = effort
         it["completedAt"] = _now_iso()
         it["unread"] = True
-        it.pop("lastError", None)
+        for k in ("lastError", "failureCount", "retryAfter", "failedFingerprint", "skipReason"):
+            it.pop(k, None)
     save_inbox_state(st)
     return {"ok": True, "itemId": item_id, "status": "ready"}
 
@@ -1680,6 +1741,21 @@ def select_eligible_items_for_cycle(
             upd_dt = _parse_iso_dt(str(item.get("updatedAt") or ""))
             if upd_dt and (now - upd_dt).total_seconds() > cutoff_days * 86400:
                 item["skipReason"] = f"Older than {cutoff_days}d auto-review cutoff"
+                continue
+        cur_fp = str(
+            item.get("currentFingerprint") or item.get("headSha") or item.get("updatedAt") or "fp"
+        )
+        if item.get("failedFingerprint") and item.get("failedFingerprint") != cur_fp:
+            for k in ("failureCount", "retryAfter", "failedFingerprint", "lastError"):
+                item.pop(k, None)
+        elif int(item.get("failureCount") or 0) >= 3:
+            item["skipReason"] = "Paused auto-retry after 3 errors (click ⚡ to retry)"
+            continue
+        elif item.get("retryAfter"):
+            ra_dt = _parse_iso_dt(str(item["retryAfter"]))
+            if ra_dt and ra_dt > now:
+                mins_left = max(1, int((ra_dt - now).total_seconds() // 60))
+                item["skipReason"] = f"Error cooldown ({mins_left}m left — click ⚡ to retry)"
                 continue
         item.pop("skipReason", None)
         # Priority: 0 = updated since last review or changes requested, 1 = author PR w/ comments,
@@ -2129,6 +2205,11 @@ def stop_daemon_background() -> Dict[str, Any]:
 
 def run_daemon_loop() -> None:
     my_pid = os.getpid()
+    script_abspath = os.path.abspath(__file__)
+    try:
+        initial_script_mtime = os.path.getmtime(script_abspath)
+    except Exception:
+        initial_script_mtime = 0.0
     save_daemon_status({"running": True, "pid": my_pid, "startedAt": _now_iso(), "activeItemIds": []})
 
     def _handle_sigterm(_signum: int, _frame: Any) -> None:
@@ -2139,6 +2220,12 @@ def run_daemon_loop() -> None:
     signal.signal(signal.SIGINT, _handle_sigterm)
 
     while True:
+        # Hot-reload daemon process cleanly if `inbox_watcher.py` was upgraded on disk
+        try:
+            if initial_script_mtime and os.path.getmtime(script_abspath) != initial_script_mtime:
+                os.execv(sys.executable, [sys.executable, script_abspath, "--daemon-loop"])
+        except Exception:
+            pass
         # Exit if another daemon superseded our PID or user disabled `enabled`
         d_info = load_daemon_status()
         if d_info.get("pid") and int(d_info["pid"]) != my_pid:
@@ -2483,6 +2570,8 @@ def requeue_inbox_item(item_id: str) -> Dict[str, Any]:
         it.pop("deletedAt", None)
         it.pop("deletedAtSha", None)
         it.pop("reviewedHeadSha", None)
+        for k in ("failureCount", "retryAfter", "failedFingerprint", "skipReason", "lastError"):
+            it.pop(k, None)
         save_inbox_state(st)
     return build_inbox_payload()
 

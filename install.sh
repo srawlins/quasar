@@ -258,6 +258,28 @@ fi
 # Initialize default preferences.json & PREFERENCES.md if not present
 python3 "${PLUGIN_DEST}/skills/quasar/scripts/manage_preferences.py" --show >/dev/null 2>&1 || true
 
+# If Background Auto-Review Inbox is enabled and idle, restart the daemon so it runs the latest script
+if [ -f "${STATE_DIR}/inbox/settings.json" ]; then
+  python3 - "${STATE_DIR}/inbox/settings.json" "${STATE_DIR}/inbox/daemon.json" "${PLUGIN_DEST}/skills/quasar/scripts/inbox_watcher.py" <<'PY' 2>/dev/null || true
+import json, os, subprocess, sys
+
+settings_p, daemon_p, watcher_py = sys.argv[1:4]
+cfg = json.load(open(settings_p, "r", encoding="utf-8"))
+if cfg.get("enabled"):
+    active_ids = []
+    if os.path.isfile(daemon_p):
+        try:
+            d = json.load(open(daemon_p, "r", encoding="utf-8"))
+            if d.get("running"):
+                active_ids = d.get("activeItemIds") or []
+        except Exception:
+            pass
+    if not active_ids:
+        subprocess.run([sys.executable, watcher_py, "--stop-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        subprocess.run([sys.executable, watcher_py, "--start-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+PY
+fi
+
 if [ "${STANDALONE_ONLY}" -eq 0 ] && [ -d "${SCRIPT_DIR}/extension" ]; then
 # Package VSIX for official CLI installation (includes README.md, CHANGELOG.md, and bundled_plugin/ so VSIX-only installs work standalone)
 VSIX_PATH="/tmp/quasar-${VERSION}.vsix"
