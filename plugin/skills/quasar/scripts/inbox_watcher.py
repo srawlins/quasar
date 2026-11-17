@@ -35,6 +35,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -68,12 +69,18 @@ INBOX_STATE_PATH = os.path.join(INBOX_DIR, "state.json")
 INBOX_DAEMON_PATH = os.path.join(INBOX_DIR, "daemon.json")
 INBOX_LOG_PATH = os.path.join(INBOX_DIR, "daemon.log")
 INBOX_ITEMS_DIR = os.path.join(INBOX_DIR, "items")
+INBOX_ETAG_CACHE_PATH = os.path.join(INBOX_DIR, "etag_cache.json")
+
+_ETAG_LOCK = threading.Lock()
+_ETAG_MEM_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_ETAG_DIRTY = False
 
 DEFAULT_INBOX_SETTINGS: Dict[str, Any] = {
     "enabled": False,
     "mode": "auto_precompute",  # "auto_precompute" | "sync_queue_only"
     "watchReviewRequested": True,
     "watchAuthoredPrs": True,
+    "watchInvolvedPrs": True,
     "watchedRepos": [],
     "restrictToWatchedRepos": False,
     "includeDrafts": False,
@@ -121,6 +128,8 @@ def normalize_inbox_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out["watchReviewRequested"] = bool(raw["watchReviewRequested"])
     if "watchAuthoredPrs" in raw:
         out["watchAuthoredPrs"] = bool(raw["watchAuthoredPrs"])
+    if "watchInvolvedPrs" in raw:
+        out["watchInvolvedPrs"] = bool(raw["watchInvolvedPrs"])
     if "watchedRepos" in raw:
         val = raw["watchedRepos"]
         if isinstance(val, str):
@@ -259,23 +268,88 @@ def find_agy_binary() -> Optional[str]:
     return None
 
 
-def _gh_api_get(path_or_url: str, token: str, timeout: float = 20.0) -> Any:
+def _load_etag_cache() -> Dict[str, Dict[str, Any]]:
+    global _ETAG_MEM_CACHE
+    with _ETAG_LOCK:
+        if _ETAG_MEM_CACHE is not None:
+            return _ETAG_MEM_CACHE
+        loaded: Dict[str, Dict[str, Any]] = {}
+        if os.path.isfile(INBOX_ETAG_CACHE_PATH):
+            try:
+                with open(INBOX_ETAG_CACHE_PATH, "r", encoding="utf-8") as ef:
+                    raw = json.load(ef)
+                if isinstance(raw, dict):
+                    loaded = raw
+            except Exception:
+                loaded = {}
+        _ETAG_MEM_CACHE = loaded
+        return _ETAG_MEM_CACHE
+
+
+def _flush_etag_cache() -> None:
+    global _ETAG_DIRTY
+    with _ETAG_LOCK:
+        if not _ETAG_DIRTY or _ETAG_MEM_CACHE is None:
+            return
+        # Bound cache size to the 300 most recently used URLs
+        if len(_ETAG_MEM_CACHE) > 300:
+            sorted_items = sorted(
+                _ETAG_MEM_CACHE.items(),
+                key=lambda kv: float((kv[1] or {}).get("ts") or 0.0),
+                reverse=True,
+            )[:300]
+            _ETAG_MEM_CACHE.clear()
+            _ETAG_MEM_CACHE.update(sorted_items)
+        snapshot = dict(_ETAG_MEM_CACHE)
+        _ETAG_DIRTY = False
+    try:
+        _atomic_write_json(INBOX_ETAG_CACHE_PATH, snapshot)
+    except Exception:
+        pass
+
+
+def _gh_api_get(path_or_url: str, token: str, timeout: float = 20.0, flush_etag: bool = True) -> Any:
+    """GitHub REST GET with automatic `If-None-Match` (`ETag`) caching.
+    Unchanged resources return `HTTP 304 Not Modified`, consuming 0 GitHub rate-limit quota.
+    """
+    global _ETAG_DIRTY
     url = (
         path_or_url
         if path_or_url.startswith("https://")
         else f"https://api.github.com/{path_or_url.lstrip('/')}"
     )
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "Quasar-Inbox-Watcher",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+    cache = _load_etag_cache()
+    with _ETAG_LOCK:
+        cached_entry = cache.get(url)
+        cached_etag = str((cached_entry or {}).get("etag") or "")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Quasar-Inbox-Watcher",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if cached_etag:
+        headers["If-None-Match"] = cached_etag
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
+            new_etag = str(resp.headers.get("ETag") or "").strip()
+            if new_etag:
+                with _ETAG_LOCK:
+                    cache[url] = {"etag": new_etag, "data": parsed, "ts": time.time()}
+                    _ETAG_DIRTY = True
+                if flush_etag:
+                    _flush_etag_cache()
+            return parsed
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and isinstance(cached_entry, dict) and "data" in cached_entry:
+            with _ETAG_LOCK:
+                cached_entry["ts"] = time.time()
+            return cached_entry["data"]
+        raise
 
 
 def resolve_github_login(token: str, cached_login: str = "") -> str:
@@ -331,34 +405,88 @@ def sync_github_queue(
     repo_qual = " " + " ".join(f"repo:{r}" for r in watched_repos[:15]) if restrict_repos else ""
 
     queries: List[Tuple[str, str]] = []
-    if cfg.get("watchReviewRequested", True):
-        queries.append(("reviewer", f"is:pr is:open review-requested:{login}{draft_qual}{repo_qual}"))
     if cfg.get("watchAuthoredPrs", True):
         queries.append(("author", f"is:pr is:open author:{login}{draft_qual}{repo_qual}"))
+    if cfg.get("watchReviewRequested", True):
+        queries.append(("reviewer", f"is:pr is:open review-requested:{login}{draft_qual}{repo_qual}"))
+    if cfg.get("watchInvolvedPrs", True):
+        queries.append(("involved", f"is:pr is:open involves:{login} -author:{login}{draft_qual}{repo_qual}"))
     if watched_repos and not restrict_repos:
         extra_repo_q = " ".join(f"repo:{r}" for r in watched_repos[:12])
         queries.append(("watched_repo", f"is:pr is:open -author:{login}{draft_qual} {extra_repo_q}"))
 
-    discovered: Dict[str, Tuple[str, str, int, str]] = {}
+    role_priority = {"author": 0, "reviewer": 1, "involved": 2, "watched_repo": 3}
+    scope_sig = json.dumps(
+        [
+            login,
+            bool(cfg.get("watchAuthoredPrs", True)),
+            bool(cfg.get("watchReviewRequested", True)),
+            bool(cfg.get("watchInvolvedPrs", True)),
+            watched_repos,
+            restrict_repos,
+            bool(cfg.get("includeDrafts")),
+        ],
+        sort_keys=True,
+    )
+    prev_synced_dt = _parse_iso_dt(str(st.get("lastSyncedAt") or ""))
+    prev_full_sweep_dt = _parse_iso_dt(str(st.get("lastFullSweepAt") or ""))
+    now_utc = _now_utc()
+    do_full_sweep = (
+        prev_synced_dt is None
+        or st.get("lastScopeSig") != scope_sig
+        or prev_full_sweep_dt is None
+        or (now_utc - prev_full_sweep_dt).total_seconds() >= 21600
+    )
+    truncated_search_cutoff: Optional[datetime.datetime] = None
+
+    # Stage 1: Fetch lightweight PR lists from `/search/issues` first (ETag-cached; stops at page 1 on incremental polls)
+    discovered: Dict[str, Dict[str, Any]] = {}
     try:
         for role, q in queries:
             enc_q = urllib.parse.quote(q)
-            search_res = _gh_api_get(
-                f"/search/issues?q={enc_q}&sort=updated&order=desc&per_page=30",
-                token,
-            )
-            for issue in search_res.get("items") or []:
-                repo_api_url = str(issue.get("repository_url") or "")
-                m_repo = re.search(r"/repos/([^/]+)/([^/]+)$", repo_api_url)
-                pr_num = int(issue.get("number") or 0)
-                if not m_repo or pr_num <= 0:
-                    continue
-                owner, repo = m_repo.group(1), m_repo.group(2)
-                item_id = f"{owner}-{repo}-pr-{pr_num}"
-                # Keep `reviewer` or `author` role ahead of generic `watched_repo`
-                if item_id not in discovered or discovered[item_id][3] == "watched_repo":
-                    discovered[item_id] = (owner, repo, pr_num, role)
+            for page in range(1, 4):
+                search_res = _gh_api_get(
+                    f"/search/issues?q={enc_q}&sort=updated&order=desc&per_page=100&page={page}",
+                    token,
+                    flush_etag=False,
+                )
+                items = search_res.get("items") or []
+                for issue in items:
+                    if issue.get("draft") and not cfg.get("includeDrafts"):
+                        continue
+                    repo_api_url = str(issue.get("repository_url") or "")
+                    m_repo = re.search(r"/repos/([^/]+)/([^/]+)$", repo_api_url)
+                    pr_num = int(issue.get("number") or 0)
+                    if not m_repo or pr_num <= 0:
+                        continue
+                    owner, repo = m_repo.group(1), m_repo.group(2)
+                    item_id = f"{owner}-{repo}-pr-{pr_num}"
+                    prev_disc = discovered.get(item_id)
+                    if (
+                        prev_disc is None
+                        or role_priority.get(role, 9) < role_priority.get(str(prev_disc.get("role")), 9)
+                    ):
+                        discovered[item_id] = {
+                            "owner": owner,
+                            "repo": repo,
+                            "number": pr_num,
+                            "role": role,
+                            "title": str(issue.get("title") or f"PR #{pr_num}"),
+                            "html_url": str(issue.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_num}"),
+                            "author": str((issue.get("user") or {}).get("login") or ""),
+                            "issue_updated_at": str(issue.get("updated_at") or _now_iso()),
+                            "issue_comments": int(issue.get("comments") or 0),
+                        }
+                if len(items) < 100:
+                    break
+                if not do_full_sweep and prev_synced_dt is not None:
+                    oldest_dt = _parse_iso_dt(str((items[-1] or {}).get("updated_at") or ""))
+                    if oldest_dt is not None and oldest_dt <= prev_synced_dt:
+                        if truncated_search_cutoff is None or oldest_dt < truncated_search_cutoff:
+                            truncated_search_cutoff = oldest_dt
+                        break
     except Exception as exc:
+        _flush_etag_cache()
         st["lastSyncError"] = f"GitHub search failed: {exc}"
         save_inbox_state(st)
         return {"ok": False, "error": st["lastSyncError"], "state": st}
@@ -369,26 +497,234 @@ def sync_github_queue(
     # Mark previously tracked open items that were closed/merged or unassigned
     for old_id, old_item in list(items_map.items()):
         if old_id not in open_ids and old_item.get("openInQueue", True):
+            if truncated_search_cutoff is not None:
+                old_dt = _parse_iso_dt(str(old_item.get("updatedAt") or ""))
+                if old_dt is not None and old_dt <= truncated_search_cutoff:
+                    continue
             old_item["openInQueue"] = False
 
-    def _fetch_pr_detail(entry: Tuple[str, Tuple[str, str, int, str]]) -> Tuple[str, Optional[Dict[str, Any]]]:
-        iid, (own, rep, num, role) = entry
+    def _reconcile_status(
+        existing: Dict[str, Any],
+        item_id: str,
+        role: str,
+        head_sha: str,
+        fingerprint: str,
+        bucket_hint: str,
+    ) -> Tuple[str, bool, str]:
+        prev_analyzed_fp = str(existing.get("analyzedFingerprint") or "")
+        prev_reviewed_sha = str(existing.get("reviewedHeadSha") or "")
+        prev_status = str(existing.get("status") or "queued")
+        item_dir = os.path.join(INBOX_ITEMS_DIR, item_id)
+        has_ready_session = os.path.isfile(os.path.join(item_dir, "active_session.json"))
+        prev_deleted_sha = str(existing.get("deletedAtSha") or "")
+        updated_since_review = bool(
+            head_sha
+            and (
+                (prev_reviewed_sha and prev_reviewed_sha != head_sha)
+                or (prev_status == "deleted" and prev_deleted_sha and prev_deleted_sha != head_sha)
+            )
+        )
+        if prev_status == "analyzing":
+            new_status = "analyzing"
+        elif prev_status == "deleted":
+            new_status = "deleted"
+        elif bucket_hint == "waiting_on_reviewers" and prev_analyzed_fp != fingerprint:
+            new_status = "waiting_on_reviewers"
+        elif fingerprint and prev_analyzed_fp == fingerprint and has_ready_session and prev_status in ("ready", "quarantined"):
+            new_status = prev_status
+        elif head_sha and prev_reviewed_sha == head_sha and role != "author":
+            new_status = "waiting_on_author"
+        else:
+            new_status = "queued"
+        return new_status, updated_since_review, item_dir
+
+    # Index any locally completed sessions in Workspace / History once (0 GitHub calls)
+    prs_with_local_sessions = set()
+    for base_d, fn in ((WORKSPACES_STATE_DIR, "active_session.json"), (HISTORY_STATE_DIR, "session.json")):
+        if not os.path.isdir(base_d):
+            continue
+        for entry in os.listdir(base_d):
+            sp = os.path.join(base_d, entry, fn)
+            if not os.path.isfile(sp):
+                continue
+            try:
+                with open(sp, "r", encoding="utf-8") as sf:
+                    s_obj = json.load(sf)
+                if _is_completed_review_session(s_obj):
+                    pm = s_obj.get("pr") or {}
+                    p_num = int(pm.get("number") or 0)
+                    if p_num > 0 and pm.get("owner") and pm.get("repo"):
+                        prs_with_local_sessions.add(
+                            (str(pm["owner"]).lower(), str(pm["repo"]).lower(), p_num)
+                        )
+            except Exception:
+                pass
+
+    # Stage 2: Dig deeper (`/pulls/{num}`) ONLY for changed PRs that actually need deep inspection right now:
+    #   (a) PRs with prior review state (to check if `headSha` changed or adopt a local manual review), OR
+    #   (b) User-authored PRs within the active recency window (to check `CHANGES_REQUESTED` / inline review comments).
+    # Unreviewed queued PRs stay lightweight from `/search/issues` until selected for review!
+    cutoff_days = int(cfg.get("onlyUpdatedWithinDays") or 0)
+    unchanged_entries: List[Tuple[str, Dict[str, Any]]] = []
+    list_only_entries: List[Tuple[str, Dict[str, Any]]] = []
+    deep_fetch_entries: List[Tuple[str, Dict[str, Any]]] = []
+
+    for item_id, info in discovered.items():
+        existing = items_map.get(item_id)
+        cached_upd = str((existing or {}).get("ghIssueUpdatedAt") or "")
+        pr_key = (str(info["owner"]).lower(), str(info["repo"]).lower(), int(info["number"]))
+        has_local_manual = pr_key in prs_with_local_sessions
+        has_prior_review_state = bool(
+            has_local_manual
+            or (
+                isinstance(existing, dict)
+                and (
+                    existing.get("reviewedHeadSha")
+                    or existing.get("deletedAtSha")
+                    or existing.get("analyzedFingerprint")
+                    or os.path.isfile(os.path.join(INBOX_ITEMS_DIR, item_id, "active_session.json"))
+                )
+            )
+        )
+
+        # Unchanged since last sync (and if it had local review state, we already know its headSha)
+        if (
+            isinstance(existing, dict)
+            and cached_upd
+            and cached_upd == info["issue_updated_at"]
+            and (not has_prior_review_state or bool(existing.get("headSha")))
+            and not (info["role"] == "author" and existing.get("role") != "author")
+        ):
+            unchanged_entries.append((item_id, info))
+            continue
+
+        needs_author_feedback_check = False
+        if info["role"] == "author":
+            if cutoff_days <= 0:
+                needs_author_feedback_check = True
+            else:
+                upd_dt = _parse_iso_dt(str(info["issue_updated_at"]))
+                if upd_dt is None or (now_utc - upd_dt).total_seconds() <= cutoff_days * 86400:
+                    needs_author_feedback_check = True
+
+        if has_prior_review_state or needs_author_feedback_check:
+            deep_fetch_entries.append((item_id, info))
+        else:
+            list_only_entries.append((item_id, info))
+
+    for item_id, info in unchanged_entries:
+        existing = dict(items_map[item_id])
+        role = str(info["role"])
+        head_sha = str(existing.get("headSha") or "")
+        fingerprint = str(existing.get("currentFingerprint") or head_sha)
+        bucket_hint = (
+            str(existing.get("bucketHint") or "author_action_needed")
+            if role == "author"
+            else "reviewer"
+        )
+        new_status, updated_since_review, item_dir = _reconcile_status(
+            existing, item_id, role, head_sha, fingerprint, bucket_hint
+        )
+        existing["title"] = info["title"]
+        existing["url"] = info["html_url"]
+        existing["author"] = info["author"]
+        existing["role"] = role
+        existing["bucketHint"] = bucket_hint
+        existing["ghIssueUpdatedAt"] = info["issue_updated_at"]
+        existing["updatedSinceLastReview"] = updated_since_review
+        existing["openInQueue"] = True
+        existing["status"] = new_status
+        existing["sessionDir"] = item_dir
+        if new_status == "queued" and head_sha:
+            adopt_completed_session_into_inbox(
+                existing,
+                owner=str(info["owner"]),
+                repo=str(info["repo"]),
+                pr_num=int(info["number"]),
+                head_sha=head_sha,
+                fingerprint=fingerprint,
+                role=role,
+                expected_review_comments=int(existing.get("reviewCommentsCount") or 0),
+            )
+        items_map[item_id] = existing
+
+    for item_id, info in list_only_entries:
+        existing = items_map.get(item_id) or {}
+        role = str(info["role"])
+        head_sha = str(existing.get("headSha") or "")
+        fingerprint = str(existing.get("currentFingerprint") or head_sha)
+        bucket_hint = "waiting_on_reviewers" if (role == "author" and info["issue_comments"] == 0) else (
+            "author_action_needed" if role == "author" else "reviewer"
+        )
+        new_status, updated_since_review, item_dir = _reconcile_status(
+            existing, item_id, role, head_sha, fingerprint, bucket_hint
+        )
+        items_map[item_id] = {
+            **existing,
+            "id": item_id,
+            "owner": info["owner"],
+            "repo": info["repo"],
+            "number": info["number"],
+            "title": info["title"],
+            "url": info["html_url"],
+            "author": info["author"],
+            "role": role,
+            "bucketHint": bucket_hint,
+            "headSha": head_sha,
+            "additions": int(existing.get("additions") or 0),
+            "deletions": int(existing.get("deletions") or 0),
+            "changedFilesCount": int(existing.get("changedFilesCount") or 0),
+            "reviewCommentsCount": int(existing.get("reviewCommentsCount") or 0),
+            "issueCommentsCount": info["issue_comments"],
+            "changesRequested": bool(existing.get("changesRequested", False)),
+            "updatedAt": info["issue_updated_at"],
+            "ghIssueUpdatedAt": info["issue_updated_at"],
+            "currentFingerprint": fingerprint,
+            "updatedSinceLastReview": updated_since_review,
+            "openInQueue": True,
+            "status": new_status,
+            "sessionDir": item_dir,
+        }
+
+    MAX_DETAIL_FETCHES_PER_SYNC = 40
+    deep_fetch_entries.sort(key=lambda pair: str(pair[1].get("issue_updated_at") or ""), reverse=True)
+    deep_fetch_entries.sort(key=lambda pair: role_priority.get(str(pair[1].get("role")), 9))
+    fetch_batch = deep_fetch_entries[:MAX_DETAIL_FETCHES_PER_SYNC]
+    deferred_batch = deep_fetch_entries[MAX_DETAIL_FETCHES_PER_SYNC:]
+
+    def _fetch_pr_detail(entry: Tuple[str, Dict[str, Any]]) -> Tuple[str, Optional[Dict[str, Any]]]:
+        iid, info = entry
+        own, rep, num, role = info["owner"], info["repo"], info["number"], info["role"]
         try:
-            pr_obj = _gh_api_get(f"/repos/{own}/{rep}/pulls/{num}", token)
+            pr_obj = _gh_api_get(f"/repos/{own}/{rep}/pulls/{num}", token, flush_etag=False)
             reviews_list: List[Dict[str, Any]] = []
             if role == "author":
                 try:
-                    rev_res = _gh_api_get(f"/repos/{own}/{rep}/pulls/{num}/reviews?per_page=40", token)
+                    rev_res = _gh_api_get(
+                        f"/repos/{own}/{rep}/pulls/{num}/reviews?per_page=40", token, flush_etag=False
+                    )
                     if isinstance(rev_res, list):
                         reviews_list = rev_res
                 except Exception:
                     reviews_list = []
-            return iid, {"pr": pr_obj, "role": role, "owner": own, "repo": rep, "reviews": reviews_list}
+            return iid, {
+                "pr": pr_obj,
+                "role": role,
+                "owner": own,
+                "repo": rep,
+                "issue_updated_at": info["issue_updated_at"],
+                "reviews": reviews_list,
+            }
         except Exception:
             return iid, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        detail_results = list(pool.map(_fetch_pr_detail, list(discovered.items())))
+    if fetch_batch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            detail_results = list(pool.map(_fetch_pr_detail, fetch_batch))
+    else:
+        detail_results = []
+
+    _flush_etag_cache()
 
     login_lower = login.lower()
     for item_id, detail in detail_results:
@@ -435,36 +771,13 @@ def sync_github_queue(
             fingerprint = f"{head_sha}:rc={review_comments_cnt}:ic={issue_comments_cnt}:rv={latest_rev_id}"
             bucket_hint = "author_action_needed" if has_external_feedback else "waiting_on_reviewers"
         else:
-            has_external_feedback = True
             fingerprint = head_sha
             bucket_hint = "reviewer"
 
         existing = items_map.get(item_id) or {}
-        prev_analyzed_fp = str(existing.get("analyzedFingerprint") or "")
-        prev_reviewed_sha = str(existing.get("reviewedHeadSha") or "")
-        prev_status = str(existing.get("status") or "queued")
-
-        item_dir = os.path.join(INBOX_ITEMS_DIR, item_id)
-        has_ready_session = os.path.isfile(os.path.join(item_dir, "active_session.json"))
-
-        prev_deleted_sha = str(existing.get("deletedAtSha") or "")
-        updated_since_review = bool(
-            (prev_reviewed_sha and prev_reviewed_sha != head_sha)
-            or (prev_status == "deleted" and prev_deleted_sha and prev_deleted_sha != head_sha)
+        new_status, updated_since_review, item_dir = _reconcile_status(
+            existing, item_id, role, head_sha, fingerprint, bucket_hint
         )
-
-        if prev_status == "analyzing":
-            new_status = "analyzing"
-        elif prev_status == "deleted":
-            new_status = "deleted"
-        elif bucket_hint == "waiting_on_reviewers" and prev_analyzed_fp != fingerprint:
-            new_status = "waiting_on_reviewers"
-        elif prev_analyzed_fp == fingerprint and has_ready_session and prev_status in ("ready", "quarantined"):
-            new_status = prev_status
-        elif prev_reviewed_sha == head_sha and role != "author":
-            new_status = "waiting_on_author"
-        else:
-            new_status = "queued"
 
         merged_item: Dict[str, Any] = {
             **existing,
@@ -487,6 +800,7 @@ def sync_github_queue(
             "issueCommentsCount": issue_comments_cnt,
             "changesRequested": changes_requested,
             "updatedAt": updated_at,
+            "ghIssueUpdatedAt": str(detail.get("issue_updated_at") or updated_at),
             "currentFingerprint": fingerprint,
             "updatedSinceLastReview": updated_since_review,
             "openInQueue": True,
@@ -506,10 +820,54 @@ def sync_github_queue(
             )
         items_map[item_id] = merged_item
 
+    for item_id, info in deferred_batch:
+        existing = items_map.get(item_id)
+        if isinstance(existing, dict):
+            existing["role"] = info["role"]
+            existing["openInQueue"] = True
+            existing["ghIssueUpdatedAt"] = ""
+        else:
+            items_map[item_id] = {
+                "id": item_id,
+                "owner": info["owner"],
+                "repo": info["repo"],
+                "number": info["number"],
+                "title": info["title"],
+                "url": info["html_url"],
+                "author": info["author"],
+                "role": info["role"],
+                "bucketHint": "author_action_needed" if info["role"] == "author" else "reviewer",
+                "headSha": "",
+                "additions": 0,
+                "deletions": 0,
+                "changedFilesCount": 0,
+                "reviewCommentsCount": 0,
+                "issueCommentsCount": info["issue_comments"],
+                "changesRequested": False,
+                "updatedAt": info["issue_updated_at"],
+                "ghIssueUpdatedAt": "",
+                "currentFingerprint": "",
+                "updatedSinceLastReview": False,
+                "openInQueue": True,
+                "status": "queued",
+                "sessionDir": os.path.join(INBOX_ITEMS_DIR, item_id),
+            }
+
     st["lastSyncedAt"] = _now_iso()
+    st["lastScopeSig"] = scope_sig
+    if do_full_sweep or truncated_search_cutoff is None:
+        st["lastFullSweepAt"] = st["lastSyncedAt"]
     st["lastSyncError"] = ""
     save_inbox_state(st)
-    return {"ok": True, "login": login, "discoveredCount": len(discovered), "state": st}
+    return {
+        "ok": True,
+        "login": login,
+        "discoveredCount": len(discovered),
+        "fetchedDetailsCount": len(fetch_batch),
+        "listOnlyCount": len(list_only_entries),
+        "cachedUnchangedCount": len(unchanged_entries),
+        "state": st,
+    }
 
 
 def _is_completed_review_session(sess: Any) -> bool:
@@ -1004,7 +1362,8 @@ def _extract_session_metrics(session_path: str) -> Dict[str, Any]:
         ]
         cn = sess.get("cliffsNotes") or {}
         sg = sess.get("securityGate")
-        return {
+        pr_m = sess.get("pr") or {}
+        out_m: Dict[str, Any] = {
             "analysisStatus": sess.get("analysisStatus") or "ready",
             "tldr": str(cn.get("tldr") or "")[:240],
             "findingsCount": len(ai_findings),
@@ -1013,6 +1372,19 @@ def _extract_session_metrics(session_path: str) -> Dict[str, Any]:
             "actionableGhCommentsCount": len(gh_should_fix),
             "securityGateStatus": sg.get("status") if isinstance(sg, dict) else "none",
         }
+        if pr_m.get("headSha"):
+            out_m["headSha"] = str(pr_m["headSha"])
+        if pr_m.get("baseRefName"):
+            out_m["baseRefName"] = str(pr_m["baseRefName"])
+        if pr_m.get("headRefName"):
+            out_m["headRefName"] = str(pr_m["headRefName"])
+        if "additions" in pr_m:
+            out_m["additions"] = int(pr_m.get("additions") or 0)
+        if "deletions" in pr_m:
+            out_m["deletions"] = int(pr_m.get("deletions") or 0)
+        if "changedFilesCount" in pr_m or sess.get("files"):
+            out_m["changedFilesCount"] = int(pr_m.get("changedFilesCount") or len(sess.get("files") or []))
+        return out_m
     except Exception:
         return {}
 
@@ -1028,6 +1400,29 @@ def run_precompute_for_item(
     item = (st.get("items") or {}).get(item_id)
     if not item:
         return {"ok": False, "error": f"Inbox item '{item_id}' not found."}
+
+    # Only dig into `/pulls/{num}` ahead of `collect_pr_context.py` if local completed sessions exist
+    # (so we can adopt a matching manual review for 0 tokens or stage an incremental delta base).
+    # Otherwise, `collect_pr_context.py` fetches PR metadata once in Step 1 with zero duplicate calls!
+    local_manual_cands = _scan_completed_sessions_for_pr(
+        str(item.get("owner") or ""),
+        str(item.get("repo") or ""),
+        int(item.get("number") or 0),
+        include_inbox=False,
+    )
+    if local_manual_cands and not item.get("headSha") and item.get("owner") and item.get("repo") and item.get("number"):
+        gh_tok = get_github_token()
+        if gh_tok:
+            try:
+                pr_live = _gh_api_get(f"/repos/{item['owner']}/{item['repo']}/pulls/{item['number']}", gh_tok)
+                live_sha = str(((pr_live or {}).get("head") or {}).get("sha") or "")
+                if live_sha:
+                    item["headSha"] = live_sha
+                    if item.get("role") != "author":
+                        item["currentFingerprint"] = live_sha
+                    save_inbox_state(st)
+            except Exception:
+                pass
 
     # Before invoking `agy` in an automatic cycle, check if the user already reviewed this exact headSha manually!
     if count_against_daily_budget and adopt_completed_session_into_inbox(
@@ -1140,11 +1535,13 @@ def run_precompute_for_item(
         st = load_inbox_state()
         if item_id in st.get("items", {}):
             it = st["items"][item_id]
+            it.update(_extract_session_metrics(session_file))
+            if it.get("headSha") and it.get("role") != "author" and not it.get("currentFingerprint"):
+                it["currentFingerprint"] = it["headSha"]
             it["status"] = "quarantined"
-            it["analyzedFingerprint"] = it.get("currentFingerprint")
+            it["analyzedFingerprint"] = it.get("currentFingerprint") or it.get("headSha") or ""
             it["completedAt"] = _now_iso()
             it["unread"] = True
-            it.update(_extract_session_metrics(session_file))
             save_inbox_state(st)
         return {"ok": True, "quarantined": True, "itemId": item_id}
 
@@ -1232,13 +1629,15 @@ def run_precompute_for_item(
         st["reviewsRunToday"] = int(st.get("reviewsRunToday") or 0) + 1
     if item_id in st.get("items", {}):
         it = st["items"][item_id]
+        it.update(_extract_session_metrics(session_file))
+        if it.get("headSha") and it.get("role") != "author" and not it.get("currentFingerprint"):
+            it["currentFingerprint"] = it["headSha"]
         it["status"] = "ready"
-        it["analyzedFingerprint"] = it.get("currentFingerprint")
+        it["analyzedFingerprint"] = it.get("currentFingerprint") or it.get("headSha") or ""
         it["analyzedEffort"] = effort
         it["completedAt"] = _now_iso()
         it["unread"] = True
         it.pop("lastError", None)
-        it.update(_extract_session_metrics(session_file))
     save_inbox_state(st)
     return {"ok": True, "itemId": item_id, "status": "ready"}
 
@@ -1283,13 +1682,18 @@ def select_eligible_items_for_cycle(
                 item["skipReason"] = f"Older than {cutoff_days}d auto-review cutoff"
                 continue
         item.pop("skipReason", None)
-        # Priority: 0 = updated since last review or author PR with changes requested, 1 = author PR with comments, 2 = review requested
+        # Priority: 0 = updated since last review or changes requested, 1 = author PR w/ comments,
+        #           2 = explicit review-requested:@me, 3 = involves:@me, 4 = watched repo
         if item.get("updatedSinceLastReview") or item.get("changesRequested"):
             prio = 0
         elif item.get("role") == "author":
             prio = 1
-        else:
+        elif item.get("role") == "reviewer":
             prio = 2
+        elif item.get("role") == "involved":
+            prio = 3
+        else:
+            prio = 4
         candidates.append((prio, str(item.get("updatedAt") or ""), iid))
 
     # Sort highest priority first, then most recently updated first
@@ -1473,7 +1877,7 @@ def activate_existing_session_file(
 def check_session_head_freshness(
     session_dict: Optional[Dict[str, Any]],
     allow_network: bool = True,
-    ttl_seconds: float = 90.0,
+    ttl_seconds: float = 300.0,
 ) -> Dict[str, Any]:
     """Checks whether an active review session's `pr.headSha` has been superseded by newer commits on GitHub.
     Uses `inbox/state.json` first and a 90s TTL cache (`inbox/head_cache.json`) so polling never spams GitHub.
@@ -2150,6 +2554,12 @@ def main() -> None:
     parser.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Background review effort")
     parser.add_argument("--mode", choices=["auto_precompute", "sync_queue_only"], default=None, help="Watcher mode")
     parser.add_argument("--watched-repos", default=None, help="Comma-separated owner/repo watchlist")
+    parser.add_argument("--watch-requested", dest="watch_requested", action="store_true", default=None, help="Watch PRs requesting your review (review-requested:@me)")
+    parser.add_argument("--no-watch-requested", dest="watch_requested", action="store_false", help="Stop watching review-requested:@me PRs")
+    parser.add_argument("--watch-authored", dest="watch_authored", action="store_true", default=None, help="Watch your open authored PRs")
+    parser.add_argument("--no-watch-authored", dest="watch_authored", action="store_false", help="Stop watching your open authored PRs")
+    parser.add_argument("--watch-involved", dest="watch_involved", action="store_true", default=None, help="Watch open PRs involving @me (mentions, prior reviews, triage)")
+    parser.add_argument("--no-watch-involved", dest="watch_involved", action="store_false", help="Stop watching involves:@me PRs")
     parser.add_argument("--sync-now", action="store_true", help="Poll GitHub queue now without running LLM reviews (0 tokens)")
     parser.add_argument("--run-cycle", action="store_true", help="Run one sync + quota-guarded pre-review cycle and exit")
     parser.add_argument("--precompute-item", default="", help="Explicitly pre-compute a specific Inbox item ID now")
@@ -2201,6 +2611,12 @@ def main() -> None:
         updates["mode"] = args.mode
     if args.watched_repos is not None:
         updates["watchedRepos"] = args.watched_repos
+    if args.watch_requested is not None:
+        updates["watchReviewRequested"] = bool(args.watch_requested)
+    if args.watch_authored is not None:
+        updates["watchAuthoredPrs"] = bool(args.watch_authored)
+    if args.watch_involved is not None:
+        updates["watchInvolvedPrs"] = bool(args.watch_involved)
 
     if args.configure or updates:
         saved = save_inbox_settings(updates)

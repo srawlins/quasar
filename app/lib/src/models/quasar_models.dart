@@ -62,6 +62,7 @@ class InboxSettings {
     required this.mode,
     required this.watchReviewRequested,
     required this.watchAuthoredPrs,
+    this.watchInvolvedPrs = true,
     required this.watchedRepos,
     required this.restrictToWatchedRepos,
     required this.includeDrafts,
@@ -84,6 +85,7 @@ class InboxSettings {
       mode: '${json['mode'] ?? 'auto_precompute'}',
       watchReviewRequested: json['watchReviewRequested'] != false,
       watchAuthoredPrs: json['watchAuthoredPrs'] != false,
+      watchInvolvedPrs: json['watchInvolvedPrs'] != false,
       watchedRepos: rawRepos
           .map((dynamic e) => '$e'.trim())
           .where((String s) => s.isNotEmpty)
@@ -108,6 +110,7 @@ class InboxSettings {
   final String mode;
   final bool watchReviewRequested;
   final bool watchAuthoredPrs;
+  final bool watchInvolvedPrs;
   final List<String> watchedRepos;
   final bool restrictToWatchedRepos;
   final bool includeDrafts;
@@ -145,6 +148,7 @@ class InboxItem {
     required this.tldr,
     required this.skipReason,
     required this.lastError,
+    this.headSha = '',
   });
 
   factory InboxItem.fromJson(Map<String, dynamic> json) {
@@ -171,10 +175,12 @@ class InboxItem {
       tldr: '${json['tldr'] ?? ''}',
       skipReason: '${json['skipReason'] ?? ''}',
       lastError: '${json['lastError'] ?? ''}',
+      headSha: '${json['headSha'] ?? ''}',
     );
   }
 
   final String id;
+  final String headSha;
   final String owner;
   final String repo;
   final int number;

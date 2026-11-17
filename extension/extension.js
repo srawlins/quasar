@@ -1750,6 +1750,7 @@ const DEFAULT_INBOX_SETTINGS = {
   mode: 'auto_precompute',
   watchReviewRequested: true,
   watchAuthoredPrs: true,
+  watchInvolvedPrs: true,
   watchedRepos: [],
   restrictToWatchedRepos: false,
   includeDrafts: false,
@@ -1820,6 +1821,7 @@ function loadInboxPayloadSync() {
     else if (st === 'analyzing') it.inboxGroup = 'in_progress';
     else if (st === 'ready' && role === 'author') it.inboxGroup = 'author_action_needed';
     else if (st === 'ready') it.inboxGroup = 'ready_to_review';
+    else if (st === 'deleted') it.inboxGroup = 'deleted';
     else if (st === 'waiting_on_author' || st === 'waiting_on_reviewers') it.inboxGroup = 'waiting';
     else it.inboxGroup = 'queued';
     itemsList.push(it);
@@ -1832,6 +1834,7 @@ function loadInboxPayloadSync() {
     quarantined: 3,
     queued: 4,
     waiting: 5,
+    deleted: 6,
   };
   itemsList.sort((a, b) => {
     const ga = orderMap[a.inboxGroup] ?? 9;
@@ -1864,6 +1867,7 @@ function loadInboxPayloadSync() {
       unreadReady: unreadReady.length,
       analyzing: itemsList.filter((i) => i.inboxGroup === 'in_progress').length,
       queued: itemsList.filter((i) => i.inboxGroup === 'queued').length,
+      deleted: itemsList.filter((i) => i.inboxGroup === 'deleted').length,
     },
     items: itemsList,
   };
@@ -1942,10 +1946,10 @@ function getSessionStaleHeadInfo(session) {
     }
   } catch (_) { }
 
-  // Trigger a throttled non-blocking live check every 90s for the open PR
+  // Probe live HEAD freshness on session switch or at most every 10 minutes (ETag 304-cached)
   const probeKey = `${owner}/${repo}#${num}@${reviewedSha}`;
   const nowMs = Date.now();
-  if (probeKey !== lastFreshnessProbeKey || nowMs - lastFreshnessProbeAt > 90000) {
+  if (probeKey !== lastFreshnessProbeKey || nowMs - lastFreshnessProbeAt > 600000) {
     lastFreshnessProbeKey = probeKey;
     lastFreshnessProbeAt = nowMs;
     runInboxWatcher(
@@ -2138,6 +2142,9 @@ class InboxTreeProvider {
           `${unreadDot}${updBadge}${it.repo}#${it.number}: ${it.title || ''}`,
           vscode.TreeItemCollapsibleState.None
         );
+        const hasDiffStats = Boolean(
+          it.headSha || it.changedFilesCount || it.additions || it.deletions
+        );
         const diffStats = `+${it.additions || 0}/-${it.deletions || 0}`;
         if (it.inboxGroup === 'ready_to_review') {
           const fCnt = Number(it.findingsCount || 0);
@@ -2178,17 +2185,26 @@ class InboxTreeProvider {
           node.contextValue = 'inbox-item-deleted';
         } else {
           node.description = it.skipReason
-            ? `${diffStats} • ${it.skipReason}`
-            : `@${it.author || ''} • ${diffStats}`;
+            ? `${hasDiffStats ? `${diffStats} • ` : ''}${it.skipReason}`
+            : `@${it.author || ''}${hasDiffStats ? ` • ${diffStats}` : ''}`;
           node.iconPath = new vscode.ThemeIcon('git-pull-request');
           node.contextValue = 'inbox-item-queued';
         }
 
+        const roleLabelMap = {
+          author: 'Author (@me)',
+          reviewer: 'Review Requested (@me)',
+          involved: 'Involved (@me)',
+          watched_repo: 'Watched Repo',
+        };
+        const roleLabel = roleLabelMap[it.role] || String(it.role || 'reviewer');
+        const diffTipSuffix = hasDiffStats
+          ? ` • **Diff**: \`+${it.additions || 0} / -${it.deletions || 0}\` (${it.changedFilesCount || 0} files)`
+          : '';
         const tipLines = [
           `### [${it.owner}/${it.repo}#${it.number}](${it.url || ''}) — ${it.title || ''}`,
           '',
-          `- **Author**: \`@${it.author || ''}\` • **Diff**: \`+${it.additions || 0} / -${it.deletions || 0
-          }\` (${it.changedFilesCount || 0} files)`,
+          `- **Source**: ${roleLabel} • **Author**: \`@${it.author || ''}\`${diffTipSuffix}`,
         ];
         if (it.tldr) {
           tipLines.push('', `**TL;DR**: ${it.tldr}`);
@@ -8006,8 +8022,9 @@ function activate(context) {
         const cfg = snap.settings;
         const isRunning = Boolean(snap.daemon && snap.daemon.running);
         const scopeParts = [];
-        if (cfg.watchReviewRequested) scopeParts.push('Assigned to @me');
-        if (cfg.watchAuthoredPrs) scopeParts.push('My PRs w/ comments');
+        if (cfg.watchReviewRequested !== false) scopeParts.push('Assigned to @me');
+        if (cfg.watchInvolvedPrs !== false) scopeParts.push('Involving @me');
+        if (cfg.watchAuthoredPrs !== false) scopeParts.push('My PRs w/ comments');
         if (Array.isArray(cfg.watchedRepos) && cfg.watchedRepos.length > 0) {
           scopeParts.push(`${cfg.watchedRepos.length} repo(s)`);
         }
@@ -8188,12 +8205,17 @@ function activate(context) {
             [
               {
                 label: 'Incoming PRs Requesting My Review (review-requested:@me)',
-                picked: Boolean(cfg.watchReviewRequested),
+                picked: cfg.watchReviewRequested !== false,
                 key: 'watchReviewRequested',
               },
               {
+                label: 'Open PRs Involving @me — Mentions, Prior Reviews, Triage (involves:@me)',
+                picked: cfg.watchInvolvedPrs !== false,
+                key: 'watchInvolvedPrs',
+              },
+              {
                 label: 'My Open PRs With New Comments / Changes Requested (author:@me)',
-                picked: Boolean(cfg.watchAuthoredPrs),
+                picked: cfg.watchAuthoredPrs !== false,
                 key: 'watchAuthoredPrs',
               },
               {
@@ -8214,6 +8236,7 @@ function activate(context) {
               '--settings-json',
               JSON.stringify({
                 watchReviewRequested: chosenKeys.has('watchReviewRequested'),
+                watchInvolvedPrs: chosenKeys.has('watchInvolvedPrs'),
                 watchAuthoredPrs: chosenKeys.has('watchAuthoredPrs'),
                 includeDrafts: chosenKeys.has('includeDrafts'),
               }),

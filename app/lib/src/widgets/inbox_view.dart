@@ -38,6 +38,7 @@ class InboxView extends StatelessWidget {
     final TextEditingController reposCtrl =
         TextEditingController(text: cfg.watchedRepos.join(', '));
     bool watchReq = cfg.watchReviewRequested;
+    bool watchInvolved = cfg.watchInvolvedPrs;
     bool watchAuth = cfg.watchAuthoredPrs;
     bool restrictRepos = cfg.restrictToWatchedRepos;
     bool includeDrafts = cfg.includeDrafts;
@@ -200,6 +201,17 @@ class InboxView extends StatelessWidget {
                   CheckboxListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                    value: watchInvolved,
+                    onChanged: (bool? v) =>
+                        setModal(() => watchInvolved = v ?? true),
+                    title: const Text(
+                      'Watch PRs involving me — mentions, prior reviews, triage (involves:@me)',
+                      style: TextStyle(fontSize: 12.5),
+                    ),
+                  ),
+                  CheckboxListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     value: watchAuth,
                     onChanged: (bool? v) =>
                         setModal(() => watchAuth = v ?? true),
@@ -269,6 +281,7 @@ class InboxView extends StatelessWidget {
       'onlyUpdatedWithinDays': int.tryParse(recencyCtrl.text.trim()) ?? 14,
       'watchedRepos': reposCtrl.text.trim(),
       'watchReviewRequested': watchReq,
+      'watchInvolvedPrs': watchInvolved,
       'watchAuthoredPrs': watchAuth,
       'restrictToWatchedRepos': restrictRepos,
       'includeDrafts': includeDrafts,
@@ -517,7 +530,12 @@ class InboxView extends StatelessWidget {
                                   ),
                                   const SizedBox(height: 3),
                                   Text(
-                                    '@${it.author} • +${it.additions}/-${it.deletions} (${it.changedFilesCount} files)',
+                                    (it.headSha.isNotEmpty ||
+                                            it.changedFilesCount > 0 ||
+                                            it.additions > 0 ||
+                                            it.deletions > 0)
+                                        ? '@${it.author} • +${it.additions}/-${it.deletions} (${it.changedFilesCount} files)'
+                                        : '@${it.author}',
                                     style: const TextStyle(
                                       fontFamily: 'monospace',
                                       fontSize: 11,

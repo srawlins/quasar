@@ -1204,7 +1204,9 @@ def build_state_payload(
 
         inbox_payload = inbox_watcher.build_inbox_payload()
         if isinstance(session, dict):
-            fresh = inbox_watcher.check_session_head_freshness(session, allow_network=True)
+            fresh = inbox_watcher.check_session_head_freshness(
+                session, allow_network=True, ttl_seconds=600.0
+            )
             if fresh.get("isStaleHead"):
                 session["staleHeadInfo"] = fresh
             else:
@@ -1749,8 +1751,9 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 <div class="flex flex-wrap items-center gap-2 text-xs">
                   ${it.unread ? '<span class="q-badge text-emerald-300 border-emerald-500/40">● New</span>' : ''}
                   ${it.updatedSinceLastReview ? '<span class="q-badge text-amber-300 border-amber-500/40">🔄 Updated</span>' : ''}
+                  ${it.role === 'involved' ? '<span class="q-badge text-[var(--q-muted)]">Involved</span>' : ''}
                   <span class="font-bold">${esc(it.owner)}/${esc(it.repo)}#${it.number}: ${esc(it.title || '')}</span>
-                  <span class="text-[var(--q-muted)] font-mono">+${it.additions || 0}/-${it.deletions || 0} (${it.changedFilesCount || 0} files) • @${esc(it.author || '')}</span>
+                  <span class="text-[var(--q-muted)] font-mono">${(it.headSha || it.changedFilesCount || it.additions || it.deletions) ? `+${it.additions || 0}/-${it.deletions || 0} (${it.changedFilesCount || 0} files) • ` : ''}@${esc(it.author || '')}</span>
                 </div>
                 ${it.tldr ? `<div class="text-xs text-[var(--q-muted)]">${esc(it.tldr)}</div>` : ''}
                 ${it.skipReason ? `<div class="text-[11px] text-amber-300/80">${esc(it.skipReason)} (click ⚡ Pre-Review to run manually)</div>` : ''}
@@ -1930,6 +1933,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             <input id="inbRepos" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" placeholder="e.g. acme/backend, acme/app" value="${esc((cfg.watchedRepos || []).join(', '))}" />
           </div>
           <label class="flex items-center gap-2"><input id="inbReq" type="checkbox" ${cfg.watchReviewRequested !== false ? 'checked' : ''} /> <span>Watch PRs requesting my review (<code>review-requested:@me</code>)</span></label>
+          <label class="flex items-center gap-2"><input id="inbInvolved" type="checkbox" ${cfg.watchInvolvedPrs !== false ? 'checked' : ''} /> <span>Watch PRs involving me — mentions, prior reviews, triage (<code>involves:@me</code>)</span></label>
           <label class="flex items-center gap-2"><input id="inbAuth" type="checkbox" ${cfg.watchAuthoredPrs !== false ? 'checked' : ''} /> <span>Watch my open PRs with new comments / changes requested</span></label>
           <label class="flex items-center gap-2"><input id="inbRestrict" type="checkbox" ${cfg.restrictToWatchedRepos ? 'checked' : ''} /> <span>Restrict <code>@me</code> queue only to Watched Repos above</span></label>
           <label class="flex items-center gap-2"><input id="inbDrafts" type="checkbox" ${cfg.includeDrafts ? 'checked' : ''} /> <span>Include Draft PRs</span></label>
@@ -1953,6 +1957,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         onlyUpdatedWithinDays: Number(document.getElementById('inbRecency')?.value ?? 14),
         watchedRepos: document.getElementById('inbRepos')?.value || '',
         watchReviewRequested: Boolean(document.getElementById('inbReq')?.checked),
+        watchInvolvedPrs: Boolean(document.getElementById('inbInvolved')?.checked),
         watchAuthoredPrs: Boolean(document.getElementById('inbAuth')?.checked),
         restrictToWatchedRepos: Boolean(document.getElementById('inbRestrict')?.checked),
         includeDrafts: Boolean(document.getElementById('inbDrafts')?.checked),
