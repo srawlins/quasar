@@ -1198,6 +1198,20 @@ def build_state_payload(
         except Exception:
             pass
 
+    inbox_payload = {}
+    try:
+        import inbox_watcher  # type: ignore
+
+        inbox_payload = inbox_watcher.build_inbox_payload()
+        if isinstance(session, dict):
+            fresh = inbox_watcher.check_session_head_freshness(session, allow_network=True)
+            if fresh.get("isStaleHead"):
+                session["staleHeadInfo"] = fresh
+            else:
+                session.pop("staleHeadInfo", None)
+    except Exception:
+        inbox_payload = {}
+
     return {
         "ok": True,
         "activeSession": session,
@@ -1207,6 +1221,7 @@ def build_state_payload(
         "sessions": session_summaries,
         "githubAuth": gh_auth or {"configured": False},
         "preferences": prefs_summary,
+        "inbox": inbox_payload,
         "agentStatus": agent_status,
         "sidecarPort": PORT,
     }
@@ -1360,6 +1375,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       <button id="tabBtn-guide" class="q-btn q-btn-primary" onclick="setTab('guide')">📖 Study Guide & Reading Tour</button>
       <button id="tabBtn-diff" class="q-btn" onclick="setTab('diff')">± Side-by-Side Diff & Inline Q&A</button>
       <button id="tabBtn-comments" class="q-btn" onclick="setTab('comments')">💬 Review Comments & Fix Cart <span id="commentsCountBadge" class="ml-1 px-1.5 py-0.2 rounded-full bg-white/10">0</span></button>
+      <button id="tabBtn-inbox" class="q-btn" onclick="setTab('inbox')">📥 PR Inbox & Auto-Review <span id="inboxCountBadge" class="ml-1 px-1.5 py-0.2 rounded-full bg-emerald-500/25 text-emerald-300">0</span></button>
       <div class="ml-auto flex items-center gap-1.5" id="batchFixBar"></div>
     </div>
   </header>
@@ -1593,7 +1609,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
     function setTab(tab) {
       ACTIVE_TAB = tab;
-      ['guide', 'diff', 'comments'].forEach((t) => {
+      ['guide', 'diff', 'comments', 'inbox'].forEach((t) => {
         const btn = document.getElementById(`tabBtn-${t}`);
         if (btn) btn.className = t === tab ? 'q-btn q-btn-primary' : 'q-btn';
       });
@@ -1626,6 +1642,17 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         ghBtn.textContent = STATE.githubAuth.configured ? `🔑 @${STATE.githubAuth.login}` : '🔑 GitHub Key';
       }
 
+      const inboxBadge = document.getElementById('inboxCountBadge');
+      if (inboxBadge) {
+        const rCnt = Number(STATE.inbox?.counts?.ready || 0);
+        inboxBadge.textContent = String(rCnt);
+      }
+
+      if (ACTIVE_TAB === 'inbox') {
+        renderInboxTab();
+        return;
+      }
+
       if (!session) {
         document.getElementById('mainContent').innerHTML = `
           <div class="q-card p-8 text-center space-y-4">
@@ -1633,9 +1660,10 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
             <p class="text-sm text-[var(--q-muted)] max-w-lg mx-auto">
               Review any GitHub Pull Request or local git branch with interactive CliffsNotes study guides, clickable SVG flowcharts, side-by-side diffs, inline agent Q&A, and 1-click GitHub publishing.
             </p>
-            <div class="flex justify-center gap-3">
+            <div class="flex flex-wrap justify-center gap-3">
               <button class="q-btn q-btn-primary" onclick="startTutorial()">🎓 Start Interactive Tutorial (Sandbox PR)</button>
               <button class="q-btn" onclick="openNewReviewModal()">➕ Review a GitHub PR or Local Branch</button>
+              <button class="q-btn" onclick="setTab('inbox')">📥 Open PR Inbox & Auto-Review</button>
             </div>
           </div>`;
         return;
@@ -1684,7 +1712,254 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 
       if (ACTIVE_TAB === 'guide') renderGuideTab(session);
       else if (ACTIVE_TAB === 'diff') renderDiffTab(session);
+      else if (ACTIVE_TAB === 'inbox') renderInboxTab();
       else renderCommentsTab(session);
+    }
+
+    function renderInboxTab() {
+      const inbox = STATE?.inbox || {};
+      const cfg = inbox.settings || {};
+      const daemon = inbox.daemon || {};
+      const budget = inbox.budget || {};
+      const items = inbox.items || [];
+      const isRunning = Boolean(daemon.running);
+      const dayCapLabel = budget.maxReviewsPerDay > 0
+        ? `${budget.reviewsRunToday || 0}/${budget.maxReviewsPerDay} today`
+        : `${budget.reviewsRunToday || 0} today (unlimited)`;
+
+      const groupsDef = [
+        { key: 'in_progress', title: '⏳ Pre-Reviewing in Background', cls: 'text-blue-300' },
+        { key: 'ready_to_review', title: '🟢 Ready to Review (0-Second Open)', cls: 'text-emerald-300' },
+        { key: 'author_action_needed', title: '🛠️ Your PRs — Action Needed (0-Second Open)', cls: 'text-amber-300' },
+        { key: 'quarantined', title: '🚨 Quarantined by Security Gate', cls: 'text-red-300' },
+        { key: 'queued', title: '📋 Queued in GitHub (Not Pre-Reviewed Yet)', cls: 'text-[var(--q-fg)]' },
+        { key: 'waiting', title: '⏸️ Waiting on Author / Reviewers', cls: 'text-[var(--q-muted)]' },
+      ];
+
+      const groupsHtml = groupsDef.map((g) => {
+        const gItems = items.filter((i) => i.inboxGroup === g.key);
+        if (!gItems.length) return '';
+        const rows = gItems.map((it) => {
+          const isReady = it.status === 'ready' || it.status === 'quarantined';
+          return `
+            <div class="p-3 rounded-lg border border-[var(--q-border)] bg-black/25 flex flex-wrap items-center justify-between gap-3">
+              <div class="space-y-1 min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2 text-xs">
+                  ${it.unread ? '<span class="q-badge text-emerald-300 border-emerald-500/40">● New</span>' : ''}
+                  ${it.updatedSinceLastReview ? '<span class="q-badge text-amber-300 border-amber-500/40">🔄 Updated</span>' : ''}
+                  <span class="font-bold">${esc(it.owner)}/${esc(it.repo)}#${it.number}: ${esc(it.title || '')}</span>
+                  <span class="text-[var(--q-muted)] font-mono">+${it.additions || 0}/-${it.deletions || 0} (${it.changedFilesCount || 0} files) • @${esc(it.author || '')}</span>
+                </div>
+                ${it.tldr ? `<div class="text-xs text-[var(--q-muted)]">${esc(it.tldr)}</div>` : ''}
+                ${it.skipReason ? `<div class="text-[11px] text-amber-300/80">${esc(it.skipReason)} (click ⚡ Pre-Review to run manually)</div>` : ''}
+                ${it.lastError ? `<div class="text-[11px] text-red-300">${esc(it.lastError)}</div>` : ''}
+              </div>
+              <div class="flex items-center gap-1.5 flex-wrap">
+                ${isReady ? `<button class="q-btn q-btn-success" onclick="activateInboxItem('${esc(it.id)}')">📖 Open in 0s</button>` : ''}
+                ${it.inboxGroup === 'queued' ? `<button class="q-btn q-btn-primary" onclick="precomputeInboxItem('${esc(it.id)}')">⚡ Pre-Review</button>` : ''}
+                ${it.url ? `<a href="${esc(it.url)}" target="_blank" class="q-btn">🔗 GitHub</a>` : ''}
+                <button class="q-btn" onclick="inboxItemAction('${esc(it.id)}', 'markReviewed')" title="Mark Reviewed (wait for next commit)">✓ Reviewed</button>
+                <button class="q-btn" onclick="inboxItemAction('${esc(it.id)}', 'dismiss')" title="Hide from Inbox">✕</button>
+              </div>
+            </div>`;
+        }).join('');
+        return `
+          <div class="q-card p-4 space-y-2.5">
+            <div class="text-xs font-bold uppercase tracking-wider ${g.cls}">${g.title} (${gItems.length})</div>
+            <div class="space-y-2">${rows}</div>
+          </div>`;
+      }).join('');
+
+      document.getElementById('mainContent').innerHTML = `
+        <div class="q-card p-4 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div class="text-base font-bold">📥 Multi-PR Inbox & Background Auto-Review</div>
+              <div class="text-xs text-[var(--q-muted)]">
+                Pre-computes CliffsNotes & findings in isolated storage so reviews open in 0s without interrupting your active session.
+              </div>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <button class="q-btn ${isRunning ? 'border-amber-500/50 text-amber-200' : 'q-btn-primary'}" onclick="toggleInboxDaemon(${!isRunning})">
+                ${isRunning ? '⏸️ Pause Auto-Review' : '🚀 Enable Auto-Review'}
+              </button>
+              <button class="q-btn" onclick="syncInboxNow()">🔄 Sync Queue (0 Tokens)</button>
+              <button class="q-btn" onclick="openInboxSettingsModal()">⚙️ Settings & Token Caps</button>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 text-xs">
+            <span class="q-badge ${isRunning ? 'text-emerald-300 border-emerald-500/50' : 'text-[var(--q-muted)]'}">
+              ${isRunning ? `● Daemon Active (PID ${daemon.pid})` : '○ Daemon Paused'}
+            </span>
+            <span class="q-badge">Mode: ${cfg.mode === 'sync_queue_only' ? 'Sync Only (0 Tokens)' : `${esc((cfg.effort || 'high').toUpperCase())} Precompute`}</span>
+            <span class="q-badge">Every ${cfg.pollIntervalMinutes || 15}m</span>
+            <span class="q-badge">Max ${cfg.maxReviewsPerCycle ?? 1}/cycle</span>
+            <span class="q-badge">Daily Cap: ${esc(dayCapLabel)}</span>
+            <span class="q-badge">Concurrency: ${cfg.maxConcurrency || 1}</span>
+          </div>
+          ${inbox.lastSyncError ? `<div class="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/40 rounded p-2.5">⚠️ ${esc(inbox.lastSyncError)}</div>` : ''}
+        </div>
+        ${groupsHtml || `<div class="q-card p-6 text-center text-xs text-[var(--q-muted)]">No open PRs in your Inbox yet. Click <b>🔄 Sync Queue (0 Tokens)</b> to pull your GitHub review queue, or <b>⚙️ Settings & Token Caps</b> to configure watched repositories.</div>`}
+      `;
+    }
+
+    async function syncInboxNow() {
+      showToast('🔄 Syncing GitHub PR queue (0 tokens)...');
+      const res = await apiCall('/api/inbox-sync', 'POST', {});
+      if (res && res.ok) {
+        await refreshState(STATE?.activeSession?.sessionId);
+        showToast('📥 GitHub PR Inbox synced!');
+      } else {
+        showToast(res?.error || 'Failed to sync GitHub PR Inbox', true);
+      }
+    }
+
+    async function toggleInboxDaemon(enable) {
+      const res = await apiCall('/api/inbox-settings', 'POST', { settings: { enabled: Boolean(enable) } });
+      if (res && res.ok) {
+        await refreshState(STATE?.activeSession?.sessionId);
+        showToast(enable ? '🚀 Background Auto-Review enabled!' : '⏸️ Background Auto-Review paused.');
+      } else {
+        showToast(res?.error || 'Failed to update daemon state', true);
+      }
+    }
+
+    async function activateInboxItem(itemId, allowStale = false) {
+      const res = await apiCall('/api/inbox-activate', 'POST', { itemId, allowStale });
+      if (res && res.ok && res.instant) {
+        ACTIVE_TAB = 'guide';
+        await refreshState(res.sessionId);
+        setTab('guide');
+        showToast('⚡ Opened pre-reviewed PR in 0s!');
+      } else if (res && res.staleSessionAvailable) {
+        const cShort = String(res.cachedHeadSha || '').slice(0, 7);
+        const lShort = String(res.liveHeadSha || '').slice(0, 7);
+        openModal(`
+          <h3>🔄 Stale Review Detected (${esc(cShort)} → ${esc(lShort)})</h3>
+          <p style="font-size:12.5px;color:var(--muted);margin-bottom:14px;">
+            An earlier review exists at <code>${esc(cShort)}</code>, and the PR HEAD is now at <code>${esc(lShort)}</code>.
+            Would you like an updated review (comparing <code>${esc(lShort)}</code> against <code>${esc(cShort)}</code>) or a clean new review?
+          </p>
+          <div class="modal-footer" style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+            <button class="btn" onclick="closeModal()">Cancel</button>
+            <button class="btn" onclick="closeModal();submitNewReview(true, { prUrl: '${esc(res.prUrl || '')}', repoDir: '', effort: '${esc(res.effort || 'high')}', commentsOnly: false })">✨ Clean New Review</button>
+            <button class="btn primary" onclick="closeModal();precomputeInboxItem('${esc(itemId)}')">⚡ Updated Review (${esc(cShort)} → ${esc(lShort)})</button>
+          </div>
+        `);
+      } else if (res && res.prUrl) {
+        if (confirm('This PR has not been pre-computed yet. Pre-review it in the background now?')) {
+          await precomputeInboxItem(itemId);
+        }
+      } else {
+        showToast(res?.error || 'Failed to open Inbox item', true);
+      }
+    }
+
+    async function precomputeInboxItem(itemId) {
+      const res = await apiCall('/api/inbox-precompute', 'POST', { itemId });
+      if (res && res.ok) {
+        showToast('⚡ Started background pre-review — will appear under Ready when finished!');
+        setTimeout(() => refreshState(STATE?.activeSession?.sessionId), 800);
+      } else {
+        showToast(res?.error || 'Failed to start background pre-review', true);
+      }
+    }
+
+    async function inboxItemAction(itemId, action) {
+      await apiCall('/api/inbox-item-action', 'POST', { itemId, action });
+      await refreshState(STATE?.activeSession?.sessionId);
+    }
+
+    function openInboxSettingsModal() {
+      const cfg = STATE?.inbox?.settings || {};
+      showModal(`
+        <div class="text-sm font-bold">⚙️ PR Inbox & Background Auto-Review Settings</div>
+        <p class="text-xs text-[var(--q-muted)]">
+          Control trigger scope, cadence, and token-consumption caps so initial backfills trickle safely one PR at a time.
+        </p>
+        <div class="space-y-2.5 text-xs max-h-[65vh] overflow-y-auto pr-1">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block font-semibold mb-1">Watcher Mode</label>
+              <select id="inbMode" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">
+                <option value="auto_precompute" ${cfg.mode !== 'sync_queue_only' ? 'selected' : ''}>Auto-Precompute Reviews</option>
+                <option value="sync_queue_only" ${cfg.mode === 'sync_queue_only' ? 'selected' : ''}>Sync Queue Only (0 Tokens)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block font-semibold mb-1">Background Effort</label>
+              <select id="inbEffort" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2">
+                <option value="high" ${(cfg.effort || 'high') === 'high' ? 'selected' : ''}>High (Deep Multi-Lens)</option>
+                <option value="medium" ${cfg.effort === 'medium' ? 'selected' : ''}>Medium (Balanced)</option>
+                <option value="low" ${cfg.effort === 'low' ? 'selected' : ''}>Low (Quick Pass)</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="block font-semibold mb-1">Poll Every (min)</label>
+              <input id="inbPoll" type="number" min="2" max="720" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2" value="${cfg.pollIntervalMinutes || 15}" />
+            </div>
+            <div>
+              <label class="block font-semibold mb-1">Max / Cycle</label>
+              <input id="inbMaxCycle" type="number" min="0" max="50" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2" value="${cfg.maxReviewsPerCycle ?? 1}" />
+            </div>
+            <div>
+              <label class="block font-semibold mb-1">Daily Cap (0=∞)</label>
+              <input id="inbMaxDay" type="number" min="0" max="200" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2" value="${cfg.maxReviewsPerDay ?? 6}" />
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block font-semibold mb-1">Max Concurrency</label>
+              <input id="inbConc" type="number" min="1" max="4" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2" value="${cfg.maxConcurrency || 1}" />
+            </div>
+            <div>
+              <label class="block font-semibold mb-1">Recency Cutoff (days, 0=all)</label>
+              <input id="inbRecency" type="number" min="0" max="365" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2" value="${cfg.onlyUpdatedWithinDays ?? 14}" />
+            </div>
+          </div>
+          <div>
+            <label class="block font-semibold mb-1">Watched Repos (optional comma-separated owner/repo)</label>
+            <input id="inbRepos" type="text" class="w-full bg-black/40 border border-[var(--q-border)] rounded p-2 font-mono" placeholder="e.g. acme/backend, acme/app" value="${esc((cfg.watchedRepos || []).join(', '))}" />
+          </div>
+          <label class="flex items-center gap-2"><input id="inbReq" type="checkbox" ${cfg.watchReviewRequested !== false ? 'checked' : ''} /> <span>Watch PRs requesting my review (<code>review-requested:@me</code>)</span></label>
+          <label class="flex items-center gap-2"><input id="inbAuth" type="checkbox" ${cfg.watchAuthoredPrs !== false ? 'checked' : ''} /> <span>Watch my open PRs with new comments / changes requested</span></label>
+          <label class="flex items-center gap-2"><input id="inbRestrict" type="checkbox" ${cfg.restrictToWatchedRepos ? 'checked' : ''} /> <span>Restrict <code>@me</code> queue only to Watched Repos above</span></label>
+          <label class="flex items-center gap-2"><input id="inbDrafts" type="checkbox" ${cfg.includeDrafts ? 'checked' : ''} /> <span>Include Draft PRs</span></label>
+          <label class="flex items-center gap-2"><input id="inbCommentsOnly" type="checkbox" ${cfg.commentsOnly ? 'checked' : ''} /> <span>Comments-Only format (skip Study Guide & Tour)</span></label>
+        </div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button class="q-btn" onclick="closeModal()">Cancel</button>
+          <button class="q-btn q-btn-primary" onclick="saveInboxSettingsModal()">💾 Save Settings</button>
+        </div>
+      `);
+    }
+
+    async function saveInboxSettingsModal() {
+      const settings = {
+        mode: document.getElementById('inbMode')?.value || 'auto_precompute',
+        effort: document.getElementById('inbEffort')?.value || 'high',
+        pollIntervalMinutes: Number(document.getElementById('inbPoll')?.value || 15),
+        maxReviewsPerCycle: Number(document.getElementById('inbMaxCycle')?.value ?? 1),
+        maxReviewsPerDay: Number(document.getElementById('inbMaxDay')?.value ?? 6),
+        maxConcurrency: Number(document.getElementById('inbConc')?.value || 1),
+        onlyUpdatedWithinDays: Number(document.getElementById('inbRecency')?.value ?? 14),
+        watchedRepos: document.getElementById('inbRepos')?.value || '',
+        watchReviewRequested: Boolean(document.getElementById('inbReq')?.checked),
+        watchAuthoredPrs: Boolean(document.getElementById('inbAuth')?.checked),
+        restrictToWatchedRepos: Boolean(document.getElementById('inbRestrict')?.checked),
+        includeDrafts: Boolean(document.getElementById('inbDrafts')?.checked),
+        commentsOnly: Boolean(document.getElementById('inbCommentsOnly')?.checked),
+      };
+      closeModal();
+      const res = await apiCall('/api/inbox-settings', 'POST', { settings });
+      if (res && res.ok) {
+        await refreshState(STATE?.activeSession?.sessionId);
+        showToast('✅ Saved Inbox & Auto-Review settings!');
+      } else {
+        showToast(res?.error || 'Failed to save settings', true);
+      }
     }
 
     function renderPrSummaryBanner(session) {
@@ -1738,9 +2013,24 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           </div>`;
       })() : '';
 
+      const staleHead = session.staleHeadInfo;
+      const staleHtml = staleHead && staleHead.isStaleHead
+        ? `<div class="q-card p-3 border border-amber-500/60 bg-amber-500/10 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div>
+              <div class="font-bold text-amber-300">⚠️ Newer Commits Pushed on GitHub (<code>${esc(String(staleHead.reviewedHeadSha || '').slice(0, 7))}</code> → <code>${esc(String(staleHead.latestHeadSha || '').slice(0, 7))}</code>)</div>
+              <div class="text-[var(--q-muted)]">Update incrementally to audit only new commits while preserving your read stops &amp; staged/dismissed comments.</div>
+            </div>
+            <div class="flex gap-1.5">
+              <button class="q-btn primary" onclick="triggerIncrementalUpdateActive()">⚡ Update Incrementally</button>
+              <button class="q-btn" onclick="triggerFullRereviewActive()">🔄 Full Re-Review</button>
+            </div>
+          </div>`
+        : '';
+
       return `
         ${tutorialHtml}
         ${sgHtml}
+        ${staleHtml}
         <div class="q-card p-4 space-y-2">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div>
@@ -1755,6 +2045,16 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               ${pr.url ? `<a href="${esc(pr.url)}" target="_blank" class="q-btn">🔗 GitHub PR</a>` : ''}
             </div>
           </div>
+          ${(() => {
+            const ds = cn.deltaSummary;
+            if (!ds || typeof ds !== 'object' || (!ds.fromSha && !ds.summary)) return '';
+            const fS = String(ds.fromSha || '').slice(0, 7);
+            const tS = String(ds.toSha || '').slice(0, 7);
+            return `<div class="text-xs rounded p-3 border border-sky-500/45 bg-sky-500/10 space-y-1">
+              <div class="font-bold text-sky-300">🔄 Incremental Review Update (<code>${esc(fS)}</code> → <code>${esc(tS)}</code>)${ds.rebased ? ' <em>(rebased)</em>' : ''} • ${Number(ds.deltaFilesCount || 0)} changed, ${Number(ds.unchangedFilesCount || 0)} unchanged, ${Number(ds.resolvedFindingsCount || 0)} resolved, +${Number(ds.newFindingsCount || 0)} new</div>
+              ${ds.summary ? `<div>${esc(ds.summary)}</div>` : ''}
+            </div>`;
+          })()}
           ${cn.tldr ? `<div class="text-xs bg-black/25 border border-[var(--q-border)] rounded p-3"><b>TL;DR:</b> ${esc(cn.tldr)}</div>` : ''}
           ${(() => {
             const iva = cn.intentVsActuality;
@@ -2693,19 +2993,79 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       `);
     }
 
-    async function submitNewReview() {
-      const prUrl = document.getElementById('newReviewPrInput')?.value?.trim() || '';
-      const repoDir = document.getElementById('newReviewRepoInput')?.value?.trim() || '';
-      const effort = document.getElementById('newReviewEffort')?.value || 'high';
-      const commentsOnly = document.getElementById('newReviewMode')?.value === 'comments_only';
+    async function triggerIncrementalUpdateActive() {
+      const sess = STATE?.activeSession;
+      const pr = sess?.pr || {};
+      const prUrl = pr.url || (pr.owner && pr.repo && pr.number ? `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}` : '');
+      if (!prUrl) return;
+      await submitNewReview(true, {
+        prUrl,
+        repoDir: sess?.repoDir || sess?.workspaceDir || '',
+        effort: sess?.effortLevel || 'high',
+        commentsOnly: Boolean(sess?.commentsOnly),
+        incrementalFrom: STATE?.activeSessionPath || '',
+        incremental: true,
+      });
+    }
+
+    async function triggerFullRereviewActive() {
+      const sess = STATE?.activeSession;
+      const pr = sess?.pr || {};
+      const prUrl = pr.url || (pr.owner && pr.repo && pr.number ? `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}` : '');
+      if (!prUrl) return;
+      await submitNewReview(true, {
+        prUrl,
+        repoDir: sess?.repoDir || sess?.workspaceDir || '',
+        effort: sess?.effortLevel || 'high',
+        commentsOnly: Boolean(sess?.commentsOnly),
+      });
+    }
+
+    async function submitNewReview(forceNew = false, cachedInputs = null) {
+      const prUrl = cachedInputs
+        ? cachedInputs.prUrl
+        : (document.getElementById('newReviewPrInput')?.value?.trim() || '');
+      const repoDir = cachedInputs
+        ? cachedInputs.repoDir
+        : (document.getElementById('newReviewRepoInput')?.value?.trim() || '');
+      const effort = cachedInputs
+        ? cachedInputs.effort
+        : (document.getElementById('newReviewEffort')?.value || 'high');
+      const commentsOnly = cachedInputs
+        ? cachedInputs.commentsOnly
+        : (document.getElementById('newReviewMode')?.value === 'comments_only');
+      const incrementalFrom = cachedInputs?.incrementalFrom || '';
+      const incremental = Boolean(cachedInputs?.incremental);
       closeModal();
       startOptimisticAgentBanner(
-        `Quasar Code Review (${prUrl || repoDir || 'Local Branch'})`,
-        'Phase 1/3 • Collecting PR diff & context snapshot',
+        `Quasar ${incremental || incrementalFrom ? 'Incremental ' : ''}Code Review (${prUrl || repoDir || 'Local Branch'})`,
+        incremental || incrementalFrom
+          ? 'Phase 1/3 • Computing commit delta & remapping comments'
+          : 'Phase 1/3 • Collecting PR diff & context snapshot',
         `Starting ${effort}-effort review pipeline and spawning multi-lens subagents...`
       );
-      showToast('🚀 Starting Quasar review...');
-      const res = await apiCall('/api/start-review', 'POST', { prUrl, repoDir, effort, commentsOnly });
+      showToast(
+        incremental || incrementalFrom
+          ? '⚡ Starting Incremental Delta Review...'
+          : forceNew
+          ? '🚀 Starting fresh Quasar review...'
+          : '🚀 Checking & starting Quasar review...'
+      );
+      const res = await apiCall('/api/start-review', 'POST', {
+        prUrl,
+        repoDir,
+        effort,
+        commentsOnly,
+        forceNew: Boolean(forceNew),
+        incremental,
+        incrementalFrom,
+      });
+      if (res && res.ok && res.existingReviewFound && res.existingReview) {
+        OPTIMISTIC_AGENT_JOB = null;
+        renderAgentActivityBanner();
+        promptExistingReviewChoice(res.existingReview, { prUrl, repoDir, effort, commentsOnly });
+        return;
+      }
       if (res && res.ok && res.quarantined) {
         OPTIMISTIC_AGENT_JOB = null;
         renderAgentActivityBanner();
@@ -2718,6 +3078,78 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         OPTIMISTIC_AGENT_JOB = null;
         renderAgentActivityBanner();
         showToast(res?.error || 'Failed to start review', true);
+      }
+    }
+
+    function promptExistingReviewChoice(ex, pendingParams) {
+      window.__QUASAR_EXISTING_REVIEW_CHOICE__ = { ex, pendingParams };
+      const cachedShort = ex.cachedHeadSha ? String(ex.cachedHeadSha).slice(0, 7) : '';
+      const liveShort = ex.liveHeadSha ? String(ex.liveHeadSha).slice(0, 7) : '';
+      const statusBadge = ex.isUpToDate
+        ? `<span class="badge low">Up to date${cachedShort ? ' @ ' + esc(cachedShort) : ''}</span>`
+        : `<span class="badge medium">New commits pushed (${esc(cachedShort || '?')} → ${esc(liveShort || 'HEAD')})</span>`;
+      openModal(`
+        <h3>⚡ Completed Review Already Available</h3>
+        <p style="font-size:13px;color:var(--muted);line-height:1.5;margin-bottom:10px;">
+          <strong>${esc(ex.owner || '')}/${esc(ex.repo || '')}#${esc(String(ex.number || ''))}</strong> — ${esc(ex.title || '')}
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+          <span class="badge">${esc(ex.sourceLabel || 'Completed Review')}</span>
+          <span class="badge">${esc(String(ex.effort || 'high').toUpperCase())} effort</span>
+          <span class="badge">${Number(ex.findingsCount || 0)} finding(s)</span>
+          ${statusBadge}
+        </div>
+        ${ex.tldr ? `<div style="font-size:12px;color:var(--muted);background:var(--bg);padding:10px;border-radius:8px;border:1px solid var(--border);margin-bottom:14px;">${esc(ex.tldr)}</div>` : ''}
+        <p style="font-size:12.5px;margin-bottom:14px;">
+          ${ex.isUpToDate
+            ? 'Would you like to open the existing review (0s), run an updated review on top of it, or run a clean new review?'
+            : 'Stale hash detected — would you like an updated review (comparing the new hash against the previous hash) or a clean new review?'}
+        </p>
+        <div class="modal-footer" style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+          <button class="btn" onclick="closeModal()">Cancel</button>
+          <button class="btn" onclick="confirmExistingReviewChoice('new')">
+            ✨ Clean New Review
+          </button>
+          <button class="btn ${ex.isUpToDate ? '' : 'primary'}" onclick="confirmExistingReviewChoice('incremental')">
+            ⚡ Updated Review${!ex.isUpToDate ? ` (${esc(cachedShort || 'old')} → ${esc(liveShort || 'HEAD')})` : ''}
+          </button>
+          ${ex.isUpToDate ? `
+            <button class="btn primary" onclick="confirmExistingReviewChoice('switch')">
+              📖 Open Existing Review (0s)
+            </button>
+          ` : ''}
+        </div>
+      `);
+    }
+
+    async function confirmExistingReviewChoice(mode) {
+      const ctx = window.__QUASAR_EXISTING_REVIEW_CHOICE__;
+      closeModal();
+      if (!ctx) return;
+      if (mode === 'incremental') {
+        await submitNewReview(true, {
+          ...(ctx.pendingParams || {}),
+          incremental: true,
+          incrementalFrom: ctx.ex?.sessionPath || '',
+        });
+        return;
+      }
+      if (mode === 'new') {
+        await submitNewReview(true, ctx.pendingParams);
+        return;
+      }
+      const ex = ctx.ex;
+      const act = await apiCall('/api/inbox-activate', 'POST', {
+        sessionPath: ex.sessionPath,
+        itemId: ex.itemId || '',
+        workspaceDir: ctx.pendingParams?.repoDir || '',
+      });
+      if (act && act.ok) {
+        ACTIVE_TAB = 'guide';
+        await refreshState(act.sessionId);
+        showToast(`⚡ Switched to completed review for ${ex.owner}/${ex.repo}#${ex.number}`);
+      } else {
+        showToast(act?.error || 'Could not switch to completed review', true);
       }
     }
 
@@ -3552,6 +3984,44 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 effort = "high"
             comments_only = bool(data.get("commentsOnly", False))
             branch_name = (data.get("branch") or "").strip()
+            force_new = bool(data.get("forceNew", False))
+            incremental = bool(data.get("incremental", False))
+            incremental_from = str(data.get("incrementalFrom") or "").strip()
+
+            target_check_ref = pr_url if pr_url else (branch_name or "HEAD")
+            if target_check_ref and not force_new and not incremental and not incremental_from:
+                try:
+                    import inbox_watcher  # type: ignore
+
+                    existing_res = inbox_watcher.find_existing_completed_review(target_check_ref, repo_dir=repo_dir)
+                    if existing_res.get("found") and existing_res.get("sessionPath"):
+                        self._send_json(
+                            200,
+                            {
+                                "ok": True,
+                                "existingReviewFound": True,
+                                "existingReview": existing_res,
+                            },
+                        )
+                        return
+                except Exception:
+                    pass
+
+            # Copy incrementalFrom safely before `collect_pr_context.py` updates `active_session.json`
+            safe_inc_from = ""
+            if incremental_from and os.path.isfile(incremental_from):
+                try:
+                    from collect_pr_context import get_session_paths
+
+                    ws_st, _, _ = get_session_paths(repo_dir)
+                    os.makedirs(ws_st, exist_ok=True)
+                    safe_inc_from = os.path.join(ws_st, "prior_session_for_delta.json")
+                    if os.path.realpath(incremental_from) != os.path.realpath(safe_inc_from):
+                        import shutil
+
+                        shutil.copy2(incremental_from, safe_inc_from)
+                except Exception:
+                    safe_inc_from = incremental_from
 
             # Run deterministic `collect_pr_context.py` pre-scan BEFORE invoking any LLM agent!
             collect_script = os.path.join(SCRIPTS_DIR, "collect_pr_context.py")
@@ -3564,6 +4034,10 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 "--workspace-dir",
                 repo_dir,
             ]
+            if safe_inc_from:
+                cmd.extend(["--incremental-from", safe_inc_from])
+            elif incremental:
+                cmd.append("--incremental")
             if pr_url:
                 cmd.extend(["--pr", pr_url])
                 if os.path.isdir(repo_dir):
@@ -3590,11 +4064,18 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 ctx_out = {}
 
             mode_str = " (comments only)" if comments_only else ""
+            is_inc_ctx = isinstance(ctx_out, dict) and bool(ctx_out.get("is_incremental"))
+            saved_ctx_p = ctx_out.get("saved_context_path") if isinstance(ctx_out, dict) else ""
+            inc_prompt_note = (
+                f" (context initialized in \"{saved_ctx_p}\"; INCREMENTAL DELTA REVIEW: inspect `delta.diff` & `incremental_context` in `pr_context.json` — audit ONLY `delta.diff` & `deltaFiles`, evaluate `priorFindingsToRecheck` via `priorFindingUpdates`, emit ONLY new delta findings in `findings` and delta stops in `chapters`, and populate `cliffsNotes.deltaSummary`)"
+                if is_inc_ctx
+                else (f" (context initialized in \"{saved_ctx_p}\" — do NOT re-run `collect_pr_context.py`)" if saved_ctx_p else "")
+            )
             if pr_url:
-                prompt = f"Using the `quasar` skill, review {pr_url} on {effort} effort{mode_str} with --workspace-dir \"{repo_dir}\""
+                prompt = f"Using the `quasar` skill, review {pr_url} on {effort} effort{mode_str} with --workspace-dir \"{repo_dir}\"{inc_prompt_note}"
             else:
                 branch_part = f" branch `{branch_name}`" if branch_name else " local branch"
-                prompt = f"Using the `quasar` skill, review{branch_part} in {repo_dir} on {effort} effort{mode_str}"
+                prompt = f"Using the `quasar` skill, review{branch_part} in {repo_dir} on {effort} effort{mode_str}{inc_prompt_note}"
             res = dispatch_to_agent(
                 prompt,
                 title="Quasar Code Review",
@@ -3655,6 +4136,102 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 allow_edits=False,
             )
             self._send_json(200 if res.get("ok") else 500, {"ok": bool(res.get("ok")), "error": res.get("error"), "dispatch": res})
+            return
+
+        if pathname == "/api/inbox-settings":
+            try:
+                import inbox_watcher  # type: ignore
+
+                updates = data.get("settings") if isinstance(data.get("settings"), dict) else data
+                saved = inbox_watcher.save_inbox_settings(updates or {})
+                daemon_res = {}
+                if saved.get("enabled"):
+                    daemon_res = inbox_watcher.start_daemon_background()
+                elif "enabled" in (updates or {}) and not saved.get("enabled"):
+                    daemon_res = inbox_watcher.stop_daemon_background()
+                out = inbox_watcher.build_inbox_payload()
+                out["daemonAction"] = daemon_res
+                self._send_json(200, out)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if pathname == "/api/inbox-sync":
+            try:
+                import inbox_watcher  # type: ignore
+
+                res = inbox_watcher.sync_github_queue()
+                out = inbox_watcher.build_inbox_payload()
+                out["ok"] = bool(res.get("ok"))
+                if res.get("error"):
+                    out["error"] = res["error"]
+                self._send_json(200 if out["ok"] else 400, out)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if pathname == "/api/inbox-precompute":
+            try:
+                import inbox_watcher  # type: ignore
+
+                item_id = str(data.get("itemId") or "").strip()
+                if not item_id:
+                    self._send_json(400, {"ok": False, "error": "Missing itemId"})
+                    return
+                threading.Thread(
+                    target=inbox_watcher.run_precompute_for_item,
+                    args=(item_id, None, False),
+                    daemon=True,
+                ).start()
+                self._send_json(200, {"ok": True, "started": True, "itemId": item_id})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if pathname == "/api/inbox-activate":
+            try:
+                import inbox_watcher  # type: ignore
+
+                item_id = str(data.get("itemId") or "").strip()
+                session_path = str(data.get("sessionPath") or "").strip()
+                _, _, default_ws, _ = resolve_conversation_context(data.get("conversationId"))
+                ws_dir = (data.get("workspaceDir") or default_ws or os.getcwd()).strip()
+                if session_path:
+                    res = inbox_watcher.activate_existing_session_file(
+                        src_session_path=session_path,
+                        workspace_dir=ws_dir,
+                        item_id=item_id or None,
+                    )
+                else:
+                    res = inbox_watcher.activate_inbox_item(
+                        item_id,
+                        workspace_dir=ws_dir,
+                        allow_stale=bool(data.get("allowStale", False)),
+                    )
+                self._send_json(200 if res.get("ok") else 400, res)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if pathname == "/api/inbox-item-action":
+            try:
+                import inbox_watcher  # type: ignore
+
+                item_id = str(data.get("itemId") or "").strip()
+                act = str(data.get("action") or "").strip()
+                st = inbox_watcher.load_inbox_state()
+                if item_id in st.get("items", {}):
+                    if act == "markReviewed":
+                        st["items"][item_id]["reviewedHeadSha"] = st["items"][item_id].get("headSha")
+                        st["items"][item_id]["status"] = "waiting_on_author"
+                        st["items"][item_id]["unread"] = False
+                    elif act == "dismiss":
+                        st["items"][item_id]["dismissed"] = True
+                        st["items"][item_id]["unread"] = False
+                    inbox_watcher.save_inbox_state(st)
+                self._send_json(200, inbox_watcher.build_inbox_payload())
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
             return
 
         self._send_json(404, {"ok": False, "error": "Unknown endpoint"})

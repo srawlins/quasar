@@ -329,4 +329,87 @@ flowchart LR
       );
     },
   );
+
+  testWidgets(
+    'QuasarStandaloneApp renders Multi-PR Inbox and token-cap badges',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1400, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final MockClient mockHttp = MockClient((http.Request req) async {
+        if (req.url.path == '/api/state') {
+          return http.Response.bytes(
+            utf8.encode(jsonEncode(<String, dynamic>{
+              'ok': true,
+              'sidecarPort': 49341,
+              'defaultWorkspaceDir': '/tmp/repo',
+              'githubAuth': <String, dynamic>{'configured': true, 'login': 'octocat'},
+              'agentStatus': <String, dynamic>{'active': false},
+              'sessions': <Map<String, dynamic>>[],
+              'filesDiff': <Map<String, dynamic>>[],
+              'activeSession': null,
+              'inbox': <String, dynamic>{
+                'settings': <String, dynamic>{
+                  'enabled': true,
+                  'mode': 'auto_precompute',
+                  'effort': 'high',
+                  'pollIntervalMinutes': 15,
+                  'maxReviewsPerCycle': 1,
+                  'maxReviewsPerDay': 6,
+                  'maxConcurrency': 1,
+                },
+                'daemon': <String, dynamic>{'running': true, 'pid': 12345},
+                'budget': <String, dynamic>{
+                  'reviewsRunToday': 2,
+                  'maxReviewsPerDay': 6,
+                },
+                'counts': <String, dynamic>{'ready': 1, 'unreadReady': 1},
+                'items': <Map<String, dynamic>>[
+                  <String, dynamic>{
+                    'id': 'acme-api-pr-101',
+                    'owner': 'acme',
+                    'repo': 'api',
+                    'number': 101,
+                    'title': 'Add retry jitter',
+                    'author': 'bob',
+                    'role': 'reviewer',
+                    'status': 'ready',
+                    'inboxGroup': 'ready_to_review',
+                    'additions': 45,
+                    'deletions': 12,
+                    'changedFilesCount': 3,
+                    'unread': true,
+                    'tldr': 'Adds bounded exponential backoff with jitter.',
+                  },
+                ],
+              },
+            })),
+            200,
+            headers: const <String, String>{
+              'content-type': 'application/json; charset=utf-8',
+            },
+          );
+        }
+        return http.Response(jsonEncode(<String, dynamic>{'ok': true}), 200);
+      });
+
+      final QuasarApiClient api = QuasarApiClient(
+        baseUrl: 'http://127.0.0.1:49341',
+        client: mockHttp,
+      );
+
+      await tester.pumpWidget(QuasarStandaloneApp(apiClient: api));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('📥 Inbox (1)'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Max 1/cycle'), findsOneWidget);
+      expect(find.text('Daily Cap: 2/6 today'), findsOneWidget);
+      expect(find.textContaining('acme/api#101: Add retry jitter'), findsOneWidget);
+      expect(find.text('📖 Open in 0s'), findsOneWidget);
+    },
+  );
 }

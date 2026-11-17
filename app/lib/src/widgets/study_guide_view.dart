@@ -10,12 +10,16 @@ class StudyGuideView extends StatelessWidget {
     required this.onJumpToStop,
     required this.onToggleStopRead,
     this.onOverrideQuarantine,
+    this.onIncrementalUpdate,
+    this.onFullRereview,
   });
 
   final ReviewSession session;
   final ValueChanged<TourStop> onJumpToStop;
   final ValueChanged<TourStop> onToggleStopRead;
   final VoidCallback? onOverrideQuarantine;
+  final VoidCallback? onIncrementalUpdate;
+  final VoidCallback? onFullRereview;
 
   void _handleFlowchartNodeTap(FlowchartNode node) {
     final String needle = node.label
@@ -186,6 +190,78 @@ class StudyGuideView extends StatelessWidget {
           ),
           const SizedBox(height: 14),
         ],
+        if (session.staleHeadInfo != null &&
+            session.staleHeadInfo!.isStaleHead) ...<Widget>[
+          Builder(
+            builder: (BuildContext ctx) {
+              final StaleHeadInfo sh = session.staleHeadInfo!;
+              final String oldS = sh.reviewedHeadSha.length > 7
+                  ? sh.reviewedHeadSha.substring(0, 7)
+                  : sh.reviewedHeadSha;
+              final String newS = sh.latestHeadSha.length > 7
+                  ? sh.latestHeadSha.substring(0, 7)
+                  : sh.latestHeadSha;
+              return Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFD29922).withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: const Color(0xFFD29922).withValues(alpha: 0.65),
+                    width: 1.5,
+                  ),
+                ),
+                child: Wrap(
+                  spacing: 12,
+                  runSpacing: 10,
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: <Widget>[
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          '⚠️ Newer Commits Pushed on GitHub ($oldS → $newS)',
+                          style: const TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFFE3B341),
+                          ),
+                        ),
+                        const SizedBox(height: 3),
+                        const Text(
+                          'Update incrementally to diff only new commits while preserving your read stops & staged/dismissed comments.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFC9D1D9),
+                          ),
+                        ),
+                      ],
+                    ),
+                    Wrap(
+                      spacing: 8,
+                      children: <Widget>[
+                        if (onIncrementalUpdate != null)
+                          FilledButton.icon(
+                            onPressed: onIncrementalUpdate,
+                            icon: const Icon(Icons.compare_arrows, size: 15),
+                            label: Text('Update Incrementally ($oldS → $newS)'),
+                          ),
+                        if (onFullRereview != null)
+                          OutlinedButton.icon(
+                            onPressed: onFullRereview,
+                            icon: const Icon(Icons.refresh, size: 15),
+                            label: const Text('Full Re-Review'),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 14),
+        ],
         // Overview Card
         Container(
           padding: const EdgeInsets.all(18),
@@ -232,6 +308,58 @@ class StudyGuideView extends StatelessWidget {
                   ),
                 ],
               ),
+              if (cn.deltaSummary != null &&
+                  cn.deltaSummary!.hasContent) ...<Widget>[
+                const SizedBox(height: 12),
+                Builder(
+                  builder: (BuildContext ctx) {
+                    final DeltaSummary ds = cn.deltaSummary!;
+                    final String fS = ds.fromSha.length > 7
+                        ? ds.fromSha.substring(0, 7)
+                        : ds.fromSha;
+                    final String tS = ds.toSha.length > 7
+                        ? ds.toSha.substring(0, 7)
+                        : ds.toSha;
+                    return Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(11),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF388BFD).withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color:
+                              const Color(0xFF388BFD).withValues(alpha: 0.45),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            '🔄 Incremental Review Update ($fS → $tS)${ds.rebased ? ' (rebased)' : ''} • '
+                            '${ds.deltaFilesCount} changed, ${ds.unchangedFilesCount} unchanged, '
+                            '${ds.resolvedFindingsCount} resolved, +${ds.newFindingsCount} new',
+                            style: const TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF79C0FF),
+                            ),
+                          ),
+                          if (ds.summary.isNotEmpty) ...<Widget>[
+                            const SizedBox(height: 4),
+                            Text(
+                              ds.summary,
+                              style: const TextStyle(
+                                fontSize: 12.5,
+                                color: Color(0xFFC9D1D9),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
               if (cn.tldr.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 12),
                 Container(

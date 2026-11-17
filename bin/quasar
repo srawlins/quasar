@@ -7,6 +7,7 @@
 #   quasar --branch [branch] [--repo <dir>]   # Start a local branch review via `agy` CLI & open Quasar
 #   quasar --desktop                          # Launch native Flutter macOS Desktop App (`Quasar.app`)
 #   quasar --tutorial                         # Open the interactive sandbox tutorial
+#   quasar watch [--sync|--once|--stop|--status] # Manage background PR Inbox & Auto-Review daemon
 set -euo pipefail
 
 SCRIPT_PATH="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
@@ -20,6 +21,47 @@ if [ ! -f "${SERVER_PY}" ]; then
   SERVER_PY="${HOME}/.gemini/config/plugins/quasar/sidecars/quasar-web/server.py"
 fi
 
+INBOX_WATCHER_PY="${REPO_ROOT}/plugin/skills/quasar/scripts/inbox_watcher.py"
+if [ ! -f "${INBOX_WATCHER_PY}" ]; then
+  INBOX_WATCHER_PY="${REPO_ROOT}/skills/quasar/scripts/inbox_watcher.py"
+fi
+if [ ! -f "${INBOX_WATCHER_PY}" ]; then
+  INBOX_WATCHER_PY="${HOME}/.gemini/config/plugins/quasar/skills/quasar/scripts/inbox_watcher.py"
+fi
+
+if [ "${1:-}" = "watch" ] || [ "${1:-}" = "inbox" ]; then
+  shift
+  if [ $# -eq 0 ]; then
+    exec python3 "${INBOX_WATCHER_PY}" --start-daemon
+  fi
+  WATCH_ARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sync)
+        WATCH_ARGS+=("--sync-now")
+        shift
+        ;;
+      --once)
+        WATCH_ARGS+=("--run-cycle")
+        shift
+        ;;
+      --stop)
+        WATCH_ARGS+=("--stop-daemon")
+        shift
+        ;;
+      --status)
+        WATCH_ARGS+=("--get-state")
+        shift
+        ;;
+      *)
+        WATCH_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+  exec python3 "${INBOX_WATCHER_PY}" "${WATCH_ARGS[@]}"
+fi
+
 PORT="${QUASAR_PORT:-49341}"
 URL="http://127.0.0.1:${PORT}"
 PR_URL=""
@@ -31,6 +73,7 @@ COMMENTS_ONLY=0
 DESKTOP_MODE=0
 TUTORIAL_MODE=0
 NO_OPEN=0
+FORCE_NEW=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,6 +108,10 @@ while [ $# -gt 0 ]; do
       ;;
     --no-open)
       NO_OPEN=1
+      shift
+      ;;
+    --force|--fresh)
+      FORCE_NEW=1
       shift
       ;;
     -v|--version)
@@ -115,27 +162,82 @@ if [ "${TUTORIAL_MODE}" = "1" ]; then
   echo "🎓 Generating interactive sandbox tutorial..."
   curl -fsS -X POST "${URL}/api/tutorial" -H "Content-Type: application/json" -d '{}' >/dev/null
 elif [ -n "${PR_URL}" ] || [ "${BRANCH_MODE}" = "1" ]; then
-  echo "🔬 Dispatching review to Antigravity CLI (agy)..."
+  echo "🔬 Checking & dispatching review..."
   CO_BOOL="false"
   if [ "${COMMENTS_ONLY}" = "1" ]; then CO_BOOL="true"; fi
-  python3 - "${URL}" "${PR_URL}" "${REPO_DIR}" "${BRANCH_NAME}" "${EFFORT}" "${CO_BOOL}" <<'PY'
-import json, sys, urllib.request
-url, pr_url, repo_dir, branch, effort, co_str = sys.argv[1:7]
+  FORCE_BOOL="false"
+  if [ "${FORCE_NEW}" = "1" ]; then FORCE_BOOL="true"; fi
+  python3 - "${URL}" "${PR_URL}" "${REPO_DIR}" "${BRANCH_NAME}" "${EFFORT}" "${CO_BOOL}" "${FORCE_BOOL}" <<'PY'
+import json, os, sys, urllib.request
+
+url, pr_url, repo_dir, branch, effort, co_str, force_str = sys.argv[1:8]
+
+def post_json(endpoint, data):
+    req = urllib.request.Request(
+        f"{url}{endpoint}",
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
 payload = {
     "prUrl": pr_url,
     "repoDir": repo_dir,
     "branch": branch,
     "effort": effort,
     "commentsOnly": co_str == "true",
+    "forceNew": force_str == "true",
 }
-req = urllib.request.Request(
-    f"{url}/api/start-review",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json"},
-    method="POST",
-)
-with urllib.request.urlopen(req, timeout=15) as resp:
-    print("  ✅ Dispatched:", resp.read().decode("utf-8"))
+res = post_json("/api/start-review", payload)
+if res.get("existingReviewFound") and isinstance(res.get("existingReview"), dict):
+    ex = res["existingReview"]
+    up_to_date = ex.get("isUpToDate", True)
+    c_sha = str(ex.get("cachedHeadSha") or "")[:7]
+    l_sha = str(ex.get("liveHeadSha") or "")[:7]
+    sha_info = f"up to date @ {c_sha}" if up_to_date else f"new commits pushed ({c_sha} -> {l_sha})"
+    print(f"  ⚡ Completed review already exists for {ex.get('owner')}/{ex.get('repo')}#{ex.get('number')} — {ex.get('title')}")
+    print(f"     ({ex.get('sourceLabel')} • {str(ex.get('effort', 'high')).upper()} effort • {ex.get('findingsCount', 0)} finding(s) • {sha_info})")
+    choice = "o" if up_to_date else "u"
+    try:
+        if os.path.exists("/dev/tty"):
+            with open("/dev/tty", "r", encoding="utf-8") as tty_in, open("/dev/tty", "w", encoding="utf-8") as tty_out:
+                if up_to_date:
+                    tty_out.write("  👉 [O]pen existing review (0s), [U]pdated review, or [C]lean new review? [O/u/c]: ")
+                    tty_out.flush()
+                    ans = tty_in.readline().strip().lower()
+                    if ans in ("o", "open", "s", "switch"):
+                        choice = "o"
+                    elif ans in ("u", "update", "updated", "i", "inc"):
+                        choice = "u"
+                    elif ans in ("c", "clean", "n", "new"):
+                        choice = "c"
+                else:
+                    tty_out.write("  👉 Stale hash detected — [U]pdated review or [C]lean new review? [U/c]: ")
+                    tty_out.flush()
+                    ans = tty_in.readline().strip().lower()
+                    if ans in ("u", "update", "updated", "i", "inc"):
+                        choice = "u"
+                    elif ans in ("c", "clean", "n", "new"):
+                        choice = "c"
+    except Exception:
+        pass
+    if choice == "o" and up_to_date:
+        act = post_json("/api/inbox-activate", {
+            "itemId": ex.get("itemId") or "",
+            "sessionPath": ex.get("sessionPath") or "",
+            "workspaceDir": repo_dir,
+        })
+        print(f"  ⚡ Opened existing review in 0s (session: {act.get('sessionId')})")
+        sys.exit(0)
+    payload["forceNew"] = True
+    if choice == "u":
+        payload["incremental"] = True
+        payload["incrementalFrom"] = ex.get("sessionPath") or ""
+    res = post_json("/api/start-review", payload)
+
+print("  ✅ Dispatched:", json.dumps(res))
 PY
 fi
 

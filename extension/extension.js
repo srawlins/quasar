@@ -13,6 +13,10 @@ let onAgyCliJobStateChanged = null;
 const REVIEW_STATE_DIR = path.join(os.homedir(), '.gemini', 'quasar');
 const WORKSPACES_STATE_DIR = path.join(REVIEW_STATE_DIR, 'workspaces');
 const HISTORY_STATE_DIR = path.join(REVIEW_STATE_DIR, 'history');
+const INBOX_STATE_DIR = path.join(REVIEW_STATE_DIR, 'inbox');
+const INBOX_SETTINGS_PATH = path.join(INBOX_STATE_DIR, 'settings.json');
+const INBOX_INDEX_PATH = path.join(INBOX_STATE_DIR, 'state.json');
+const INBOX_DAEMON_PATH = path.join(INBOX_STATE_DIR, 'daemon.json');
 const PREFERENCES_JSON_PATH = path.join(REVIEW_STATE_DIR, 'preferences.json');
 const PREFERENCES_MD_PATH = path.join(REVIEW_STATE_DIR, 'PREFERENCES.md');
 const GITHUB_AUTH_PATH = path.join(REVIEW_STATE_DIR, 'github_auth.json');
@@ -1741,6 +1745,465 @@ function listPastReviews() {
   return Array.from(byId.values()).sort((a, b) => b.updatedMs - a.updatedMs);
 }
 
+const DEFAULT_INBOX_SETTINGS = {
+  enabled: false,
+  mode: 'auto_precompute',
+  watchReviewRequested: true,
+  watchAuthoredPrs: true,
+  watchedRepos: [],
+  restrictToWatchedRepos: false,
+  includeDrafts: false,
+  effort: 'high',
+  commentsOnly: false,
+  pollIntervalMinutes: 15,
+  maxConcurrency: 1,
+  maxReviewsPerCycle: 1,
+  maxReviewsPerDay: 6,
+  onlyUpdatedWithinDays: 14,
+  notifyWhenReady: true,
+};
+
+function loadInboxPayloadSync() {
+  let settings = { ...DEFAULT_INBOX_SETTINGS };
+  if (fs.existsSync(INBOX_SETTINGS_PATH)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(INBOX_SETTINGS_PATH, 'utf-8'));
+      if (raw && typeof raw === 'object') {
+        settings = { ...settings, ...raw };
+      }
+    } catch (_) { }
+  }
+
+  let daemon = { running: false, pid: null, activeItemIds: [] };
+  if (fs.existsSync(INBOX_DAEMON_PATH)) {
+    try {
+      const rawD = JSON.parse(fs.readFileSync(INBOX_DAEMON_PATH, 'utf-8'));
+      if (rawD && typeof rawD === 'object') {
+        const alive = Boolean(rawD.pid && isPidAlive(rawD.pid));
+        daemon = {
+          ...rawD,
+          running: alive,
+          activeItemIds: alive && Array.isArray(rawD.activeItemIds) ? rawD.activeItemIds : [],
+        };
+      }
+    } catch (_) { }
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  let state = {
+    lastSyncedAt: null,
+    githubLogin: '',
+    budgetDate: today,
+    reviewsRunToday: 0,
+    lastSyncError: '',
+    items: {},
+  };
+  if (fs.existsSync(INBOX_INDEX_PATH)) {
+    try {
+      const rawS = JSON.parse(fs.readFileSync(INBOX_INDEX_PATH, 'utf-8'));
+      if (rawS && typeof rawS === 'object') {
+        state = { ...state, ...rawS };
+      }
+    } catch (_) { }
+  }
+
+  const itemsList = [];
+  const rawItems = state.items && typeof state.items === 'object' ? state.items : {};
+  for (const rawIt of Object.values(rawItems)) {
+    if (!rawIt || typeof rawIt !== 'object') continue;
+    if (rawIt.openInQueue === false && rawIt.status !== 'ready') continue;
+    if (rawIt.dismissed) continue;
+    const it = { ...rawIt };
+    const st = String(it.status || 'queued');
+    const role = String(it.role || 'reviewer');
+    if (st === 'quarantined') it.inboxGroup = 'quarantined';
+    else if (st === 'analyzing') it.inboxGroup = 'in_progress';
+    else if (st === 'ready' && role === 'author') it.inboxGroup = 'author_action_needed';
+    else if (st === 'ready') it.inboxGroup = 'ready_to_review';
+    else if (st === 'waiting_on_author' || st === 'waiting_on_reviewers') it.inboxGroup = 'waiting';
+    else it.inboxGroup = 'queued';
+    itemsList.push(it);
+  }
+
+  const orderMap = {
+    in_progress: 0,
+    ready_to_review: 1,
+    author_action_needed: 2,
+    quarantined: 3,
+    queued: 4,
+    waiting: 5,
+  };
+  itemsList.sort((a, b) => {
+    const ga = orderMap[a.inboxGroup] ?? 9;
+    const gb = orderMap[b.inboxGroup] ?? 9;
+    if (ga !== gb) return ga - gb;
+    return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
+  });
+
+  const readyItems = itemsList.filter(
+    (i) => i.inboxGroup === 'ready_to_review' || i.inboxGroup === 'author_action_needed'
+  );
+  const unreadReady = readyItems.filter((i) => Boolean(i.unread));
+  const maxDay = Number(settings.maxReviewsPerDay || 0);
+  const runToday = state.budgetDate === today ? Number(state.reviewsRunToday || 0) : 0;
+
+  return {
+    settings,
+    daemon,
+    githubLogin: state.githubLogin || '',
+    lastSyncedAt: state.lastSyncedAt || null,
+    lastSyncError: state.lastSyncError || '',
+    budget: {
+      reviewsRunToday: runToday,
+      maxReviewsPerDay: maxDay,
+      dailyCapReached: maxDay > 0 && runToday >= maxDay,
+    },
+    counts: {
+      total: itemsList.length,
+      ready: readyItems.length,
+      unreadReady: unreadReady.length,
+      analyzing: itemsList.filter((i) => i.inboxGroup === 'in_progress').length,
+      queued: itemsList.filter((i) => i.inboxGroup === 'queued').length,
+    },
+    items: itemsList,
+  };
+}
+
+function runInboxWatcher(args, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    const scriptPath = path.join(PLUGIN_SCRIPTS_DIR, 'inbox_watcher.py');
+    execFile(
+      'python3',
+      [scriptPath, ...args],
+      { timeout: timeoutMs, env: getQuasarScriptEnv() },
+      (err, stdout, stderr) => {
+        if (err) {
+          let parsedErr = null;
+          try {
+            parsedErr = JSON.parse(stdout || '{}');
+          } catch (_) { }
+          resolve({
+            ok: false,
+            error: (parsedErr && parsedErr.error) || (stderr && stderr.trim()) || err.message,
+          });
+        } else {
+          try {
+            const parsed = JSON.parse(stdout || '{}');
+            resolve({ ok: parsed.ok !== false, ...parsed });
+          } catch (_) {
+            resolve({ ok: true });
+          }
+        }
+      }
+    );
+  });
+}
+
+let lastFreshnessProbeAt = 0;
+let lastFreshnessProbeKey = '';
+
+function getSessionStaleHeadInfo(session) {
+  if (!session || typeof session !== 'object' || session.analysisStatus === 'analyzing') {
+    return null;
+  }
+  const pr = session.pr || {};
+  const owner = String(pr.owner || '').trim();
+  const repo = String(pr.repo || '').trim();
+  const num = Number(pr.number || 0);
+  const reviewedSha = String(pr.headSha || '').trim();
+  if (!owner || owner === 'local' || !repo || num <= 0 || !reviewedSha) {
+    return null;
+  }
+
+  let latestSha = '';
+  try {
+    const inboxPayload = loadInboxPayloadSync();
+    for (const it of inboxPayload.items || []) {
+      if (
+        String(it.owner || '').toLowerCase() === owner.toLowerCase() &&
+        String(it.repo || '').toLowerCase() === repo.toLowerCase() &&
+        Number(it.number || 0) === num &&
+        it.headSha
+      ) {
+        latestSha = String(it.headSha);
+        break;
+      }
+    }
+  } catch (_) { }
+
+  try {
+    const headCachePath = path.join(REVIEW_STATE_DIR, 'inbox', 'head_cache.json');
+    if (fs.existsSync(headCachePath)) {
+      const cacheObj = JSON.parse(fs.readFileSync(headCachePath, 'utf8') || '{}');
+      const entry = cacheObj[`${owner.toLowerCase()}/${repo.toLowerCase()}#${num}`];
+      if (entry && entry.headSha) {
+        latestSha = String(entry.headSha);
+      }
+    }
+  } catch (_) { }
+
+  // Trigger a throttled non-blocking live check every 90s for the open PR
+  const probeKey = `${owner}/${repo}#${num}@${reviewedSha}`;
+  const nowMs = Date.now();
+  if (probeKey !== lastFreshnessProbeKey || nowMs - lastFreshnessProbeAt > 90000) {
+    lastFreshnessProbeKey = probeKey;
+    lastFreshnessProbeAt = nowMs;
+    runInboxWatcher(
+      ['--check-session-freshness', '--workspace-dir', getWindowWorkspaceRoot()],
+      8000
+    )
+      .then((res) => {
+        if (res && res.isStaleHead && res.latestHeadSha && res.latestHeadSha !== latestSha) {
+          refreshAllUI(false);
+        }
+      })
+      .catch(() => { });
+  }
+
+  if (latestSha && latestSha !== reviewedSha) {
+    return {
+      isStaleHead: true,
+      reviewedHeadSha: reviewedSha,
+      latestHeadSha: latestSha,
+      prUrl: pr.url || `https://github.com/${owner}/${repo}/pull/${num}`,
+      owner,
+      repo,
+      number: num,
+    };
+  }
+  return null;
+}
+
+class InboxTreeProvider {
+  constructor() {
+    this._onDidChangeTreeData = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+  }
+
+  refresh() {
+    this._onDidChangeTreeData.fire();
+  }
+
+  getTreeItem(element) {
+    return element;
+  }
+
+  getChildren(element) {
+    const payload = loadInboxPayloadSync();
+    const { settings, daemon, budget, items, lastSyncedAt, lastSyncError } = payload;
+
+    if (!element) {
+      const roots = [];
+
+      // Status / Setup Banner Row
+      const isDaemonRunning = Boolean(daemon && daemon.running);
+      const modeDesc =
+        settings.mode === 'sync_queue_only'
+          ? 'Sync-Only (0 tokens)'
+          : `${String(settings.effort || 'high').toUpperCase()} • ≤${settings.maxReviewsPerCycle || 1
+          }/cycle • ${budget.maxReviewsPerDay > 0
+            ? `${budget.reviewsRunToday}/${budget.maxReviewsPerDay} today`
+            : `${budget.reviewsRunToday} today`
+          }`;
+      const statusItem = new vscode.TreeItem(
+        isDaemonRunning
+          ? `Auto-Review: Active (Every ${settings.pollIntervalMinutes || 15}m)`
+          : settings.enabled
+            ? 'Auto-Review: Enabled (Daemon Stopped — Click to Configure)'
+            : 'Set Up Background Auto-Review & PR Inbox...',
+        vscode.TreeItemCollapsibleState.None
+      );
+      statusItem.description = isDaemonRunning ? modeDesc : 'Configure scope, cadence & token caps';
+      statusItem.iconPath = new vscode.ThemeIcon(
+        isDaemonRunning ? 'pulse' : 'settings-gear',
+        new vscode.ThemeColor(isDaemonRunning ? 'charts.green' : 'charts.blue')
+      );
+      statusItem.tooltip = new vscode.MarkdownString(
+        `### 📥 Quasar Background Auto-Review & Multi-PR Inbox\n\n` +
+        `- **Daemon**: ${isDaemonRunning ? `Running (PID ${daemon.pid})` : 'Paused / Off'}\n` +
+        `- **Mode**: ${settings.mode === 'sync_queue_only'
+          ? 'Sync Queue Only (0 LLM tokens — manual Pre-Review)'
+          : 'Auto-Precompute Reviews in Background'
+        }\n` +
+        `- **Cadence & Token Caps**: Every **${settings.pollIntervalMinutes || 15}m**, max **${settings.maxReviewsPerCycle || 1
+        }** PR(s) per cycle, **${budget.maxReviewsPerDay > 0
+          ? `${budget.reviewsRunToday}/${budget.maxReviewsPerDay}`
+          : 'unlimited'
+        }** today, max concurrency **${settings.maxConcurrency || 1}**\n` +
+        (lastSyncedAt ? `- **Last Synced**: ${lastSyncedAt}\n` : '') +
+        `\n*Click to configure scope, cadence, effort, and daily token caps.*`
+      );
+      statusItem.command = {
+        command: 'quasar.configureInboxWatcher',
+        title: 'Configure PR Inbox & Auto-Review Settings',
+      };
+      roots.push(statusItem);
+
+      if (lastSyncError) {
+        const errItem = new vscode.TreeItem(
+          `Sync Issue: ${lastSyncError}`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        errItem.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.yellow'));
+        errItem.command = {
+          command: lastSyncError.toLowerCase().includes('token')
+            ? 'quasar.configureGithubToken'
+            : 'quasar.syncInboxNow',
+          title: 'Resolve Inbox Sync Issue',
+        };
+        roots.push(errItem);
+      }
+
+      if (items.length === 0) {
+        const syncNowItem = new vscode.TreeItem(
+          'Sync My GitHub PR Queue Now (0 Tokens)',
+          vscode.TreeItemCollapsibleState.None
+        );
+        syncNowItem.description = 'Fetch Assigned PRs & Authored PRs';
+        syncNowItem.iconPath = new vscode.ThemeIcon('sync');
+        syncNowItem.command = {
+          command: 'quasar.syncInboxNow',
+          title: 'Sync GitHub PR Inbox Now',
+        };
+        roots.push(syncNowItem);
+        return roots;
+      }
+
+      const groupsDef = [
+        {
+          key: 'in_progress',
+          label: '⏳ Pre-Reviewing in Background',
+          icon: 'loading~spin',
+          expanded: true,
+        },
+        {
+          key: 'ready_to_review',
+          label: '🟢 Ready to Review (0s Open)',
+          icon: 'pass-filled',
+          expanded: true,
+        },
+        {
+          key: 'author_action_needed',
+          label: '🛠️ Your PRs — Action Needed (0s Open)',
+          icon: 'wrench',
+          expanded: true,
+        },
+        {
+          key: 'quarantined',
+          label: '🚨 Quarantined by Security Gate',
+          icon: 'shield',
+          expanded: true,
+        },
+        {
+          key: 'queued',
+          label: '📋 Queued in GitHub (Not Pre-Reviewed Yet)',
+          icon: 'git-pull-request',
+          expanded: true,
+        },
+        {
+          key: 'waiting',
+          label: '⏸️ Waiting on Author / Reviewers',
+          icon: 'clock',
+          expanded: false,
+        },
+      ];
+
+      for (const g of groupsDef) {
+        const gItems = items.filter((it) => it.inboxGroup === g.key);
+        if (gItems.length === 0) continue;
+        const gNode = new vscode.TreeItem(
+          `${g.label} (${gItems.length})`,
+          g.expanded
+            ? vscode.TreeItemCollapsibleState.Expanded
+            : vscode.TreeItemCollapsibleState.Collapsed
+        );
+        gNode.iconPath = new vscode.ThemeIcon(g.icon);
+        gNode.inboxGroupItems = gItems;
+        roots.push(gNode);
+      }
+      return roots;
+    }
+
+    if (element.inboxGroupItems) {
+      return element.inboxGroupItems.map((it) => {
+        const unreadDot = it.unread ? '● ' : '';
+        const updBadge = it.updatedSinceLastReview ? '🔄 ' : '';
+        const node = new vscode.TreeItem(
+          `${unreadDot}${updBadge}${it.repo}#${it.number}: ${it.title || ''}`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        const diffStats = `+${it.additions || 0}/-${it.deletions || 0}`;
+        if (it.inboxGroup === 'ready_to_review') {
+          const fCnt = Number(it.findingsCount || 0);
+          node.description = `${fCnt} finding${fCnt === 1 ? '' : 's'} • ${diffStats}`;
+          node.iconPath = new vscode.ThemeIcon(
+            'pass-filled',
+            new vscode.ThemeColor('charts.green')
+          );
+          node.contextValue = 'inbox-item-ready';
+        } else if (it.inboxGroup === 'author_action_needed') {
+          const cCnt = Number(it.reviewCommentsCount || 0);
+          node.description = `${cCnt} comment${cCnt === 1 ? '' : 's'}${it.changesRequested ? ' • Changes Requested' : ''
+            }`;
+          node.iconPath = new vscode.ThemeIcon('wrench', new vscode.ThemeColor('charts.orange'));
+          node.contextValue = 'inbox-item-ready';
+        } else if (it.inboxGroup === 'in_progress') {
+          node.description = 'Pre-computing CliffsNotes...';
+          node.iconPath = new vscode.ThemeIcon(
+            'loading~spin',
+            new vscode.ThemeColor('charts.blue')
+          );
+          node.contextValue = 'inbox-item-analyzing';
+        } else if (it.inboxGroup === 'quarantined') {
+          node.description = 'Quarantined before LLM review';
+          node.iconPath = new vscode.ThemeIcon('shield', new vscode.ThemeColor('charts.red'));
+          node.contextValue = 'inbox-item-quarantined';
+        } else if (it.inboxGroup === 'waiting') {
+          node.description =
+            it.role === 'author' ? 'Waiting on reviewers' : 'Reviewed • waiting on author';
+          node.iconPath = new vscode.ThemeIcon('clock');
+          node.contextValue = 'inbox-item-waiting';
+        } else {
+          node.description = it.skipReason
+            ? `${diffStats} • ${it.skipReason}`
+            : `@${it.author || ''} • ${diffStats}`;
+          node.iconPath = new vscode.ThemeIcon('git-pull-request');
+          node.contextValue = 'inbox-item-queued';
+        }
+
+        const tipLines = [
+          `### [${it.owner}/${it.repo}#${it.number}](${it.url || ''}) — ${it.title || ''}`,
+          '',
+          `- **Author**: \`@${it.author || ''}\` • **Diff**: \`+${it.additions || 0} / -${it.deletions || 0
+          }\` (${it.changedFilesCount || 0} files)`,
+        ];
+        if (it.tldr) {
+          tipLines.push('', `**TL;DR**: ${it.tldr}`);
+        }
+        if (it.status === 'ready') {
+          tipLines.push('', '*Click to open this pre-computed review in **0 seconds**.*');
+        } else if (it.inboxGroup === 'queued') {
+          tipLines.push(
+            '',
+            '*Click ⚡ inline to pre-review in the background, or click this row to open/review now.*'
+          );
+        }
+        node.tooltip = new vscode.MarkdownString(tipLines.join('\n'));
+        node.inboxItem = it;
+        node.itemId = it.id;
+        node.command = {
+          command: 'quasar.openInboxItem',
+          title: 'Open PR from Quasar Inbox',
+          arguments: [it],
+        };
+        return node;
+      });
+    }
+
+    return [];
+  }
+}
+
 let suppressSelfWatchUntil = 0;
 
 function saveActiveSession(session) {
@@ -2323,6 +2786,58 @@ class CliffsNotesTreeProvider {
     if (element.nodeType === 'summary-root') {
       const cn = session.cliffsNotes || {};
       const items = [];
+
+      const staleInfo = getSessionStaleHeadInfo(this.session);
+      if (staleInfo) {
+        const oldS = staleInfo.reviewedHeadSha.slice(0, 7);
+        const newS = staleInfo.latestHeadSha.slice(0, 7);
+        const staleItem = new vscode.TreeItem(
+          `Outdated Commit (${oldS} → ${newS}) — Click to Update Incrementally`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        staleItem.description = 'New commits on GitHub';
+        staleItem.iconPath = new vscode.ThemeIcon('sync', new vscode.ThemeColor('charts.yellow'));
+        staleItem.tooltip = new vscode.MarkdownString(
+          `### ⚠️ Newer Commits Pushed on GitHub\n\n` +
+          `- **Reviewed Commit**: \`${staleInfo.reviewedHeadSha}\`\n` +
+          `- **Latest PR HEAD**: \`${staleInfo.latestHeadSha}\`\n\n` +
+          `*Click to run an Incremental Delta Review (\`${oldS} → ${newS}\`), preserving your read stops and comments on untouched files.*`
+        );
+        staleItem.command = {
+          command: 'quasar.loadPrFromUrl',
+          title: 'Update Review Incrementally',
+          arguments: [
+            {
+              url: staleInfo.prUrl,
+              forceNewReview: true,
+              incrementalFrom: path.join(getWindowStateDir(), 'active_session.json'),
+              effort: this.session.effortLevel || 'high',
+              commentsOnly: Boolean(this.session.commentsOnly),
+            },
+          ],
+        };
+        items.push(staleItem);
+      }
+
+      const ds = cn.deltaSummary;
+      if (ds && typeof ds === 'object' && (ds.fromSha || ds.summary)) {
+        const fS = String(ds.fromSha || '').slice(0, 7);
+        const tS = String(ds.toSha || '').slice(0, 7);
+        const dsItem = new vscode.TreeItem(
+          `Incremental Update (${fS} → ${tS}): ${ds.deltaFilesCount || 0} changed, ${ds.resolvedFindingsCount || 0} resolved`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        dsItem.description = `+${ds.newFindingsCount || 0} new finding(s)`;
+        dsItem.iconPath = new vscode.ThemeIcon('git-compare', new vscode.ThemeColor('charts.blue'));
+        dsItem.tooltip = new vscode.MarkdownString(
+          `### 🔄 Incremental Delta Update (\`${fS}\` → \`${tS}\`)\n\n${ds.summary || ''}`
+        );
+        dsItem.command = {
+          command: 'quasar.openCliffsNotesGuide',
+          title: 'Open Full CliffsNotes',
+        };
+        items.push(dsItem);
+      }
 
       const tldrItem = new vscode.TreeItem(
         `TL;DR: ${cn.tldr || cn.whatAndWhy || 'Synthesizing summary...'}`,
@@ -4015,9 +4530,16 @@ function activate(context) {
     );
   }
 
+  const inboxProvider = new InboxTreeProvider();
   const cliffsProvider = new CliffsNotesTreeProvider();
   const commentsProvider = new CommentsTreeProvider();
   const checksProvider = new ChecksTreeProvider();
+
+  const inboxTreeView = vscode.window.createTreeView('quasar.inboxTree', {
+    treeDataProvider: inboxProvider,
+    showCollapseAll: true,
+  });
+  context.subscriptions.push(inboxTreeView);
 
   vscode.window.registerTreeDataProvider('quasar.cliffsNotesTree', cliffsProvider);
   const commentsTreeView = vscode.window.createTreeView('quasar.commentsTree', {
@@ -5845,8 +6367,43 @@ function activate(context) {
       </div>`;
   })()}
 
+  ${(() => {
+        const staleInfo = getSessionStaleHeadInfo(session);
+        if (!staleInfo) return '';
+        const oldS = escapeHtmlText(staleInfo.reviewedHeadSha.slice(0, 7));
+        const newS = escapeHtmlText(staleInfo.latestHeadSha.slice(0, 7));
+        return `
+      <div class="q-section" id="stale-head-section" style="border: 1.5px solid rgba(227, 179, 65, 0.65); background: rgba(227, 179, 65, 0.1);">
+        <h2>
+          <span>⚠️ Newer Commits Pushed on GitHub (<code>${oldS}</code> → <code>${newS}</code>)</span>
+          <span style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="q-btn q-btn-sm" data-act="incrementalUpdate">⚡ Update Incrementally (${oldS} → ${newS})</button>
+            <button type="button" class="q-btn q-btn-sm" data-act="fullRereview">🔄 Full Re-Review</button>
+          </span>
+        </h2>
+        <p style="margin:0;font-size:12.5px;">
+          This review was computed on commit <code>${oldS}</code>, and the PR HEAD is now at <code>${newS}</code>.
+          Run an <strong>Incremental Update</strong> to diff only <code>${oldS}...${newS}</code>, update prior comments, and preserve your reading tour progress &amp; staged/dismissed decisions.
+        </p>
+      </div>`;
+      })()}
+
   <div class="q-section" id="summary-section">
     <h2>⚡ In Plain English</h2>
+    ${(() => {
+        const ds = cn.deltaSummary;
+        if (!ds || typeof ds !== 'object' || (!ds.fromSha && !ds.summary)) return '';
+        const fS = escapeHtmlText(String(ds.fromSha || '').slice(0, 7));
+        const tS = escapeHtmlText(String(ds.toSha || '').slice(0, 7));
+        return `
+        <div style="margin-bottom:10px;padding:10px 12px;border-radius:7px;border:1px solid rgba(88,166,255,0.5);background:rgba(88,166,255,0.08);font-size:12.5px;">
+          <div style="font-weight:700;margin-bottom:4px;">
+            🔄 Incremental Review Update (<code>${fS}</code> → <code>${tS}</code>)${ds.rebased ? ' <em>(rebased)</em>' : ''}
+            <span style="font-weight:400;opacity:0.85;"> • ${Number(ds.deltaFilesCount || 0)} file(s) changed, ${Number(ds.unchangedFilesCount || 0)} unchanged, ${Number(ds.resolvedFindingsCount || 0)} prior finding(s) resolved, +${Number(ds.newFindingsCount || 0)} new</span>
+          </div>
+          ${ds.summary ? `<div>${formatInlineMd(ds.summary)}</div>` : ''}
+        </div>`;
+      })()}
     <div class="q-tldr-box">${formatInlineMd(headlineSource)}</div>
     ${(() => {
       const iva = cn.intentVsActuality;
@@ -6105,6 +6662,10 @@ function activate(context) {
           });
         } else if (act === 'openRawMarkdown') {
           vscode.postMessage({ type: 'openRawMarkdown' });
+        } else if (act === 'incrementalUpdate') {
+          vscode.postMessage({ type: 'incrementalUpdate' });
+        } else if (act === 'fullRereview') {
+          vscode.postMessage({ type: 'fullRereview' });
         } else if (act === 'openSignalDiff') {
           vscode.postMessage({
             type: 'openSignalDiff',
@@ -6261,6 +6822,35 @@ function activate(context) {
         }
       } else if (msg.type === 'nextTourStop') {
         await vscode.commands.executeCommand('quasar.nextTourStop');
+      } else if (msg.type === 'incrementalUpdate') {
+        const prMeta = curSession.pr || {};
+        const prUrl =
+          prMeta.url ||
+          (prMeta.owner && prMeta.repo && prMeta.number
+            ? `https://github.com/${prMeta.owner}/${prMeta.repo}/pull/${prMeta.number}`
+            : '');
+        if (prUrl) {
+          await vscode.commands.executeCommand('quasar.loadPrFromUrl', {
+            url: prUrl,
+            forceNewReview: true,
+            incrementalFrom: path.join(getWindowStateDir(), 'active_session.json'),
+            effort: curSession.effortLevel || 'high',
+            commentsOnly: Boolean(curSession.commentsOnly),
+          });
+        }
+      } else if (msg.type === 'fullRereview') {
+        const prMeta = curSession.pr || {};
+        const prUrl =
+          prMeta.url ||
+          (prMeta.owner && prMeta.repo && prMeta.number
+            ? `https://github.com/${prMeta.owner}/${prMeta.repo}/pull/${prMeta.number}`
+            : '');
+        if (prUrl) {
+          await vscode.commands.executeCommand('quasar.loadPrFromUrl', {
+            url: prUrl,
+            forceNewReview: true,
+          });
+        }
       } else if (msg.type === 'jumpToThread') {
         const t = (curSession.threads || []).find((th) => th.id === msg.threadId);
         if (t) await vscode.commands.executeCommand('quasar.jumpToThread', t);
@@ -6683,10 +7273,66 @@ function activate(context) {
     }
   }
 
+  const notifiedReadyInboxKeys = new Set();
+  let inboxNotifyInitialized = false;
+
+  function refreshInboxUI(allowReadyToast = false) {
+    inboxProvider.refresh();
+    try {
+      const inboxPayload = loadInboxPayloadSync();
+      const unreadCnt = Number((inboxPayload.counts && inboxPayload.counts.unreadReady) || 0);
+      inboxTreeView.badge =
+        unreadCnt > 0
+          ? {
+            value: unreadCnt,
+            tooltip: `${unreadCnt} pre-reviewed PR${unreadCnt === 1 ? '' : 's'
+              } ready in Quasar Inbox (0s open)`,
+          }
+          : undefined;
+
+      if (!inboxNotifyInitialized) {
+        inboxNotifyInitialized = true;
+        for (const it of inboxPayload.items || []) {
+          if (it.status === 'ready' && it.analyzedFingerprint) {
+            notifiedReadyInboxKeys.add(`${it.id}:${it.analyzedFingerprint}`);
+          }
+        }
+        return;
+      }
+
+      if (
+        allowReadyToast &&
+        inboxPayload.settings &&
+        inboxPayload.settings.notifyWhenReady !== false &&
+        (!vscode.window.state || vscode.window.state.focused)
+      ) {
+        for (const it of inboxPayload.items || []) {
+          if (it.status === 'ready' && it.analyzedFingerprint) {
+            const key = `${it.id}:${it.analyzedFingerprint}`;
+            if (!notifiedReadyInboxKeys.has(key)) {
+              notifiedReadyInboxKeys.add(key);
+              vscode.window
+                .showInformationMessage(
+                  `📥 Ready in Quasar Inbox (0s open): ${it.repo}#${it.number} — ${it.title || ''}`,
+                  'Open Review Now'
+                )
+                .then((choice) => {
+                  if (choice === 'Open Review Now') {
+                    vscode.commands.executeCommand('quasar.openInboxItem', it);
+                  }
+                });
+            }
+          }
+        }
+      }
+    } catch (_) { }
+  }
+
   function refreshAllUI(autoOpenIfNew = false) {
     onAgyCliJobStateChanged = () => {
       refreshAllUI(true);
     };
+    refreshInboxUI(false);
     const session = loadActiveSession();
     vscode.commands
       .executeCommand('setContext', 'quasar.hasActiveReview', Boolean(session && session.pr))
@@ -6897,13 +7543,25 @@ function activate(context) {
   let globalPrefsDebounce = null;
   try {
     const globalWatcher = fs.watch(REVIEW_STATE_DIR, (_eventType, filename) => {
-      if (filename === 'preferences.json' || filename === 'github_auth.json') {
+      if (filename === 'preferences.json' || filename === 'github_auth.json' || filename === 'inbox') {
         if (globalPrefsDebounce) clearTimeout(globalPrefsDebounce);
         globalPrefsDebounce = setTimeout(() => refreshAllUI(false), 180);
       }
     });
     context.subscriptions.push({ dispose: () => globalWatcher.close() });
   } catch (_) {}
+
+  let inboxWatchDebounce = null;
+  try {
+    fs.mkdirSync(INBOX_STATE_DIR, { recursive: true });
+    const inboxWatcher = fs.watch(INBOX_STATE_DIR, (_eventType, filename) => {
+      if (!filename || filename.endsWith('.json')) {
+        if (inboxWatchDebounce) clearTimeout(inboxWatchDebounce);
+        inboxWatchDebounce = setTimeout(() => refreshInboxUI(true), 220);
+      }
+    });
+    context.subscriptions.push({ dispose: () => inboxWatcher.close() });
+  } catch (_) { }
 
   // ==========================================================================
   // Commands
@@ -7078,6 +7736,503 @@ function activate(context) {
     })
   );
 
+  function resolveInboxItemId(arg) {
+    if (!arg) return null;
+    if (typeof arg === 'string') return arg;
+    if (arg.itemId) return String(arg.itemId);
+    if (arg.inboxItem && arg.inboxItem.id) return String(arg.inboxItem.id);
+    if (arg.id) return String(arg.id);
+    return null;
+  }
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.syncInboxNow', async () => {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Quasar: Syncing GitHub PR Inbox (0 LLM tokens)...',
+          cancellable: false,
+        },
+        async () => {
+          const res = await runInboxWatcher(['--sync-now'], 45000);
+          refreshInboxUI(false);
+          if (!res || !res.ok) {
+            const errMsg = (res && res.error) || 'Failed to sync GitHub PR Inbox.';
+            if (errMsg.toLowerCase().includes('token')) {
+              const pick = await vscode.window.showWarningMessage(
+                errMsg,
+                'Configure GitHub API Key...'
+              );
+              if (pick === 'Configure GitHub API Key...') {
+                await vscode.commands.executeCommand('quasar.configureGithubToken');
+              }
+            } else {
+              vscode.window.showErrorMessage(errMsg);
+            }
+            return;
+          }
+          const cnt = (res.counts && res.counts.total) || 0;
+          const readyCnt = (res.counts && res.counts.ready) || 0;
+          vscode.window.setStatusBarMessage(
+            `📥 Quasar Inbox synced: ${cnt} open PR(s) (${readyCnt} pre-reviewed)`,
+            4500
+          );
+        }
+      );
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.toggleInboxDaemon', async () => {
+      const cur = loadInboxPayloadSync();
+      if (cur.daemon && cur.daemon.running) {
+        await runInboxWatcher(['--stop-daemon'], 15000);
+        refreshInboxUI(false);
+        vscode.window.showInformationMessage('⏸️ Paused Quasar Background Auto-Review daemon.');
+      } else {
+        const res = await runInboxWatcher(['--start-daemon'], 15000);
+        refreshInboxUI(false);
+        if (res && res.ok) {
+          vscode.window.showInformationMessage(
+            `🚀 Quasar Background Auto-Review daemon started (every ${cur.settings.pollIntervalMinutes || 15
+            }m • max ${cur.settings.maxReviewsPerCycle || 1}/cycle • cap ${cur.settings.maxReviewsPerDay || 6
+            }/day).`
+          );
+        }
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.openInboxItem', async (arg) => {
+      const itemId = resolveInboxItemId(arg);
+      if (!itemId) return;
+      const windowWsRoot = getWindowWorkspaceRoot();
+      const res = await runInboxWatcher(
+        ['--activate', '--item-id', itemId, '--workspace-dir', windowWsRoot],
+        20000
+      );
+      if (!res || !res.ok) {
+        vscode.window.showErrorMessage(
+          `Could not open Inbox item: ${(res && res.error) || 'Unknown error'}`
+        );
+        return;
+      }
+      if (res.instant) {
+        refreshAllUI(true);
+        const sess = loadActiveSession();
+        if (sess && !sess.commentsOnly) {
+          await openInteractiveCliffsNotesPanel();
+        }
+        return;
+      }
+      const prUrl = res.prUrl || (arg && arg.inboxItem && arg.inboxItem.url) || '';
+      if (res.staleSessionAvailable) {
+        const cShort = String(res.cachedHeadSha || '').slice(0, 7);
+        const lShort = String(res.liveHeadSha || '').slice(0, 7);
+        const staleChoice = await vscode.window.showQuickPick(
+          [
+            {
+              label: `$(zap) Updated Review in Background (${cShort} → ${lShort})`,
+              description: 'Compare new hash to old hash in the background while you stay on your current work',
+              action: 'bg_inc',
+            },
+            {
+              label: `$(git-compare) Updated Review Live Now (${cShort} → ${lShort})`,
+              description: 'Compare new hash to old hash to update & add to the existing review here',
+              action: 'live_inc',
+            },
+            {
+              label: `$(sparkle) Clean New Review (${lShort})`,
+              description: 'Start a brand-new full review from scratch',
+              action: 'live_full',
+            },
+          ],
+          {
+            title: `Stale Review Detected on ${itemId} (${cShort} → ${lShort})`,
+            placeHolder: 'Run an updated review against the previous hash or a clean new review?',
+            ignoreFocusOut: true,
+          }
+        );
+        if (!staleChoice) return;
+        if (staleChoice.action === 'bg_inc') {
+          await vscode.commands.executeCommand('quasar.precomputeInboxItem', { itemId });
+        } else if (staleChoice.action === 'live_inc' && prUrl) {
+          await vscode.commands.executeCommand('quasar.loadPrFromUrl', {
+            url: prUrl,
+            forceNewReview: true,
+            incrementalFrom: res.sessionPath,
+          });
+        } else if (staleChoice.action === 'live_full' && prUrl) {
+          await vscode.commands.executeCommand('quasar.loadPrFromUrl', {
+            url: prUrl,
+            forceNewReview: true,
+          });
+        }
+        return;
+      }
+      // Not pre-computed yet — ask how the user wants to review it
+      const choice = await vscode.window.showQuickPick(
+        [
+          {
+            label: '$(zap) Pre-Review in Background (Stay on Current Work)',
+            description: 'Computes CliffsNotes & findings into your Inbox without touching your open editor',
+            action: 'background',
+          },
+          {
+            label: '$(git-pull-request) Open & Review Live in This Window Now',
+            description: 'Fetches snapshots immediately and starts live review here',
+            action: 'live',
+          },
+        ],
+        {
+          title: `PR Not Pre-Computed Yet: ${itemId}`,
+          placeHolder: 'Choose whether to pre-compute in the background or review live now',
+        }
+      );
+      if (!choice) return;
+      if (choice.action === 'background') {
+        await vscode.commands.executeCommand('quasar.precomputeInboxItem', { itemId });
+      } else if (choice.action === 'live' && prUrl) {
+        await vscode.commands.executeCommand('quasar.loadPrFromUrl', prUrl);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.precomputeInboxItem', async (arg) => {
+      const itemId = resolveInboxItemId(arg);
+      if (!itemId) return;
+      vscode.window.showInformationMessage(
+        `⚡ Started background pre-review for ${itemId}. You'll get a notification as soon as it's ready to open in 0s!`
+      );
+      runInboxWatcher(['--precompute-item', itemId], 960000).then((res) => {
+        refreshInboxUI(true);
+        if (res && !res.ok && res.error) {
+          vscode.window.showWarningMessage(`Background pre-review failed (${itemId}): ${res.error}`);
+        }
+      });
+      setTimeout(() => refreshInboxUI(false), 700);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.markInboxItemReviewed', async (arg) => {
+      const itemId = resolveInboxItemId(arg);
+      if (!itemId) return;
+      await runInboxWatcher(['--mark-reviewed', '--item-id', itemId], 15000);
+      refreshInboxUI(false);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.dismissInboxItem', async (arg) => {
+      const itemId = resolveInboxItemId(arg);
+      if (!itemId) return;
+      await runInboxWatcher(['--dismiss-item', '--item-id', itemId], 15000);
+      refreshInboxUI(false);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.configureInboxWatcher', async () => {
+      while (true) {
+        const snap = loadInboxPayloadSync();
+        const cfg = snap.settings;
+        const isRunning = Boolean(snap.daemon && snap.daemon.running);
+        const scopeParts = [];
+        if (cfg.watchReviewRequested) scopeParts.push('Assigned to @me');
+        if (cfg.watchAuthoredPrs) scopeParts.push('My PRs w/ comments');
+        if (Array.isArray(cfg.watchedRepos) && cfg.watchedRepos.length > 0) {
+          scopeParts.push(`${cfg.watchedRepos.length} repo(s)`);
+        }
+
+        const menuItems = [
+          {
+            label: isRunning
+              ? '$(debug-pause) Pause Background Auto-Review Daemon'
+              : '$(rocket) Enable & Start Background Auto-Review Daemon',
+            description: isRunning
+              ? `Currently RUNNING (PID ${snap.daemon.pid})`
+              : 'Currently PAUSED / OFF',
+            detail:
+              'Runs 1 review at a time in isolated storage so your active editor is never interrupted',
+            act: 'toggle_enabled',
+          },
+          {
+            label: '$(sync) Sync GitHub PR Queue Right Now (0 LLM Tokens)',
+            description: snap.lastSyncedAt ? `Last synced: ${snap.lastSyncedAt}` : 'Not synced yet',
+            detail: 'Polls GitHub REST API for matching open PRs without running any model tokens',
+            act: 'sync_now',
+          },
+          {
+            label: `$(sliders) Watcher Mode: ${cfg.mode === 'sync_queue_only'
+              ? 'Sync Queue Only (0 Tokens)'
+              : 'Auto-Precompute Reviews'
+              }`,
+            description: 'Click to toggle between automatic background pre-review vs. 0-token queue sync',
+            act: 'mode',
+          },
+          {
+            label: `$(Shield) Max Auto-Reviews per Poll Cycle: ${cfg.maxReviewsPerCycle} at a time`,
+            description: 'Prevents a 20+ PR token burst when first enabling on a large backlog',
+            act: 'max_per_cycle',
+          },
+          {
+            label: `$(graph) Daily Auto-Review Cap: ${cfg.maxReviewsPerDay > 0 ? `${cfg.maxReviewsPerDay}/day` : 'Unlimited'
+              } (${snap.budget.reviewsRunToday} used today)`,
+            description: 'Hard daily safeguard on automatic background pre-reviews (manual ⚡ clicks still work)',
+            act: 'max_per_day',
+          },
+          {
+            label: `$(clock) Poll Interval: Every ${cfg.pollIntervalMinutes} minutes`,
+            description: 'How often Quasar checks GitHub and trickles the next eligible PR(s)',
+            act: 'poll_interval',
+          },
+          {
+            label: `$(zap) Background Effort & Format: ${String(cfg.effort || 'high').toUpperCase()} • ${cfg.commentsOnly ? 'Comments Only' : 'Full CliffsNotes + Tour'
+              }`,
+            description: 'Default effort level and output format for background pre-reviews',
+            act: 'effort',
+          },
+          {
+            label: `$(target) Trigger Scope: ${scopeParts.join(' + ') || 'None'}${cfg.includeDrafts ? ' (incl. drafts)' : ''
+              }`,
+            description: 'Choose which PRs enter your Inbox (Assigned to @me, Authored PRs, Drafts)',
+            act: 'scope',
+          },
+          {
+            label: `$(repo) Watched Repositories Filter / Extra Repos (${(cfg.watchedRepos || []).length
+              })`,
+            description:
+              (cfg.watchedRepos || []).length > 0
+                ? `${cfg.watchedRepos.join(', ')}${cfg.restrictToWatchedRepos ? ' (Restricting @me to these)' : ' (Extra watched)'
+                }`
+                : 'All repositories where @me is requested',
+            act: 'repos',
+          },
+          {
+            label: `$(calendar) Backlog Recency Cutoff: ${cfg.onlyUpdatedWithinDays > 0
+              ? `Updated within last ${cfg.onlyUpdatedWithinDays} days`
+              : 'No cutoff (all open PRs)'
+              }`,
+            description: 'Older backlog PRs still appear in your Inbox, without auto-spending tokens',
+            act: 'recency',
+          },
+          {
+            label: `$(layers) Max Concurrent Background Reviews: ${cfg.maxConcurrency}`,
+            description: 'Keep at 1 (recommended) to run strictly one review at a time',
+            act: 'concurrency',
+          },
+          {
+            label: `$(bell) Ready Notification Toast: ${cfg.notifyWhenReady ? 'ON' : 'OFF'}`,
+            description: 'Show a quiet IDE toast when a background PR finishes pre-computing',
+            act: 'notify',
+          },
+        ];
+
+        const picked = await vscode.window.showQuickPick(menuItems, {
+          title: '📥 Quasar: PR Inbox & Background Auto-Review Settings',
+          placeHolder:
+            'Configure cadence, token caps, effort, and trigger scope (Esc when finished)',
+        });
+        if (!picked) break;
+
+        if (picked.act === 'toggle_enabled') {
+          if (isRunning) {
+            await runInboxWatcher(['--stop-daemon'], 15000);
+          } else {
+            await runInboxWatcher(['--start-daemon'], 15000);
+          }
+          refreshInboxUI(false);
+        } else if (picked.act === 'sync_now') {
+          await vscode.commands.executeCommand('quasar.syncInboxNow');
+        } else if (picked.act === 'mode') {
+          const nextMode = cfg.mode === 'sync_queue_only' ? 'auto_precompute' : 'sync_queue_only';
+          await runInboxWatcher([
+            '--configure',
+            '--settings-json',
+            JSON.stringify({ mode: nextMode }),
+          ]);
+          refreshInboxUI(false);
+        } else if (picked.act === 'max_per_cycle') {
+          const val = await vscode.window.showInputBox({
+            title: 'Max Auto-Reviews per Poll Cycle',
+            prompt:
+              'How many PRs may auto-start per poll cycle? (1 = recommended so large queues trickle 1 at a time)',
+            value: String(cfg.maxReviewsPerCycle ?? 1),
+          });
+          if (val !== undefined && /^\d+$/.test(val.trim())) {
+            await runInboxWatcher([
+              '--configure',
+              '--max-per-cycle',
+              String(Math.max(0, Number(val.trim()))),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'max_per_day') {
+          const val = await vscode.window.showInputBox({
+            title: 'Daily Auto-Review Cap (0 = Unlimited)',
+            prompt:
+              'Maximum automatic background pre-reviews per day across your queue (0 = unlimited)',
+            value: String(cfg.maxReviewsPerDay ?? 6),
+          });
+          if (val !== undefined && /^\d+$/.test(val.trim())) {
+            await runInboxWatcher([
+              '--configure',
+              '--max-per-day',
+              String(Math.max(0, Number(val.trim()))),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'poll_interval') {
+          const val = await vscode.window.showInputBox({
+            title: 'GitHub Poll Interval (Minutes)',
+            prompt: 'Check GitHub and run at most Max-Per-Cycle review(s) every N minutes (min 2)',
+            value: String(cfg.pollIntervalMinutes || 15),
+          });
+          if (val !== undefined && /^\d+$/.test(val.trim())) {
+            await runInboxWatcher([
+              '--configure',
+              '--poll-minutes',
+              String(Math.max(2, Number(val.trim()))),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'effort') {
+          const effPick = await vscode.window.showQuickPick(
+            [
+              { label: '🔬 High Effort • Full CliffsNotes + Tour (Recommended Default)', effort: 'high', co: false },
+              { label: '⚖️ Medium Effort • Full CliffsNotes + Tour (Faster / Lighter)', effort: 'medium', co: false },
+              { label: '⚡ Low Effort • Full CliffsNotes + Tour (Quick Scan)', effort: 'low', co: false },
+              { label: '💬 High Effort • Comments Only (No Study Guide)', effort: 'high', co: true },
+              { label: '💬 Medium Effort • Comments Only (No Study Guide)', effort: 'medium', co: true },
+            ],
+            { title: 'Background Pre-Review Effort & Format' }
+          );
+          if (effPick) {
+            await runInboxWatcher([
+              '--configure',
+              '--settings-json',
+              JSON.stringify({ effort: effPick.effort, commentsOnly: effPick.co }),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'scope') {
+          const scopePicks = await vscode.window.showQuickPick(
+            [
+              {
+                label: 'Incoming PRs Requesting My Review (review-requested:@me)',
+                picked: Boolean(cfg.watchReviewRequested),
+                key: 'watchReviewRequested',
+              },
+              {
+                label: 'My Open PRs With New Comments / Changes Requested (author:@me)',
+                picked: Boolean(cfg.watchAuthoredPrs),
+                key: 'watchAuthoredPrs',
+              },
+              {
+                label: 'Include Draft PRs',
+                picked: Boolean(cfg.includeDrafts),
+                key: 'includeDrafts',
+              },
+            ],
+            {
+              canPickMany: true,
+              title: 'Select Which PR Categories Enter Your Inbox',
+            }
+          );
+          if (scopePicks) {
+            const chosenKeys = new Set(scopePicks.map((p) => p.key));
+            await runInboxWatcher([
+              '--configure',
+              '--settings-json',
+              JSON.stringify({
+                watchReviewRequested: chosenKeys.has('watchReviewRequested'),
+                watchAuthoredPrs: chosenKeys.has('watchAuthoredPrs'),
+                includeDrafts: chosenKeys.has('includeDrafts'),
+              }),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'repos') {
+          const repoStr = await vscode.window.showInputBox({
+            title: 'Watched Repositories (Optional)',
+            prompt:
+              'Comma-separated owner/repo list (leave empty to watch all repos where @me is requested)',
+            value: (cfg.watchedRepos || []).join(', '),
+            placeHolder: 'e.g. acme/backend, acme/web-client',
+          });
+          if (repoStr !== undefined) {
+            const list = repoStr
+              .split(/[,\s]+/)
+              .map((s) => s.trim())
+              .filter((s) => s.includes('/'));
+            let restrict = Boolean(cfg.restrictToWatchedRepos);
+            if (list.length > 0) {
+              const modeChoice = await vscode.window.showQuickPick(
+                [
+                  {
+                    label: 'Restrict @me queue ONLY to these repositories',
+                    val: true,
+                  },
+                  {
+                    label: 'Watch ALL open PRs in these repositories (in addition to @me)',
+                    val: false,
+                  },
+                ],
+                { title: 'How Should Watched Repositories Apply?' }
+              );
+              if (modeChoice) restrict = modeChoice.val;
+            }
+            await runInboxWatcher([
+              '--configure',
+              '--settings-json',
+              JSON.stringify({ watchedRepos: list, restrictToWatchedRepos: restrict }),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'recency') {
+          const val = await vscode.window.showInputBox({
+            title: 'Backlog Recency Cutoff (Days, 0 = No Cutoff)',
+            prompt:
+              'Only auto-precompute PRs updated within the last N days (older PRs still appear in your Inbox)',
+            value: String(cfg.onlyUpdatedWithinDays ?? 14),
+          });
+          if (val !== undefined && /^\d+$/.test(val.trim())) {
+            await runInboxWatcher([
+              '--configure',
+              '--recency-days',
+              String(Math.max(0, Number(val.trim()))),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'concurrency') {
+          const val = await vscode.window.showInputBox({
+            title: 'Max Concurrent Background Reviews (1–4)',
+            prompt: 'Maximum reviews running simultaneously in the background (1 recommended)',
+            value: String(cfg.maxConcurrency || 1),
+          });
+          if (val !== undefined && /^\d+$/.test(val.trim())) {
+            await runInboxWatcher([
+              '--configure',
+              '--max-concurrency',
+              String(Math.max(1, Math.min(4, Number(val.trim())))),
+            ]);
+            refreshInboxUI(false);
+          }
+        } else if (picked.act === 'notify') {
+          await runInboxWatcher([
+            '--configure',
+            '--settings-json',
+            JSON.stringify({ notifyWhenReady: !cfg.notifyWhenReady }),
+          ]);
+          refreshInboxUI(false);
+        }
+      }
+    })
+  );
+
   // 0. Quick Menu & Sidebar Launcher (bound to always-visible Status Bar item)
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.openMenu', async () => {
@@ -7092,7 +8247,14 @@ function activate(context) {
         : 0;
       const hasSession = Boolean(session && session.pr);
       const pastReviews = listPastReviews();
+      const inboxSnap = loadInboxPayloadSync();
       const items = [
+        {
+          label: `$(inbox) PR Inbox & Background Auto-Review (${inboxSnap.counts.ready
+            } ready • ${inboxSnap.daemon.running ? 'Daemon ON' : 'Daemon OFF'})...`,
+          description: 'Configure cadence, token caps, or sync your GitHub review queue',
+          command: 'quasar.configureInboxWatcher',
+        },
         {
           label: '$(git-branch) Review Local Branch or Working-Tree Diff...',
           description: `Pick a local git branch, commit range, or uncommitted changes (${defaultEffortSpec.shortLabel} • ${defaultModeLabel})`,
@@ -7237,6 +8399,94 @@ function activate(context) {
   );
 
   // 1. Load PR from GitHub URL (or local branch name/path)
+  async function promptExistingReviewAction(existingCheck, windowWsRoot) {
+    const cachedShort = existingCheck.cachedHeadSha
+      ? String(existingCheck.cachedHeadSha).slice(0, 7)
+      : '';
+    const liveShort = existingCheck.liveHeadSha
+      ? String(existingCheck.liveHeadSha).slice(0, 7)
+      : '';
+    const effTag = String(existingCheck.effort || 'high').toUpperCase();
+    const summaryDesc = `${existingCheck.sourceLabel || 'Completed Review'} • ${effTag} effort • ${existingCheck.findingsCount || 0
+      } finding(s)${cachedShort ? ` • @ ${cachedShort}` : ''}`;
+
+    const oldReviewOption = {
+      label: '$(zap) Open Existing Review (0s)',
+      description: summaryDesc,
+      detail:
+        existingCheck.tldr ||
+        'Loads the already-completed review into this window immediately without consuming tokens.',
+      action: 'switch',
+    };
+    const updatedOption = {
+      label: existingCheck.isUpToDate
+        ? '$(git-compare) Updated Review'
+        : `$(git-compare) Updated Review (${cachedShort || 'old'} → ${liveShort || 'HEAD'})`,
+      description: existingCheck.isUpToDate
+        ? 'Refresh & add to the existing review while preserving read stops & staged/dismissed comments'
+        : `Compare new hash to old hash to update & add to the existing review`,
+      detail:
+        'Carries forward your read tour stops and staged/dismissed comments on untouched files while reviewing changes.',
+      action: 'incremental',
+    };
+    const cleanNewOption = {
+      label: existingCheck.isUpToDate
+        ? '$(sparkle) Clean New Review'
+        : `$(sparkle) Clean New Review (${liveShort || 'HEAD'})`,
+      description: 'Start a brand-new full review from scratch',
+      action: 'new',
+    };
+
+    // Only offer the old review as-is when it is NOT stale!
+    const pickItems = existingCheck.isUpToDate
+      ? [oldReviewOption, updatedOption, cleanNewOption]
+      : [updatedOption, cleanNewOption];
+
+    const targetLabel = existingCheck.isLocalBranch
+      ? `${existingCheck.repo}@${existingCheck.branch}`
+      : `${existingCheck.owner}/${existingCheck.repo}#${existingCheck.number}`;
+
+    const choice = await vscode.window.showQuickPick(pickItems, {
+      title: `${existingCheck.isUpToDate ? 'Completed Review Found' : 'Stale Review Found'}: ${targetLabel} — ${existingCheck.title || ''
+        }`,
+      placeHolder: existingCheck.isUpToDate
+        ? 'Open the existing review (0s), run an updated review, or run a clean new review?'
+        : 'Stale hash detected — run an updated review against the previous hash or a clean new review?',
+      ignoreFocusOut: true,
+    });
+    if (!choice) return { cancelled: true };
+    if (choice.action === 'switch') {
+      const actArgs = [
+        '--activate-session',
+        existingCheck.sessionPath,
+        '--workspace-dir',
+        windowWsRoot,
+      ];
+      if (existingCheck.itemId) {
+        actArgs.push('--item-id', existingCheck.itemId);
+      }
+      const actRes = await runInboxWatcher(actArgs, 20000);
+      if (!actRes || !actRes.ok) {
+        vscode.window.showErrorMessage(
+          `Could not load completed review: ${(actRes && actRes.error) || 'Unknown error'}`
+        );
+        return { cancelled: true };
+      }
+      refreshAllUI(true);
+      await focusReviewSidebar();
+      const sess = loadActiveSession();
+      if (sess && !sess.commentsOnly) {
+        await openInteractiveCliffsNotesPanel();
+      }
+      vscode.window.showInformationMessage(`⚡ Opened existing review for ${targetLabel}.`);
+      return { switched: true };
+    }
+    if (choice.action === 'incremental') {
+      return { incrementalFromPath: existingCheck.sessionPath };
+    }
+    return { cleanNew: true };
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.loadPrFromUrl', async (providedArg) => {
       const providedUrl =
@@ -7253,6 +8503,13 @@ function activate(context) {
         providedArg && typeof providedArg === 'object' && typeof providedArg.commentsOnly === 'boolean'
           ? providedArg.commentsOnly
           : null;
+      const forceNewReview = Boolean(
+        providedArg && typeof providedArg === 'object' && providedArg.forceNewReview
+      );
+      let incrementalFromPath =
+        providedArg && typeof providedArg === 'object' && providedArg.incrementalFrom
+          ? String(providedArg.incrementalFrom)
+          : '';
 
       const prUrl =
         providedUrl ||
@@ -7264,6 +8521,24 @@ function activate(context) {
       if (!prUrl || !prUrl.trim()) return;
 
       const trimmedUrl = prUrl.trim();
+      const workspaceRepo = await detectWorkspaceRepoDir();
+      const windowWsRoot = getWindowWorkspaceRoot();
+
+      if (!forceNewReview && !incrementalFromPath) {
+        const checkArgs = ['--check-existing', trimmedUrl];
+        if (workspaceRepo) {
+          checkArgs.push('--repo-dir', workspaceRepo);
+        }
+        const existingCheck = await runInboxWatcher(checkArgs, 10000);
+        if (existingCheck && existingCheck.found && existingCheck.sessionPath) {
+          const decision = await promptExistingReviewAction(existingCheck, windowWsRoot);
+          if (decision.cancelled || decision.switched) return;
+          if (decision.incrementalFromPath) {
+            incrementalFromPath = decision.incrementalFromPath;
+          }
+        }
+      }
+
       const effortLevel = providedEffort || (await pickEffortLevelForReview(trimmedUrl));
       if (!effortLevel) return;
       const commentsOnly =
@@ -7274,8 +8549,6 @@ function activate(context) {
         : effortSpec.shortLabel;
 
       const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
-      const workspaceRepo = await detectWorkspaceRepoDir();
-      const windowWsRoot = getWindowWorkspaceRoot();
       const windowStateDir = getWindowStateDir();
       await focusReviewSidebar();
 
@@ -7298,6 +8571,18 @@ function activate(context) {
               '--workspace-dir',
               windowWsRoot,
             ];
+            if (incrementalFromPath && fs.existsSync(incrementalFromPath)) {
+              const safePriorPath = path.join(windowStateDir, 'prior_session_for_delta.json');
+              try {
+                fs.mkdirSync(windowStateDir, { recursive: true });
+                if (path.resolve(incrementalFromPath) !== path.resolve(safePriorPath)) {
+                  fs.copyFileSync(incrementalFromPath, safePriorPath);
+                }
+                scriptArgs.push('--incremental-from', safePriorPath);
+              } catch (_) {
+                scriptArgs.push('--incremental-from', incrementalFromPath);
+              }
+            }
             if (workspaceRepo) {
               scriptArgs.push('--repo-dir', workspaceRepo);
             }
@@ -7339,12 +8624,16 @@ function activate(context) {
                   message: `Snapshots ready! Dispatching Quasar (${modeTitleTag})...`,
                 });
                 const effortInstruction = buildEffortPromptInstruction(effortLevel, commentsOnly);
+                const isIncSession = Boolean(freshSession && freshSession.incrementalFromSha);
+                const incPromptPart = isIncSession
+                  ? ` INCREMENTAL DELTA REVIEW (\`${String(freshSession.incrementalFromSha).slice(0, 7)} → ${String((freshSession.pr && freshSession.pr.headSha) || '').slice(0, 7)}\`): inspect \`${windowStateDir}/delta.diff\` and \`incremental_context\` in \`${windowStateDir}/pr_context.json\` — focus subagents strictly on \`delta.diff\` & \`deltaFiles\`, evaluate \`priorFindingsToRecheck\` via \`priorFindingUpdates\`, emit ONLY new delta findings in \`findings\` and delta stops in \`chapters\`, and populate \`cliffsNotes.deltaSummary\`.`
+                  : '';
                 const publishFlags = commentsOnly
                   ? `--comments-only --workspace-dir "${windowWsRoot}"`
                   : `--workspace-dir "${windowWsRoot}"`;
                 await sendPromptToQuasar(
-                  `Review ${trimmedUrl} using the quasar skill for workspace "${windowWsRoot}" (context initialized in "${windowStateDir}/pr_context.json"). ${effortInstruction} Publish the session via \`publish_review_session.py ${publishFlags}\`.`,
-                  `Quasar (${modeTitleTag}): ${trimmedUrl}`,
+                  `Review ${trimmedUrl} using the quasar skill for workspace "${windowWsRoot}" (context initialized in "${windowStateDir}/pr_context.json").${incPromptPart} ${effortInstruction} Publish the session via \`publish_review_session.py ${publishFlags}\`.`,
+                  `Quasar (${isIncSession ? 'Incremental • ' : ''}${modeTitleTag}): ${trimmedUrl}`,
                   null,
                   { effortLevel, commentsOnly }
                 );
@@ -7525,6 +8814,30 @@ function activate(context) {
       }
 
       const repoName = path.basename(repoDir);
+      const windowWsRoot = getWindowWorkspaceRoot();
+      const windowStateDir = getWindowStateDir();
+      const forceNewBranch = Boolean(
+        providedArgs && typeof providedArgs === 'object' && providedArgs.forceNewReview
+      );
+      let branchIncrementalFrom =
+        providedArgs && typeof providedArgs === 'object' && providedArgs.incrementalFrom
+          ? String(providedArgs.incrementalFrom)
+          : '';
+
+      if (!forceNewBranch && !branchIncrementalFrom) {
+        const existingBranchCheck = await runInboxWatcher(
+          ['--check-existing', targetBranch, '--repo-dir', repoDir],
+          8000
+        );
+        if (existingBranchCheck && existingBranchCheck.found && existingBranchCheck.sessionPath) {
+          const decision = await promptExistingReviewAction(existingBranchCheck, windowWsRoot);
+          if (decision.cancelled || decision.switched) return;
+          if (decision.incrementalFromPath) {
+            branchIncrementalFrom = decision.incrementalFromPath;
+          }
+        }
+      }
+
       const providedCommentsOnly =
         providedArgs && typeof providedArgs === 'object' && typeof providedArgs.commentsOnly === 'boolean'
           ? providedArgs.commentsOnly
@@ -7540,8 +8853,6 @@ function activate(context) {
         : effortSpec.shortLabel;
 
       const collectScript = path.join(PLUGIN_SCRIPTS_DIR, 'collect_pr_context.py');
-      const windowWsRoot = getWindowWorkspaceRoot();
-      const windowStateDir = getWindowStateDir();
       await focusReviewSidebar();
 
       await vscode.window.withProgress(
@@ -7570,6 +8881,18 @@ function activate(context) {
             }
             if (committedOnly) {
               scriptArgs.push('--committed-only');
+            }
+            if (branchIncrementalFrom && fs.existsSync(branchIncrementalFrom)) {
+              const safePriorPath = path.join(windowStateDir, 'prior_session_for_delta.json');
+              try {
+                fs.mkdirSync(windowStateDir, { recursive: true });
+                if (path.resolve(branchIncrementalFrom) !== path.resolve(safePriorPath)) {
+                  fs.copyFileSync(branchIncrementalFrom, safePriorPath);
+                }
+                scriptArgs.push('--incremental-from', safePriorPath);
+              } catch (_) {
+                scriptArgs.push('--incremental-from', branchIncrementalFrom);
+              }
             }
 
             execFile(
@@ -7613,12 +8936,16 @@ function activate(context) {
                 });
                 const baseDesc = targetBase && targetBase !== 'auto' ? ` (base: ${targetBase})` : '';
                 const effortInstruction = buildEffortPromptInstruction(effortLevel, commentsOnly);
+                const isIncBranch = Boolean(freshSession && freshSession.incrementalFromSha);
+                const incBranchNote = isIncBranch
+                  ? ` INCREMENTAL DELTA REVIEW: inspect \`${windowStateDir}/delta.diff\` and \`incremental_context\` in \`${windowStateDir}/pr_context.json\` — focus subagents strictly on \`delta.diff\` & \`deltaFiles\`, evaluate \`priorFindingsToRecheck\` via \`priorFindingUpdates\`, emit ONLY new delta findings in \`findings\` and delta stops in \`chapters\`, and populate \`cliffsNotes.deltaSummary\`.`
+                  : '';
                 const publishFlags = commentsOnly
                   ? `--comments-only --workspace-dir "${windowWsRoot}"`
                   : `--workspace-dir "${windowWsRoot}"`;
                 await sendPromptToQuasar(
-                  `Review local branch "${targetBranch}"${baseDesc} in repository "${repoDir}" using the quasar skill for workspace "${windowWsRoot}". Context and snapshots are already initialized in "${windowStateDir}/active_session.json" (and "${windowStateDir}/pr_context.json" / "${windowStateDir}/pr.diff"). ${effortInstruction} Run Phase 2 and Phase 3 (\`publish_review_session.py ${publishFlags}\`).`,
-                  `Quasar (${modeTitleTag}): ${repoName}@${targetBranch}`,
+                  `Review local branch "${targetBranch}"${baseDesc} in repository "${repoDir}" using the quasar skill for workspace "${windowWsRoot}". Context and snapshots are already initialized in "${windowStateDir}/active_session.json" (and "${windowStateDir}/pr_context.json" / "${windowStateDir}/pr.diff").${incBranchNote} ${effortInstruction} Run Phase 2 and Phase 3 (\`publish_review_session.py ${publishFlags}\`).`,
+                  `Quasar (${isIncBranch ? 'Updated • ' : ''}${modeTitleTag}): ${repoName}@${targetBranch}`,
                   null,
                   { effortLevel, commentsOnly }
                 );

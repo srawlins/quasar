@@ -69,19 +69,25 @@ class QuasarApiClient {
     return '${res['sessionId'] ?? ''}';
   }
 
-  Future<void> startReview({
+  Future<Map<String, dynamic>> startReview({
     String prUrl = '',
     String repoDir = '',
     String branch = '',
     String effort = 'high',
     bool commentsOnly = false,
+    bool forceNew = false,
+    bool incremental = false,
+    String incrementalFrom = '',
   }) async {
-    await _postJson('/api/start-review', <String, dynamic>{
+    return _postJson('/api/start-review', <String, dynamic>{
       'prUrl': prUrl,
       'repoDir': repoDir,
       'branch': branch,
       'effort': effort,
       'commentsOnly': commentsOnly,
+      'forceNew': forceNew,
+      'incremental': incremental,
+      if (incrementalFrom.isNotEmpty) 'incrementalFrom': incrementalFrom,
     });
   }
 
@@ -248,6 +254,50 @@ class QuasarApiClient {
   }) async {
     await _postJson('/api/override-quarantine', <String, dynamic>{
       'sessionId': sessionId,
+    });
+  }
+
+  Future<void> saveInboxSettings(Map<String, dynamic> settings) async {
+    await _postJson('/api/inbox-settings', <String, dynamic>{
+      'settings': settings,
+    });
+  }
+
+  Future<void> syncInbox() async {
+    await _postJson(
+      '/api/inbox-sync',
+      const <String, dynamic>{},
+      timeout: const Duration(seconds: 40),
+    );
+  }
+
+  Future<void> precomputeInboxItem(String itemId) async {
+    await _postJson('/api/inbox-precompute', <String, dynamic>{
+      'itemId': itemId,
+    });
+  }
+
+  Future<Map<String, dynamic>> activateInboxItem(
+    String itemId, {
+    String sessionPath = '',
+    String workspaceDir = '',
+    bool allowStale = false,
+  }) async {
+    return _postJson('/api/inbox-activate', <String, dynamic>{
+      'itemId': itemId,
+      'allowStale': allowStale,
+      if (sessionPath.isNotEmpty) 'sessionPath': sessionPath,
+      if (workspaceDir.isNotEmpty) 'workspaceDir': workspaceDir,
+    });
+  }
+
+  Future<void> inboxItemAction({
+    required String itemId,
+    required String action,
+  }) async {
+    await _postJson('/api/inbox-item-action', <String, dynamic>{
+      'itemId': itemId,
+      'action': action,
     });
   }
 }

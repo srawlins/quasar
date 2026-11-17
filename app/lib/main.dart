@@ -5,6 +5,7 @@ import 'src/models/quasar_models.dart';
 import 'src/services/backend_launcher.dart';
 import 'src/services/quasar_api_client.dart';
 import 'src/widgets/diff_viewer.dart';
+import 'src/widgets/inbox_view.dart';
 import 'src/widgets/study_guide_view.dart';
 import 'src/widgets/thread_card.dart';
 
@@ -37,7 +38,7 @@ class QuasarStandaloneApp extends StatelessWidget {
   }
 }
 
-enum _MainTab { studyGuide, diff, comments }
+enum _MainTab { studyGuide, diff, comments, inbox }
 
 class QuasarHomeShell extends StatefulWidget {
   const QuasarHomeShell({super.key, this.apiClient});
@@ -365,15 +366,175 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
     );
 
     if (confirmed == true) {
+      final String prUrlVal = isPrMode ? prCtrl.text.trim() : '';
+      final String repoDirVal = repoCtrl.text.trim();
+      final String branchVal = isPrMode ? '' : branchCtrl.text.trim();
       try {
-        await _api.startReview(
-          prUrl: isPrMode ? prCtrl.text.trim() : '',
-          repoDir: repoCtrl.text.trim(),
-          branch: isPrMode ? '' : branchCtrl.text.trim(),
+        Map<String, dynamic> res = await _api.startReview(
+          prUrl: prUrlVal,
+          repoDir: repoDirVal,
+          branch: branchVal,
           effort: effort,
           commentsOnly: commentsOnly,
         );
-        _showSnack('🚀 Dispatched review to Antigravity CLI (`agy`)!');
+        if (res['existingReviewFound'] == true &&
+            res['existingReview'] is Map<String, dynamic>) {
+          final Map<String, dynamic> ex =
+              res['existingReview'] as Map<String, dynamic>;
+          final bool isUpToDate = ex['isUpToDate'] != false;
+          final String cachedSha = '${ex['cachedHeadSha'] ?? ''}';
+          final String liveSha = '${ex['liveHeadSha'] ?? ''}';
+          final String cachedShort = cachedSha.length > 7
+              ? cachedSha.substring(0, 7)
+              : cachedSha;
+          final String liveShort = liveSha.length > 7
+              ? liveSha.substring(0, 7)
+              : liveSha;
+          if (!mounted) {
+            prCtrl.dispose();
+            repoCtrl.dispose();
+            branchCtrl.dispose();
+            return;
+          }
+          final String? decision = await showDialog<String>(
+            context: context,
+            builder: (BuildContext dCtx) => AlertDialog(
+              backgroundColor: const Color(0xFF161B22),
+              title: const Text(
+                '⚡ Completed Review Already Available',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+              content: SizedBox(
+                width: 480,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      '${ex['owner'] ?? ''}/${ex['repo'] ?? ''}#${ex['number'] ?? ''} — ${ex['title'] ?? ''}',
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '${ex['sourceLabel'] ?? 'Completed Review'} • ${'${ex['effort'] ?? 'high'}'.toUpperCase()} effort • ${ex['findingsCount'] ?? 0} finding(s)'
+                      '${isUpToDate ? (cachedShort.isNotEmpty ? ' • Up to date @ $cachedShort' : ' • Up to date') : ' • New commits pushed ($cachedShort → $liveShort)'}',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF8B949E),
+                      ),
+                    ),
+                    if ('${ex['tldr'] ?? ''}'.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 10),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0D1117),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: const Color(0xFF30363D)),
+                        ),
+                        child: Text(
+                          '${ex['tldr']}',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFC9D1D9),
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    Text(
+                      isUpToDate
+                          ? 'Would you like to open the existing review (0s), run an updated review, or run a clean new review?'
+                          : 'Stale hash detected — would you like an updated review (comparing $liveShort to $cachedShort) or a clean new review?',
+                      style: const TextStyle(fontSize: 12.5),
+                    ),
+                  ],
+                ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(dCtx).pop('cancel'),
+                  child: const Text('Cancel'),
+                ),
+                OutlinedButton(
+                  onPressed: () => Navigator.of(dCtx).pop('new'),
+                  child: const Text('Clean New Review'),
+                ),
+                if (isUpToDate) ...<Widget>[
+                  OutlinedButton.icon(
+                    onPressed: () => Navigator.of(dCtx).pop('incremental'),
+                    icon: const Icon(Icons.compare_arrows, size: 16),
+                    label: const Text('Updated Review'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () => Navigator.of(dCtx).pop('switch'),
+                    icon: const Icon(Icons.bolt, size: 16),
+                    label: const Text('Open Existing Review (0s)'),
+                  ),
+                ] else
+                  FilledButton.icon(
+                    onPressed: () => Navigator.of(dCtx).pop('incremental'),
+                    icon: const Icon(Icons.compare_arrows, size: 16),
+                    label: Text('Updated Review ($cachedShort → $liveShort)'),
+                  ),
+              ],
+            ),
+          );
+
+          if (decision == 'switch') {
+            final Map<String, dynamic> act = await _api.activateInboxItem(
+              '${ex['itemId'] ?? ''}',
+              sessionPath: '${ex['sessionPath'] ?? ''}',
+              workspaceDir: repoDirVal,
+            );
+            setState(() {
+              _selectedSessionId = '${act['sessionId'] ?? ''}';
+              _activeTab = _MainTab.studyGuide;
+            });
+            await _refreshState();
+            _showSnack('⚡ Switched to completed review!');
+            prCtrl.dispose();
+            repoCtrl.dispose();
+            branchCtrl.dispose();
+            return;
+          } else if (decision == 'incremental') {
+            res = await _api.startReview(
+              prUrl: prUrlVal,
+              repoDir: repoDirVal,
+              branch: branchVal,
+              effort: effort,
+              commentsOnly: commentsOnly,
+              forceNew: true,
+              incremental: true,
+              incrementalFrom: '${ex['sessionPath'] ?? ''}',
+            );
+          } else if (decision == 'new') {
+            res = await _api.startReview(
+              prUrl: prUrlVal,
+              repoDir: repoDirVal,
+              branch: branchVal,
+              effort: effort,
+              commentsOnly: commentsOnly,
+              forceNew: true,
+            );
+          } else {
+            prCtrl.dispose();
+            repoCtrl.dispose();
+            branchCtrl.dispose();
+            return;
+          }
+        }
+        if (res['quarantined'] == true) {
+          _showSnack(
+            '🚨 Quarantined before LLM review — inspect flagged diff lines first!',
+            isError: true,
+          );
+        } else {
+          _showSnack('🚀 Dispatched review to Antigravity CLI (`agy`)!');
+        }
         await _refreshState(silent: true);
       } catch (e) {
         _showSnack('Failed to start review: $e', isError: true);
@@ -585,15 +746,17 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
               Expanded(
                 child: _loading && _state == null
                     ? const Center(child: CircularProgressIndicator())
+                    : _activeTab == _MainTab.inbox
+                    ? _buildInboxPane()
                     : sess == null
-                        ? _buildEmptyWelcome()
-                        : Row(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: <Widget>[
-                              _buildLeftSidebar(sess),
-                              Expanded(child: _buildMainPane(sess)),
-                            ],
-                          ),
+                    ? _buildEmptyWelcome()
+                    : Row(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: <Widget>[
+                          _buildLeftSidebar(sess),
+                          Expanded(child: _buildMainPane(sess)),
+                        ],
+                      ),
               ),
             ],
           ),
@@ -708,6 +871,13 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),
+                ButtonSegment<_MainTab>(
+                  value: _MainTab.inbox,
+                  label: Text(
+                    '📥 Inbox (${_state?.inbox.readyCount ?? 0})',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
               ],
               selected: <_MainTab>{_activeTab},
               style: const ButtonStyle(visualDensity: VisualDensity.compact),
@@ -725,6 +895,15 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                 icon: const Icon(Icons.add, size: 16),
                 label: const Text('New Review', style: TextStyle(fontSize: 12)),
               ),
+              if (sess == null)
+                OutlinedButton.icon(
+                  onPressed: () => setState(() => _activeTab = _MainTab.inbox),
+                  icon: const Icon(Icons.inbox_outlined, size: 15),
+                  label: Text(
+                    '📥 Inbox (${_state?.inbox.readyCount ?? 0})',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
               OutlinedButton(
                 onPressed: () async {
                   try {
@@ -1187,6 +1366,57 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             await _api.overrideQuarantine(sessionId: sess.sessionId);
             await _refreshState(silent: false);
           },
+          onIncrementalUpdate: () async {
+            final String prUrl = sess.pr.url.isNotEmpty
+                ? sess.pr.url
+                : ((sess.pr.number ?? 0) > 0
+                      ? 'https://github.com/${sess.pr.repo}/pull/${sess.pr.number}'
+                      : '');
+            if (prUrl.isEmpty) {
+              return;
+            }
+            try {
+              await _api.startReview(
+                prUrl: prUrl,
+                repoDir: sess.repoDir.isNotEmpty
+                    ? sess.repoDir
+                    : sess.workspaceDir,
+                effort: sess.effortLevel,
+                commentsOnly: sess.commentsOnly,
+                forceNew: true,
+                incremental: true,
+              );
+              _showSnack('⚡ Dispatched Incremental Delta Review!');
+              await _refreshState(silent: true);
+            } catch (e) {
+              _showSnack('$e', isError: true);
+            }
+          },
+          onFullRereview: () async {
+            final String prUrl = sess.pr.url.isNotEmpty
+                ? sess.pr.url
+                : ((sess.pr.number ?? 0) > 0
+                      ? 'https://github.com/${sess.pr.repo}/pull/${sess.pr.number}'
+                      : '');
+            if (prUrl.isEmpty) {
+              return;
+            }
+            try {
+              await _api.startReview(
+                prUrl: prUrl,
+                repoDir: sess.repoDir.isNotEmpty
+                    ? sess.repoDir
+                    : sess.workspaceDir,
+                effort: sess.effortLevel,
+                commentsOnly: sess.commentsOnly,
+                forceNew: true,
+              );
+              _showSnack('🔄 Dispatched Full Re-Review!');
+              await _refreshState(silent: true);
+            } catch (e) {
+              _showSnack('$e', isError: true);
+            }
+          },
         );
       case _MainTab.diff:
         return DiffViewer(
@@ -1316,7 +1546,134 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             );
           },
         );
+      case _MainTab.inbox:
+        return _buildInboxPane();
     }
+  }
+
+  Widget _buildInboxPane() {
+    final InboxPayload inbox =
+        _state?.inbox ?? InboxPayload.fromJson(const <String, dynamic>{});
+    return InboxView(
+      inbox: inbox,
+      onSyncNow: () async {
+        try {
+          _showSnack('🔄 Syncing GitHub PR queue (0 tokens)...');
+          await _api.syncInbox();
+          await _refreshState(silent: true);
+          _showSnack('📥 GitHub PR Inbox synced!');
+        } catch (e) {
+          _showSnack('$e', isError: true);
+        }
+      },
+      onToggleDaemon: (bool enable) async {
+        try {
+          await _api.saveInboxSettings(<String, dynamic>{'enabled': enable});
+          await _refreshState(silent: true);
+          _showSnack(
+            enable
+                ? '🚀 Background Auto-Review daemon enabled!'
+                : '⏸️ Background Auto-Review daemon paused.',
+          );
+        } catch (e) {
+          _showSnack('$e', isError: true);
+        }
+      },
+      onSaveSettings: (Map<String, dynamic> settings) async {
+        try {
+          await _api.saveInboxSettings(settings);
+          await _refreshState(silent: true);
+          _showSnack('✅ Saved PR Inbox & Auto-Review settings!');
+        } catch (e) {
+          _showSnack('$e', isError: true);
+        }
+      },
+      onActivateItem: (InboxItem it) async {
+        try {
+          final Map<String, dynamic> res = await _api.activateInboxItem(it.id);
+          if (res['instant'] == true) {
+            setState(() {
+              _selectedSessionId = '${res['sessionId'] ?? ''}';
+              _activeTab = _MainTab.studyGuide;
+            });
+            await _refreshState();
+            _showSnack('⚡ Opened pre-reviewed PR in 0s!');
+          } else if (res['staleSessionAvailable'] == true) {
+            final String cS = '${res['cachedHeadSha'] ?? ''}';
+            final String lS = '${res['liveHeadSha'] ?? ''}';
+            final String cShort = cS.length > 7 ? cS.substring(0, 7) : cS;
+            final String lShort = lS.length > 7 ? lS.substring(0, 7) : lS;
+            if (!mounted) {
+              return;
+            }
+            final String? act = await showDialog<String>(
+              context: context,
+              builder: (BuildContext dCtx) => AlertDialog(
+                backgroundColor: const Color(0xFF161B22),
+                title: Text('🔄 Stale Review Detected ($cShort → $lShort)'),
+                content: Text(
+                  'An earlier review exists at $cShort, and the PR HEAD is now at $lShort.\n\n'
+                  'Would you like an updated review (comparing $lShort to $cShort) or a clean new review?',
+                ),
+                actions: <Widget>[
+                  TextButton(
+                    onPressed: () => Navigator.of(dCtx).pop('cancel'),
+                    child: const Text('Cancel'),
+                  ),
+                  OutlinedButton(
+                    onPressed: () => Navigator.of(dCtx).pop('clean_new'),
+                    child: const Text('Clean New Review'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () => Navigator.of(dCtx).pop('bg_inc'),
+                    icon: const Icon(Icons.compare_arrows, size: 15),
+                    label: Text('Updated Review ($cShort → $lShort)'),
+                  ),
+                ],
+              ),
+            );
+            if (act == 'clean_new') {
+              await _api.startReview(
+                prUrl: it.url,
+                effort: _state?.inbox.settings.effort ?? 'high',
+                forceNew: true,
+              );
+              _showSnack('✨ Started clean new review for ${it.id}!');
+              await _refreshState(silent: true);
+            } else if (act == 'bg_inc') {
+              await _api.precomputeInboxItem(it.id);
+              _showSnack('⚡ Started updated background pre-review!');
+              await _refreshState(silent: true);
+            }
+          } else {
+            await _api.precomputeInboxItem(it.id);
+            _showSnack('⚡ Started background pre-review for ${it.id}!');
+            await _refreshState(silent: true);
+          }
+        } catch (e) {
+          _showSnack('$e', isError: true);
+        }
+      },
+      onPrecomputeItem: (InboxItem it) async {
+        try {
+          await _api.precomputeInboxItem(it.id);
+          _showSnack(
+            '⚡ Started background pre-review — will appear under Ready when finished!',
+          );
+          await _refreshState(silent: true);
+        } catch (e) {
+          _showSnack('$e', isError: true);
+        }
+      },
+      onItemAction: (InboxItem it, String act) async {
+        try {
+          await _api.inboxItemAction(itemId: it.id, action: act);
+          await _refreshState(silent: true);
+        } catch (e) {
+          _showSnack('$e', isError: true);
+        }
+      },
+    );
   }
 }
 

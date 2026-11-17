@@ -7,6 +7,7 @@ class QuasarStatePayload {
     required this.defaultWorkspaceDir,
     required this.agentStatus,
     required this.sidecarPort,
+    required this.inbox,
   });
 
   factory QuasarStatePayload.fromJson(Map<String, dynamic> json) {
@@ -20,6 +21,9 @@ class QuasarStatePayload {
             const <String, dynamic>{};
     final Map<String, dynamic> rawAgent =
         (json['agentStatus'] as Map<String, dynamic>?) ??
+            const <String, dynamic>{};
+    final Map<String, dynamic> rawInbox =
+        (json['inbox'] as Map<String, dynamic>?) ??
             const <String, dynamic>{};
 
     return QuasarStatePayload(
@@ -38,6 +42,7 @@ class QuasarStatePayload {
       defaultWorkspaceDir: '${json['defaultWorkspaceDir'] ?? ''}',
       agentStatus: AgentLiveStatus.fromJson(rawAgent),
       sidecarPort: (json['sidecarPort'] as num?)?.toInt() ?? 49341,
+      inbox: InboxPayload.fromJson(rawInbox),
     );
   }
 
@@ -48,6 +53,205 @@ class QuasarStatePayload {
   final String defaultWorkspaceDir;
   final AgentLiveStatus agentStatus;
   final int sidecarPort;
+  final InboxPayload inbox;
+}
+
+class InboxSettings {
+  const InboxSettings({
+    required this.enabled,
+    required this.mode,
+    required this.watchReviewRequested,
+    required this.watchAuthoredPrs,
+    required this.watchedRepos,
+    required this.restrictToWatchedRepos,
+    required this.includeDrafts,
+    required this.effort,
+    required this.commentsOnly,
+    required this.pollIntervalMinutes,
+    required this.maxConcurrency,
+    required this.maxReviewsPerCycle,
+    required this.maxReviewsPerDay,
+    required this.onlyUpdatedWithinDays,
+    required this.notifyWhenReady,
+    this.incrementalUpdates = true,
+  });
+
+  factory InboxSettings.fromJson(Map<String, dynamic> json) {
+    final List<dynamic> rawRepos =
+        (json['watchedRepos'] as List<dynamic>?) ?? const <dynamic>[];
+    return InboxSettings(
+      enabled: json['enabled'] == true,
+      mode: '${json['mode'] ?? 'auto_precompute'}',
+      watchReviewRequested: json['watchReviewRequested'] != false,
+      watchAuthoredPrs: json['watchAuthoredPrs'] != false,
+      watchedRepos: rawRepos
+          .map((dynamic e) => '$e'.trim())
+          .where((String s) => s.isNotEmpty)
+          .toList(),
+      restrictToWatchedRepos: json['restrictToWatchedRepos'] == true,
+      includeDrafts: json['includeDrafts'] == true,
+      effort: '${json['effort'] ?? 'high'}',
+      commentsOnly: json['commentsOnly'] == true,
+      pollIntervalMinutes:
+          (json['pollIntervalMinutes'] as num?)?.toInt() ?? 15,
+      maxConcurrency: (json['maxConcurrency'] as num?)?.toInt() ?? 1,
+      maxReviewsPerCycle: (json['maxReviewsPerCycle'] as num?)?.toInt() ?? 1,
+      maxReviewsPerDay: (json['maxReviewsPerDay'] as num?)?.toInt() ?? 6,
+      onlyUpdatedWithinDays:
+          (json['onlyUpdatedWithinDays'] as num?)?.toInt() ?? 14,
+      notifyWhenReady: json['notifyWhenReady'] != false,
+      incrementalUpdates: json['incrementalUpdates'] != false,
+    );
+  }
+
+  final bool enabled;
+  final String mode;
+  final bool watchReviewRequested;
+  final bool watchAuthoredPrs;
+  final List<String> watchedRepos;
+  final bool restrictToWatchedRepos;
+  final bool includeDrafts;
+  final String effort;
+  final bool commentsOnly;
+  final int pollIntervalMinutes;
+  final int maxConcurrency;
+  final int maxReviewsPerCycle;
+  final int maxReviewsPerDay;
+  final int onlyUpdatedWithinDays;
+  final bool notifyWhenReady;
+  final bool incrementalUpdates;
+}
+
+class InboxItem {
+  const InboxItem({
+    required this.id,
+    required this.owner,
+    required this.repo,
+    required this.number,
+    required this.title,
+    required this.url,
+    required this.author,
+    required this.role,
+    required this.status,
+    required this.inboxGroup,
+    required this.additions,
+    required this.deletions,
+    required this.changedFilesCount,
+    required this.findingsCount,
+    required this.reviewCommentsCount,
+    required this.changesRequested,
+    required this.unread,
+    required this.updatedSinceLastReview,
+    required this.tldr,
+    required this.skipReason,
+    required this.lastError,
+  });
+
+  factory InboxItem.fromJson(Map<String, dynamic> json) {
+    return InboxItem(
+      id: '${json['id'] ?? ''}',
+      owner: '${json['owner'] ?? ''}',
+      repo: '${json['repo'] ?? ''}',
+      number: (json['number'] as num?)?.toInt() ?? 0,
+      title: '${json['title'] ?? ''}',
+      url: '${json['url'] ?? ''}',
+      author: '${json['author'] ?? ''}',
+      role: '${json['role'] ?? 'reviewer'}',
+      status: '${json['status'] ?? 'queued'}',
+      inboxGroup: '${json['inboxGroup'] ?? 'queued'}',
+      additions: (json['additions'] as num?)?.toInt() ?? 0,
+      deletions: (json['deletions'] as num?)?.toInt() ?? 0,
+      changedFilesCount: (json['changedFilesCount'] as num?)?.toInt() ?? 0,
+      findingsCount: (json['findingsCount'] as num?)?.toInt() ?? 0,
+      reviewCommentsCount:
+          (json['reviewCommentsCount'] as num?)?.toInt() ?? 0,
+      changesRequested: json['changesRequested'] == true,
+      unread: json['unread'] == true,
+      updatedSinceLastReview: json['updatedSinceLastReview'] == true,
+      tldr: '${json['tldr'] ?? ''}',
+      skipReason: '${json['skipReason'] ?? ''}',
+      lastError: '${json['lastError'] ?? ''}',
+    );
+  }
+
+  final String id;
+  final String owner;
+  final String repo;
+  final int number;
+  final String title;
+  final String url;
+  final String author;
+  final String role;
+  final String status;
+  final String inboxGroup;
+  final int additions;
+  final int deletions;
+  final int changedFilesCount;
+  final int findingsCount;
+  final int reviewCommentsCount;
+  final bool changesRequested;
+  final bool unread;
+  final bool updatedSinceLastReview;
+  final String tldr;
+  final String skipReason;
+  final String lastError;
+
+  bool get isReadyToOpen => status == 'ready' || status == 'quarantined';
+}
+
+class InboxPayload {
+  const InboxPayload({
+    required this.settings,
+    required this.daemonRunning,
+    required this.daemonPid,
+    required this.reviewsRunToday,
+    required this.maxReviewsPerDay,
+    required this.readyCount,
+    required this.unreadReadyCount,
+    required this.lastSyncError,
+    required this.items,
+  });
+
+  factory InboxPayload.fromJson(Map<String, dynamic> json) {
+    final Map<String, dynamic> rawCfg =
+        (json['settings'] as Map<String, dynamic>?) ??
+            const <String, dynamic>{};
+    final Map<String, dynamic> rawDaemon =
+        (json['daemon'] as Map<String, dynamic>?) ??
+            const <String, dynamic>{};
+    final Map<String, dynamic> rawBudget =
+        (json['budget'] as Map<String, dynamic>?) ??
+            const <String, dynamic>{};
+    final Map<String, dynamic> rawCounts =
+        (json['counts'] as Map<String, dynamic>?) ??
+            const <String, dynamic>{};
+    final List<dynamic> rawItems =
+        (json['items'] as List<dynamic>?) ?? const <dynamic>[];
+    return InboxPayload(
+      settings: InboxSettings.fromJson(rawCfg),
+      daemonRunning: rawDaemon['running'] == true,
+      daemonPid: (rawDaemon['pid'] as num?)?.toInt(),
+      reviewsRunToday: (rawBudget['reviewsRunToday'] as num?)?.toInt() ?? 0,
+      maxReviewsPerDay: (rawBudget['maxReviewsPerDay'] as num?)?.toInt() ?? 6,
+      readyCount: (rawCounts['ready'] as num?)?.toInt() ?? 0,
+      unreadReadyCount: (rawCounts['unreadReady'] as num?)?.toInt() ?? 0,
+      lastSyncError: '${json['lastSyncError'] ?? ''}',
+      items: rawItems
+          .whereType<Map<String, dynamic>>()
+          .map(InboxItem.fromJson)
+          .toList(),
+    );
+  }
+
+  final InboxSettings settings;
+  final bool daemonRunning;
+  final int? daemonPid;
+  final int reviewsRunToday;
+  final int maxReviewsPerDay;
+  final int readyCount;
+  final int unreadReadyCount;
+  final String lastSyncError;
+  final List<InboxItem> items;
 }
 
 class SessionSummary {
@@ -169,6 +373,7 @@ class ReviewSession {
     required this.conversationId,
     required this.isTutorial,
     this.securityGate,
+    this.staleHeadInfo,
   });
 
   factory ReviewSession.fromJson(Map<String, dynamic> json) {
@@ -181,6 +386,10 @@ class ReviewSession {
         json['securityGate'] is Map<String, dynamic>
             ? json['securityGate'] as Map<String, dynamic>
             : null;
+    final Map<String, dynamic>? rawStale =
+        json['staleHeadInfo'] is Map<String, dynamic>
+            ? json['staleHeadInfo'] as Map<String, dynamic>
+            : null;
     final List<dynamic> rawChapters =
         (json['chapters'] as List<dynamic>?) ?? const <dynamic>[];
     final List<dynamic> rawThreads =
@@ -192,6 +401,8 @@ class ReviewSession {
 
     final SecurityGate? parsedSg =
         rawSg != null ? SecurityGate.fromJson(rawSg) : null;
+    final StaleHeadInfo? parsedStale =
+        rawStale != null ? StaleHeadInfo.fromJson(rawStale) : null;
 
     return ReviewSession(
       sessionId: '${json['sessionId'] ?? ''}',
@@ -219,6 +430,8 @@ class ReviewSession {
       conversationId: '${json['conversationId'] ?? ''}',
       isTutorial: json['isTutorial'] == true || rawPr['isTutorial'] == true,
       securityGate: (parsedSg != null && parsedSg.hasAlerts) ? parsedSg : null,
+      staleHeadInfo:
+          (parsedStale != null && parsedStale.isStaleHead) ? parsedStale : null,
     );
   }
 
@@ -238,6 +451,7 @@ class ReviewSession {
   final String conversationId;
   final bool isTutorial;
   final SecurityGate? securityGate;
+  final StaleHeadInfo? staleHeadInfo;
 
   List<ReviewThread> get activeThreads =>
       threads.where((ReviewThread t) => t.status != 'dismissed').toList();
@@ -404,6 +618,67 @@ class IntentVsActuality {
       discrepancies.isNotEmpty;
 }
 
+class StaleHeadInfo {
+  const StaleHeadInfo({
+    required this.isStaleHead,
+    required this.reviewedHeadSha,
+    required this.latestHeadSha,
+    required this.prUrl,
+  });
+
+  factory StaleHeadInfo.fromJson(Map<String, dynamic> json) {
+    return StaleHeadInfo(
+      isStaleHead: json['isStaleHead'] == true,
+      reviewedHeadSha: '${json['reviewedHeadSha'] ?? ''}',
+      latestHeadSha: '${json['latestHeadSha'] ?? ''}',
+      prUrl: '${json['prUrl'] ?? ''}',
+    );
+  }
+
+  final bool isStaleHead;
+  final String reviewedHeadSha;
+  final String latestHeadSha;
+  final String prUrl;
+}
+
+class DeltaSummary {
+  const DeltaSummary({
+    required this.fromSha,
+    required this.toSha,
+    required this.rebased,
+    required this.deltaFilesCount,
+    required this.unchangedFilesCount,
+    required this.resolvedFindingsCount,
+    required this.newFindingsCount,
+    required this.summary,
+  });
+
+  factory DeltaSummary.fromJson(Map<String, dynamic> json) {
+    return DeltaSummary(
+      fromSha: '${json['fromSha'] ?? ''}',
+      toSha: '${json['toSha'] ?? ''}',
+      rebased: json['rebased'] == true,
+      deltaFilesCount: (json['deltaFilesCount'] as num?)?.toInt() ?? 0,
+      unchangedFilesCount: (json['unchangedFilesCount'] as num?)?.toInt() ?? 0,
+      resolvedFindingsCount:
+          (json['resolvedFindingsCount'] as num?)?.toInt() ?? 0,
+      newFindingsCount: (json['newFindingsCount'] as num?)?.toInt() ?? 0,
+      summary: '${json['summary'] ?? ''}',
+    );
+  }
+
+  final String fromSha;
+  final String toSha;
+  final bool rebased;
+  final int deltaFilesCount;
+  final int unchangedFilesCount;
+  final int resolvedFindingsCount;
+  final int newFindingsCount;
+  final String summary;
+
+  bool get hasContent => fromSha.isNotEmpty || summary.isNotEmpty;
+}
+
 class CliffsNotesData {
   const CliffsNotesData({
     required this.tldr,
@@ -412,6 +687,7 @@ class CliffsNotesData {
     required this.keySymbols,
     required this.designTradeoffs,
     this.intentVsActuality,
+    this.deltaSummary,
   });
 
   factory CliffsNotesData.fromJson(Map<String, dynamic> json) {
@@ -421,6 +697,8 @@ class CliffsNotesData {
         (json['designTradeoffs'] as List<dynamic>?) ?? const <dynamic>[];
     final Map<String, dynamic>? rawIva =
         json['intentVsActuality'] as Map<String, dynamic>?;
+    final Map<String, dynamic>? rawDs =
+        json['deltaSummary'] as Map<String, dynamic>?;
     return CliffsNotesData(
       tldr: '${json['tldr'] ?? ''}',
       whatAndWhy: '${json['whatAndWhy'] ?? ''}',
@@ -432,6 +710,7 @@ class CliffsNotesData {
       designTradeoffs: rawTradeoffs.map((dynamic e) => '$e').toList(),
       intentVsActuality:
           rawIva != null ? IntentVsActuality.fromJson(rawIva) : null,
+      deltaSummary: rawDs != null ? DeltaSummary.fromJson(rawDs) : null,
     );
   }
 
@@ -441,6 +720,7 @@ class CliffsNotesData {
   final List<KeySymbol> keySymbols;
   final List<String> designTradeoffs;
   final IntentVsActuality? intentVsActuality;
+  final DeltaSummary? deltaSummary;
 }
 
 class KeySymbol {

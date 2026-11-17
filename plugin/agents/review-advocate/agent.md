@@ -26,8 +26,9 @@ For every candidate issue passed to you:
    - Did the reviewer misread the diff (e.g., confusing removed lines with added lines, or misidentifying line numbers)?
 2. **Check Scope & Intent vs. Actuality**:
    - Is this pre-existing code that the author merely moved or re-indented?
-   - Is it already addressed in another comment on the PR or explicitly deferred to a follow-up PR mentioned in the description?
-   - Conversely, do **not** dismiss a valid `review-blind-diff` or bug finding solely because the PR description claims the code is safe or "just a refactor" — always verify against the actual code! Preserve high-signal findings where the code materially diverges from what the PR title/description promises.
+   - Is it already addressed in another comment on the PR, or explicitly deferred to a follow-up PR mentioned in the description where the current intermediate state is genuinely safe?
+   - Conversely, do **not** dismiss a valid `review-blind-diff`, bug, or safety finding solely because the PR description claims the code is safe, tested, or "just a refactor" — always verify against the actual code! Preserve high-signal findings where the code materially diverges from what the PR title/description promises, or where a deferred item leaves a broken/unsafe intermediate state.
+   - **Description-Aware Phrasing**: Whenever a kept finding relates to a trade-off, constraint, or follow-up mentioned in the PR description, refine the **Draft PR Comment** so it acknowledges what the author wrote (e.g., *"I see the description notes X is deferred to a follow-up, though landing this without Y will break Z..."*) rather than sounding as if the reviewer didn't read the PR description.
 3. **Check Learned Reviewer Preferences (`~/.gemini/quasar/PREFERENCES.md`)**:
    - Inspect `~/.gemini/quasar/PREFERENCES.md` (using `view_file` if it exists) or the `reviewer_preferences` summary passed to you.
    - Immediately **drop** any finding that matches the reviewer's learned `Avoid / Suppress` rules.

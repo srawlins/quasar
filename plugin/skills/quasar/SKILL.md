@@ -20,6 +20,22 @@ Whenever the user provides a GitHub PR URL (or PR number), OR asks to review a *
 
 ## Phase 1: Auto-Fetch PR or Local Branch Context, Snapshots & Learned Preferences
 
+### ⚡ Step 0 (Direct Chat Review Requests Only): Check for an Existing Completed Review
+When the user directly asks to review a GitHub PR or local branch in interactive chat (i.e. **NOT** when `pr_context.json` was already initialized by the Quasar UI/CLI, **NOT** during a background `--session-dir` pre-review, and **NOT** when the user already specified clean/updated mode), first check whether a completed review already exists in the Auto-Review Inbox, Active Workspace, or Review History:
+```bash
+python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/inbox_watcher.py \
+  --check-existing <PR_URL_OR_NUMBER_OR_BRANCH> \
+  --repo-dir <ACTIVE_WORKSPACE_PATH>
+```
+- If `found` is `true`:
+  - **When `isUpToDate` is `true` (non-stale review — same hash/working-tree)**, call `ask_question` offering **3 choices**:
+    1. **(Recommended) Open the existing review (0s, 0 tokens)** — run `inbox_watcher.py --activate-session "<SESSION_PATH>" --item-id "<ITEM_ID>" --workspace-dir "<ACTIVE_WORKSPACE_PATH>"` and summarize immediately.
+    2. **Updated review** — pass `--incremental-from "<SESSION_PATH>"` to `collect_pr_context.py` below to add to / refresh the existing review while preserving read stops and staged/dismissed comments.
+    3. **Clean new review** — run `collect_pr_context.py` from scratch without `--incremental-from`.
+  - **When `isUpToDate` is `false` (stale hash review — new commits or edits since the prior review)**, do **NOT** offer opening the stale review; call `ask_question` offering **2 choices**:
+    1. **(Recommended) Updated review (`cachedHeadSha[:7] → liveHeadSha[:7]`)** — pass `--incremental-from "<SESSION_PATH>"` to `collect_pr_context.py` below so Quasar compares the new hash against the old hash to update existing comments & tour stops and add findings for new changes.
+    2. **Clean new review** — run `collect_pr_context.py` from scratch without `--incremental-from`.
+
 Run `collect_pr_context.py` immediately, passing `--workspace-dir <ACTIVE_WORKSPACE_PATH>` (the active workspace path of the current window from `<user_information>`) so the Quasar session is isolated to the current window (`~/.gemini/quasar/workspaces/<workspaceKey>/active_session.json`) and never pops up in other open project windows:
 
 ```bash
@@ -63,6 +79,14 @@ When the user provides a GitHub PR link or number, inspect `pr_metadata` in `pr_
 
 ## Phase 2: Effort-Scaled Analysis (`low`, `medium`, `high`) & Preference-Aware Filtering
 
+> **🔄 Incremental / Delta Review Mode (`is_incremental: true` & `incremental_context` in `pr_context.json`)**:
+> Whenever `is_incremental` is `true` in `pr_context.json` (triggered via `--incremental` or `--incremental-from`), Quasar has ALREADY carried forward all chapters, read-progress, and staged/dismissed/candidate comments on `unchangedFiles`, and generated `<SCRATCH_DIR>/delta.diff` covering **only** the changes from `previousHeadSha` → `newHeadSha`:
+> 1. **Focus subagents strictly on `<SCRATCH_DIR>/delta.diff` & `deltaFiles`** (plus surrounding context in `head_snapshot_root`) instead of re-auditing `unchangedFiles`! Pass `review-blind-diff` ONLY `<SCRATCH_DIR>/delta.diff` + `head_snapshot_root` paths (no PR description or commit messages).
+> 2. **Re-check `incremental_context.priorFindingsToRecheck`** (prior findings whose files were modified in `deltaFiles`): for each entry, emit an item in `"priorFindingUpdates"` in `review_synthesis.json`:
+>    - `{"id": "<prior-id>", "action": "resolved", "resolutionNote": "Fixed in <newShort> by adding null guard at L45"}` when the new commit fixed or obviated it (even if the user had staged it — `publish_review_session.py` will automatically unstage it with a `[✅ Resolved?]` note so they don't post an obsolete comment!).
+>    - `{"id": "<prior-id>", "action": "keep", "startLine": <newStart>, "endLine": <newEnd>, "draftComment": "<optional updated wording>"}` when the issue still applies in the updated file.
+> 3. **Emit ONLY new delta findings in `"findings"`** (issues newly introduced or exposed by `delta.diff`) and **emit ONLY delta tour stops in `"chapters"`** (covering `deltaFiles`, e.g. `"🆕 Changes Since <oldShort> → <newShort>"`) — `publish_review_session.py` automatically prepends your delta chapter ahead of the carried-forward chapters (preserving `"read": true` on untouched stops!) and merges `"cliffsNotes.deltaSummary": {"summary": "Concise 1-2 sentence summary of what changed between oldSha and newSha and which prior comments were resolved."}`.
+
 > **💬 Comments-Only Mode (`comments_only: true`)**:
 > When `comments_only` is `true` (or the user requested a comments-only review):
 > - **Do NOT build the CliffsNotes Study Guide** (`cliffsNotes.tldr`, `whatAndWhy`, `architectureDiagram`, `keySymbols`, `designTradeoffs`) and **do NOT generate reading tour `chapters` or `stops`**.
@@ -76,6 +100,7 @@ Users configure which lenses run at each effort level (Quasar sidebar → **Conf
 - `review-advocate` is a false-positive filter helper (`role: "filter"`), not a lens — it is never listed in `review_lenses`.
 - If `review_lenses` is empty for the current effort, do not spawn any subagents (single-pass review).
 - Pass each non-blind lens the PR title/description, changed `core_source` files, `<SCRATCH_DIR>/pr.diff`, global `reviewer_preferences`, **and that lens's own `learnedDirectives`** (`review_lenses[i].learnedDirectives`, or its `### 🤖 \`<lens-name>\`` section in `~/.gemini/quasar/PREFERENCES.md`), and use `Role` = the lens's description title (e.g. `"Security Auditor"`).
+  - **📖 How to Treat the PR Description (Context & Phrasing, Never Ground Truth)**: Use `pr_metadata.title` and `pr_metadata.body` to understand goals, constraints, rollout steps, and intentional scope boundaries—never assume claims like *"pure refactor"*, *"no behavior change"*, or *"covered by existing tests"* hold without verifying them in the code. When a valid finding touches something the author already mentioned in the PR description (e.g., a stated limitation, migration step, or deferred follow-up), **acknowledge what they wrote in the draft comment** (*"The PR description notes X is deferred to a follow-up, though landing this intermediate state without Y will cause Z..."*) instead of phrasing the comment as if they hadn't considered it; conversely, if the deferred item leaves the current PR state completely safe, skip naive *"you forgot X"* noise.
 - **🙈 Blind-Diff Firewall (`blindDiff: true`, e.g. `review-blind-diff`)**: Whenever spawning a lens with `"blindDiff": true` (such as `review-blind-diff`), **strictly withhold** the PR title, PR description/body, commit messages, and existing PR comments from its prompt! Pass it ONLY `<SCRATCH_DIR>/pr.diff`, `head_snapshot_root` / `base_snapshot_root` / `repo_dir` file paths, global `reviewer_preferences`, and its `learnedDirectives`, and remind it not to read `pr_context.json` or commit logs so its "Actuality Report" is 100% unanchored.
 - **🎯 Intent vs. Actuality Synthesis (`cliffsNotes.intentVsActuality`)**: Compare `review-blind-diff`'s Blind Actuality Report (or in `low` effort, inspect `<SCRATCH_DIR>/pr.diff` *before* reading `pr_metadata.body`) against the author's stated PR title/description (`pr_metadata.title`, `pr_metadata.body`, or branch commit subjects):
   - Populate `cliffsNotes.intentVsActuality` in `review_synthesis.json` (unless `comments_only` is `true`) with `"status"` (`"aligned"`, `"diverges"`, or `"missing_intent"`), `"statedIntent"` (1 sentence), `"actualBehavior"` (1 sentence from the blind diff), and `"discrepancies"` (list of concrete mismatches, undocumented behavior/default changes, unfulfilled PR claims, or scope creep; `[]` when aligned).

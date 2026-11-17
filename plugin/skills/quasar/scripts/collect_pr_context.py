@@ -15,6 +15,7 @@ Usage:
 import argparse
 import concurrent.futures
 import datetime
+import difflib
 import hashlib
 import json
 import os
@@ -89,6 +90,9 @@ def compute_workspace_key(workspace_dir: str) -> str:
 
 def get_workspace_state_dir(workspace_dir: Optional[str] = None) -> str:
     """Returns the isolated Quasar state directory for the given window/workspace."""
+    explicit_session_dir = os.environ.get("QUASAR_SESSION_DIR")
+    if explicit_session_dir and explicit_session_dir.strip():
+        return os.path.abspath(os.path.expanduser(explicit_session_dir.strip()))
     explicit_state = os.environ.get("QUASAR_STATE_DIR")
     if explicit_state and not workspace_dir:
         return os.path.abspath(os.path.expanduser(explicit_state))
@@ -100,10 +104,17 @@ def get_workspace_state_dir(workspace_dir: Optional[str] = None) -> str:
 def get_session_paths(
     workspace_dir: Optional[str] = None,
     thread_id: Optional[str] = None,
+    session_dir: Optional[str] = None,
 ) -> Tuple[str, str, str]:
     """Returns (state_dir, active_session_path, cliffs_notes_md_path) for the target workspace.
-    If thread_id is provided and not found in the default workspace session, searches all workspace sessions.
+    If `session_dir` (or `QUASAR_SESSION_DIR`) is provided, uses that isolated directory directly
+    (so background Inbox pre-reviews never overwrite any window's live `active_session.json`).
     """
+    forced_dir = (session_dir or os.environ.get("QUASAR_SESSION_DIR") or "").strip()
+    if forced_dir:
+        s_dir = os.path.abspath(os.path.expanduser(forced_dir))
+        return s_dir, os.path.join(s_dir, "active_session.json"), os.path.join(s_dir, "cliffs_notes.md")
+
     state_dir = get_workspace_state_dir(workspace_dir)
     session_path = os.path.join(state_dir, "active_session.json")
     md_path = os.path.join(state_dir, "cliffs_notes.md")
@@ -303,6 +314,9 @@ def infer_owner_repo(pr_arg: str, cwd: str) -> Tuple[str, str, int]:
     m = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_arg)
     if m:
         return m.group(1), m.group(2), int(m.group(3))
+    m_short = re.match(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)$", pr_arg.strip())
+    if m_short:
+        return m_short.group(1), m_short.group(2), int(m_short.group(3))
     pr_num = int(pr_arg.strip().lstrip("#"))
     try:
         remotes = run_cmd(["git", "remote", "-v"], cwd=cwd, check=False).stdout
@@ -466,6 +480,31 @@ def fetch_raw_file_content(
         return None
 
 
+def _prune_old_session_snapshots(session_id: str, keep_count: int = 3) -> None:
+    """Prunes older SHA-keyed snapshot folders for `session_id`, keeping the `keep_count` newest."""
+    snaps_parent = os.path.join(REVIEW_STATE_DIR, "snapshots")
+    if not os.path.isdir(snaps_parent):
+        return
+    prefix = f"{session_id}-"
+    matches: List[Tuple[float, str]] = []
+    for name in os.listdir(snaps_parent):
+        if name.startswith(prefix):
+            full_p = os.path.join(snaps_parent, name)
+            if os.path.isdir(full_p):
+                try:
+                    matches.append((os.path.getmtime(full_p), full_p))
+                except Exception:
+                    pass
+    if len(matches) <= keep_count:
+        return
+    matches.sort(key=lambda t: t[0], reverse=True)
+    for _, old_dir in matches[keep_count:]:
+        try:
+            shutil.rmtree(old_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def materialize_snapshots(
     session_id: str,
     owner: str,
@@ -476,11 +515,16 @@ def materialize_snapshots(
     repo_dir: str,
     use_working_tree_head: bool = False,
 ) -> Tuple[str, str]:
-    snapshot_root = os.path.join(REVIEW_STATE_DIR, "snapshots", session_id)
+    sha_tag = "wt" if use_working_tree_head else (head_sha[:8] if head_sha else "")
+    snap_folder = f"{session_id}-{sha_tag}" if sha_tag else session_id
+    snapshot_root = os.path.join(REVIEW_STATE_DIR, "snapshots", snap_folder)
     base_root = os.path.join(snapshot_root, "base")
     head_root = os.path.join(snapshot_root, "head")
+    if os.path.isdir(snapshot_root):
+        shutil.rmtree(snapshot_root, ignore_errors=True)
     os.makedirs(base_root, exist_ok=True)
     os.makedirs(head_root, exist_ok=True)
+    _prune_old_session_snapshots(session_id, keep_count=3)
 
     # Try fetching the base/head refs in local git repo if missing, best-effort
     if os.path.isdir(os.path.join(repo_dir, ".git")) and base_sha and owner != "local":
@@ -533,6 +577,304 @@ def materialize_snapshots(
         list(pool.map(process_one, files_list))
 
     return base_root, head_root
+
+
+def _remap_line_range(
+    old_text: str,
+    new_text: str,
+    start_line: int,
+    end_line: int,
+) -> Tuple[int, int, bool]:
+    """Maps 1-indexed `(start_line, end_line)` from `old_text` into `new_text` using SequenceMatcher opcodes.
+    Returns `(new_start_line, new_end_line, target_lines_modified)`.
+    """
+    old_lines = (old_text or "").splitlines()
+    new_lines = (new_text or "").splitlines()
+    if not new_lines:
+        return 1, 1, True
+    if not old_lines or old_text == new_text:
+        clamped_s = max(1, min(len(new_lines), int(start_line or 1)))
+        clamped_e = max(clamped_s, min(len(new_lines), int(end_line or clamped_s)))
+        return clamped_s, clamped_e, False
+
+    s_idx = max(0, min(len(old_lines) - 1, int(start_line or 1) - 1))
+    e_idx = max(s_idx, min(len(old_lines) - 1, int(end_line or start_line or 1) - 1))
+
+    opcodes = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes()
+    new_s = 1
+    new_e = 1
+    modified = False
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if i1 <= s_idx < i2:
+            if tag == "equal":
+                new_s = (s_idx - i1) + j1 + 1
+            else:
+                new_s = max(1, min(len(new_lines), j1 + 1))
+                modified = True
+        if i1 <= e_idx < i2:
+            if tag == "equal":
+                new_e = (e_idx - i1) + j1 + 1
+            else:
+                new_e = max(new_s, min(len(new_lines), max(j1 + 1, j2)))
+                modified = True
+        if tag != "equal" and not (i2 <= s_idx or i1 > e_idx):
+            modified = True
+
+    new_s = max(1, min(len(new_lines), new_s))
+    new_e = max(new_s, min(len(new_lines), new_e))
+    return new_s, new_e, modified
+
+
+def build_incremental_delta_package(
+    prior_sess: Dict[str, Any],
+    metadata: Dict[str, Any],
+    files_list: List[Dict[str, Any]],
+    base_root: str,
+    head_root: str,
+    repo_dir: str,
+    owner: str,
+    repo: str,
+) -> Optional[Dict[str, Any]]:
+    """Computes the exact delta (`oldSha -> newSha`) against a prior completed review session,
+    handling both fast-forward commits AND force-pushes/rebases cleanly.
+    """
+    if not isinstance(prior_sess, dict):
+        return None
+    prior_pr = prior_sess.get("pr") or {}
+    old_head_sha = str(prior_pr.get("headSha") or "").strip()
+    new_head_sha = str(metadata.get("headSha") or "").strip()
+    if not old_head_sha or not new_head_sha:
+        return None
+    same_commit_refresh = bool(old_head_sha == new_head_sha)
+
+    old_base_sha = str(prior_pr.get("baseSha") or "").strip()
+    new_base_sha = str(metadata.get("baseSha") or "").strip()
+    rebased = bool(old_base_sha and new_base_sha and old_base_sha != new_base_sha)
+
+    prior_head_root = str(prior_sess.get("headSnapshotRoot") or "")
+    prior_base_root = str(prior_sess.get("baseSnapshotRoot") or "")
+
+    prior_files_raw = prior_sess.get("files") or []
+    old_paths = {
+        str(f.get("path") or "").strip()
+        for f in prior_files_raw
+        if isinstance(f, dict) and str(f.get("path") or "").strip()
+    }
+    if not old_paths and prior_sess.get("changedFiles"):
+        old_paths = {str(p).strip() for p in (prior_sess.get("changedFiles") or []) if str(p).strip()}
+
+    new_files_map = {str(f.get("path") or "").strip(): f for f in files_list if f.get("path")}
+    new_paths = set(new_files_map.keys())
+    all_candidate_paths = sorted(old_paths | new_paths)
+
+    def _read_old_head(rel_path: str) -> str:
+        if prior_head_root:
+            cand = os.path.join(prior_head_root, rel_path)
+            if os.path.isfile(cand):
+                return open(cand, "r", encoding="utf-8", errors="replace").read()
+        if rel_path not in old_paths and not rebased:
+            b_cand = os.path.join(base_root, rel_path)
+            if os.path.isfile(b_cand):
+                return open(b_cand, "r", encoding="utf-8", errors="replace").read()
+        fetched = fetch_raw_file_content(owner, repo, old_head_sha, rel_path, repo_dir)
+        return fetched or ""
+
+    def _read_new_head(rel_path: str) -> str:
+        cand = os.path.join(head_root, rel_path)
+        if os.path.isfile(cand):
+            return open(cand, "r", encoding="utf-8", errors="replace").read()
+        fetched = fetch_raw_file_content(owner, repo, new_head_sha, rel_path, repo_dir)
+        return fetched or ""
+
+    delta_commits: List[Dict[str, str]] = []
+    if not rebased and not same_commit_refresh and owner and owner != "local":
+        try:
+            cmp_data = github_api_get(
+                f"https://api.github.com/repos/{owner}/{repo}/compare/{old_head_sha}...{new_head_sha}"
+            )
+            if isinstance(cmp_data, dict):
+                for cm in (cmp_data.get("commits") or [])[-20:]:
+                    msg = str(((cm.get("commit") or {}).get("message") or "")).splitlines()
+                    delta_commits.append(
+                        {
+                            "sha": str(cm.get("sha") or "")[:7],
+                            "message": msg[0][:140] if msg else "",
+                        }
+                    )
+        except Exception:
+            pass
+
+    delta_files: List[Dict[str, Any]] = []
+    unchanged_files: List[str] = []
+    delta_patches: List[str] = []
+    file_contents_pair: Dict[str, Tuple[str, str]] = {}
+
+    for rel_path in all_candidate_paths:
+        old_txt = _read_old_head(rel_path)
+        new_txt = _read_new_file_cached = _read_new_head(rel_path)
+        file_contents_pair[rel_path] = (old_txt, _read_new_file_cached)
+        if old_txt == new_txt:
+            if rel_path in new_paths:
+                unchanged_files.append(rel_path)
+            continue
+
+        # Filter pure rebase upstream changes where the PR's net patch vs base didn't change
+        if rebased and prior_base_root and rel_path in old_paths and rel_path in new_paths:
+            old_b_path = os.path.join(prior_base_root, rel_path)
+            new_b_path = os.path.join(base_root, rel_path)
+            if os.path.isfile(old_b_path) and os.path.isfile(new_b_path):
+                old_b_txt = open(old_b_path, "r", encoding="utf-8", errors="replace").read()
+                new_b_txt = open(new_b_path, "r", encoding="utf-8", errors="replace").read()
+                old_patch_body = [
+                    ln
+                    for ln in difflib.unified_diff(old_b_txt.splitlines(), old_txt.splitlines(), n=1)
+                    if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+                ]
+                new_patch_body = [
+                    ln
+                    for ln in difflib.unified_diff(new_b_txt.splitlines(), new_txt.splitlines(), n=1)
+                    if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+                ]
+                if old_patch_body == new_patch_body:
+                    unchanged_files.append(rel_path)
+                    continue
+
+        diff_lines = list(
+            difflib.unified_diff(
+                old_txt.splitlines(keepends=True),
+                new_txt.splitlines(keepends=True),
+                fromfile=f"a/{rel_path} ({old_head_sha[:7]})",
+                tofile=f"b/{rel_path} ({new_head_sha[:7]})",
+            )
+        )
+        patch_str = "".join(diff_lines)
+        if patch_str:
+            delta_patches.append(patch_str)
+
+        if rel_path not in old_paths:
+            d_kind = "newly_touched_in_pr"
+        elif rel_path not in new_paths:
+            d_kind = "reverted_to_base"
+        else:
+            d_kind = "updated_since_last_review"
+
+        adds = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+        dels = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+        delta_files.append(
+            {
+                "path": rel_path,
+                "deltaStatus": d_kind,
+                "additions": adds,
+                "deletions": dels,
+            }
+        )
+
+    delta_path_set = {d["path"] for d in delta_files}
+
+    # Remap prior chapters/stops on untouched & touched files
+    carried_chapters: List[Dict[str, Any]] = []
+    for ch in prior_sess.get("chapters") or []:
+        if str(ch.get("id") or "").startswith("ch-delta-"):
+            continue
+        remapped_stops: List[Dict[str, Any]] = []
+        for stp in ch.get("stops") or []:
+            sp = str(stp.get("path") or "").strip()
+            if not sp or sp not in new_paths:
+                continue
+            s_copy = dict(stp)
+            s_copy["baseSnapshotPath"] = os.path.join(base_root, sp)
+            s_copy["headSnapshotPath"] = os.path.join(head_root, sp)
+            local_cand = os.path.join(repo_dir, sp) if repo_dir else ""
+            s_copy["localWorkspacePath"] = local_cand if (local_cand and os.path.isfile(local_cand)) else None
+            if sp in delta_path_set:
+                old_t, new_t = file_contents_pair.get(sp, ("", ""))
+                ns, ne, mod = _remap_line_range(
+                    old_t,
+                    new_t,
+                    int(stp.get("startLine") or 1),
+                    int(stp.get("endLine") or stp.get("startLine") or 1),
+                )
+                s_copy["startLine"] = ns
+                s_copy["endLine"] = ne
+                if mod:
+                    s_copy["read"] = False
+                    s_copy["touchedInDelta"] = True
+            remapped_stops.append(s_copy)
+        if remapped_stops:
+            ch_copy = dict(ch)
+            ch_copy["stops"] = remapped_stops
+            carried_chapters.append(ch_copy)
+
+    # Partition prior non-GitHub threads into untouched vs touched
+    carried_untouched_threads: List[Dict[str, Any]] = []
+    prior_touched_threads: List[Dict[str, Any]] = []
+    prior_findings_for_llm: List[Dict[str, Any]] = []
+
+    for th in prior_sess.get("threads") or []:
+        if th.get("kind") == "github_existing":
+            continue
+        th_copy = dict(th)
+        tp = str(th.get("path") or "").strip()
+        if tp:
+            th_copy["baseSnapshotPath"] = os.path.join(base_root, tp)
+            th_copy["headSnapshotPath"] = os.path.join(head_root, tp)
+            local_cand = os.path.join(repo_dir, tp) if repo_dir else ""
+            th_copy["localWorkspacePath"] = local_cand if (local_cand and os.path.isfile(local_cand)) else None
+
+        if not tp or th.get("isTopLevel") or (tp in new_paths and tp not in delta_path_set):
+            carried_untouched_threads.append(th_copy)
+            continue
+
+        reverted_out = tp not in new_paths
+        old_t, new_t = file_contents_pair.get(tp, ("", ""))
+        ns, ne, mod = _remap_line_range(
+            old_t,
+            new_t,
+            int(th.get("startLine") or 1),
+            int(th.get("endLine") or th.get("startLine") or 1),
+        )
+        th_copy["remappedStartLine"] = ns
+        th_copy["remappedEndLine"] = ne
+        th_copy["targetLinesModifiedInDelta"] = mod
+        th_copy["revertedFromPr"] = reverted_out
+        prior_touched_threads.append(th_copy)
+
+        if th.get("status") != "dismissed" and th.get("kind") in ("ai_candidate", "user_staged"):
+            prior_findings_for_llm.append(
+                {
+                    "id": th.get("id"),
+                    "kind": th.get("kind"),
+                    "status": th.get("status"),
+                    "severity": th.get("severity"),
+                    "path": tp,
+                    "previousStartLine": th.get("startLine"),
+                    "previousEndLine": th.get("endLine"),
+                    "remappedStartLine": ns,
+                    "remappedEndLine": ne,
+                    "targetLinesModifiedInDelta": mod,
+                    "revertedFromPr": reverted_out,
+                    "title": th.get("title"),
+                    "draftComment": th.get("draftComment"),
+                }
+            )
+
+    return {
+        "previousHeadSha": old_head_sha,
+        "newHeadSha": new_head_sha,
+        "previousBaseSha": old_base_sha,
+        "newBaseSha": new_base_sha,
+        "rebased": rebased,
+        "deltaCommits": delta_commits,
+        "deltaFiles": delta_files,
+        "unchangedFiles": unchanged_files,
+        "deltaDiffText": "\n".join(delta_patches),
+        "previousCliffsNotes": prior_sess.get("cliffsNotes") or {},
+        "carriedChapters": carried_chapters,
+        "carriedUntouchedThreads": carried_untouched_threads,
+        "priorTouchedThreads": prior_touched_threads,
+        "priorFindingsToRecheck": prior_findings_for_llm,
+    }
 
 
 def fetch_pr_via_rest(
@@ -2344,6 +2686,31 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
     raw_what = (cn.get("whatAndWhy") or "").strip()
     short_summary, extra_summary = _split_concise_and_detail(raw_tldr or raw_what, 190)
 
+    delta_sum = cn.get("deltaSummary")
+    if isinstance(delta_sum, dict) and (delta_sum.get("fromSha") or delta_sum.get("summary")):
+        f_short = str(delta_sum.get("fromSha") or "")[:7]
+        t_short = str(delta_sum.get("toSha") or "")[:7]
+        rebased_tag = " *(rebased)*" if delta_sum.get("rebased") else ""
+        lines.append("> [!TIP]")
+        lines.append(
+            f"> **🔄 Incremental Review Update (`{f_short}` → `{t_short}`){rebased_tag}** — "
+            f"{int(delta_sum.get('deltaFilesCount') or 0)} file(s) changed, "
+            f"{int(delta_sum.get('unchangedFilesCount') or 0)} unchanged"
+            + (
+                f", {int(delta_sum.get('resolvedFindingsCount') or 0)} prior finding(s) resolved"
+                if delta_sum.get("resolvedFindingsCount")
+                else ""
+            )
+            + (
+                f", {int(delta_sum.get('newFindingsCount') or 0)} new finding(s)"
+                if delta_sum.get("newFindingsCount")
+                else ""
+            )
+        )
+        if delta_sum.get("summary"):
+            lines.append(f"> {delta_sum['summary']}")
+        lines.append("")
+
     lines.append("## ⚡ TL;DR")
     lines.append(short_summary or raw_tldr or raw_what)
     lines.append("")
@@ -2630,6 +2997,8 @@ def is_github_pr_arg(pr_arg: Optional[str]) -> bool:
         return False
     s = pr_arg.strip()
     if re.search(r"github\.com/[^/]+/[^/]+/pull/\d+", s):
+        return True
+    if re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+$", s):
         return True
     if re.match(r"^#?\d+$", s):
         return True
@@ -3443,12 +3812,18 @@ def main() -> None:
     parser.add_argument("--tutorial", action="store_true", help="Initialize the interactive Quasar Sandbox PR Tutorial session")
     parser.add_argument("--allow-quarantined", action="store_true", help="Explicit human override allowing LLM review to proceed on a quarantined PR")
     parser.add_argument("--override-quarantine", action="store_true", help="Mark the active quarantined session in this workspace as overridden so LLM review can proceed")
+    parser.add_argument("--session-dir", default=None, help="Isolated session staging directory (used by background Inbox watcher so live active_session.json is untouched)")
+    parser.add_argument("--incremental", action="store_true", help="Incremental / delta review: diff new HEAD against the most recent completed review of this PR/branch and update existing findings & tour stops")
+    parser.add_argument("--incremental-from", default=None, help="Explicit path to a prior completed session JSON to diff & update incrementally")
     parser.add_argument("--output-dir", help="Optional directory to write diff and metadata files")
     args = parser.parse_args()
 
     os.makedirs(REVIEW_STATE_DIR, exist_ok=True)
     ws_root = resolve_workspace_root(args.workspace_dir)
-    state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(args.workspace_dir)
+    state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(
+        args.workspace_dir,
+        session_dir=args.session_dir,
+    )
     os.makedirs(state_dir, exist_ok=True)
 
     if args.override_quarantine:
@@ -3794,7 +4169,8 @@ def main() -> None:
     else:
         comments_only = bool(prefs_for_context.get("defaultCommentsOnly", False))
 
-    win_id, win_pid = resolve_target_window(state_dir)
+    is_isolated_session = bool(args.session_dir or os.environ.get("QUASAR_SESSION_DIR"))
+    win_id, win_pid = (None, None) if is_isolated_session else resolve_target_window(state_dir)
 
     try:
         from manage_preferences import load_preferences as _load_full_prefs
@@ -3851,6 +4227,106 @@ def main() -> None:
 
     out_dir = os.path.abspath(args.output_dir) if args.output_dir else state_dir
     os.makedirs(out_dir, exist_ok=True)
+
+    # Clear any stale incremental_base.json from an earlier run in state_dir / out_dir unless overwritten below
+    for clean_dir in {state_dir, out_dir}:
+        stale_inc = os.path.join(clean_dir, "incremental_base.json")
+        if os.path.isfile(stale_inc):
+            try:
+                os.remove(stale_inc)
+            except Exception:
+                pass
+
+    inc_pkg: Optional[Dict[str, Any]] = None
+    if args.incremental or args.incremental_from:
+        prior_sess_cand: Optional[Dict[str, Any]] = None
+        if args.incremental_from and os.path.isfile(os.path.expanduser(args.incremental_from)):
+            try:
+                with open(os.path.expanduser(args.incremental_from), "r", encoding="utf-8") as pf:
+                    prior_sess_cand = json.load(pf)
+            except Exception:
+                prior_sess_cand = None
+        if prior_sess_cand is None and pr_arg:
+            try:
+                from inbox_watcher import _scan_completed_sessions_for_pr
+
+                cands = _scan_completed_sessions_for_pr(
+                    str(metadata.get("owner") or ""),
+                    str(metadata.get("repo") or ""),
+                    int(metadata.get("number") or 0),
+                    include_inbox=True,
+                )
+                older_cands = [
+                    c
+                    for c in cands
+                    if c.get("headSha") and c.get("headSha") != str(metadata.get("headSha") or "")
+                ]
+                chosen_pool = older_cands if older_cands else cands
+                if chosen_pool:
+                    chosen_pool.sort(key=lambda c: float(c.get("mtime") or 0.0), reverse=True)
+                    prior_sess_cand = chosen_pool[0].get("session")
+            except Exception:
+                prior_sess_cand = None
+        if prior_sess_cand is None and os.path.isfile(active_session_path):
+            try:
+                with open(active_session_path, "r", encoding="utf-8") as af:
+                    cur_s = json.load(af)
+                if cur_s.get("sessionId") == session_id and cur_s.get("analysisStatus") == "ready":
+                    prior_sess_cand = cur_s
+            except Exception:
+                pass
+
+        if prior_sess_cand is not None:
+            inc_pkg = build_incremental_delta_package(
+                prior_sess=prior_sess_cand,
+                metadata=metadata,
+                files_list=files_list,
+                base_root=base_root,
+                head_root=head_root,
+                repo_dir=repo_dir,
+                owner=str(metadata.get("owner") or "local"),
+                repo=str(metadata.get("repo") or ""),
+            )
+
+    if inc_pkg is not None:
+        delta_diff_path = os.path.join(out_dir, "delta.diff")
+        with open(delta_diff_path, "w", encoding="utf-8") as df:
+            df.write(inc_pkg.get("deltaDiffText") or "")
+        inc_base_payload = {
+            "sessionId": session_id,
+            "previousHeadSha": inc_pkg["previousHeadSha"],
+            "newHeadSha": inc_pkg["newHeadSha"],
+            "rebased": inc_pkg["rebased"],
+            "deltaCommits": inc_pkg["deltaCommits"],
+            "deltaFiles": inc_pkg["deltaFiles"],
+            "unchangedFiles": inc_pkg["unchangedFiles"],
+            "previousCliffsNotes": inc_pkg["previousCliffsNotes"],
+            "carriedChapters": inc_pkg["carriedChapters"],
+            "carriedUntouchedThreads": inc_pkg["carriedUntouchedThreads"],
+            "priorTouchedThreads": inc_pkg["priorTouchedThreads"],
+        }
+        for target_d in {state_dir, out_dir}:
+            os.makedirs(target_d, exist_ok=True)
+            with open(os.path.join(target_d, "incremental_base.json"), "w", encoding="utf-8") as ibf:
+                json.dump(inc_base_payload, ibf, indent=2)
+        full_summary["is_incremental"] = True
+        full_summary["saved_delta_diff_path"] = delta_diff_path
+        full_summary["incremental_context"] = {
+            "previousHeadSha": inc_pkg["previousHeadSha"],
+            "newHeadSha": inc_pkg["newHeadSha"],
+            "rebased": inc_pkg["rebased"],
+            "deltaDiffPath": delta_diff_path,
+            "deltaCommits": inc_pkg["deltaCommits"],
+            "deltaFiles": inc_pkg["deltaFiles"],
+            "unchangedFiles": inc_pkg["unchangedFiles"],
+            "previousCliffsNotes": {
+                "tldr": (inc_pkg["previousCliffsNotes"] or {}).get("tldr", ""),
+                "whatAndWhy": (inc_pkg["previousCliffsNotes"] or {}).get("whatAndWhy", ""),
+                "intentVsActuality": (inc_pkg["previousCliffsNotes"] or {}).get("intentVsActuality"),
+            },
+            "priorFindingsToRecheck": inc_pkg["priorFindingsToRecheck"],
+        }
+
     context_path = os.path.join(out_dir, "pr_context.json")
     diff_path = os.path.join(out_dir, "pr.diff")
     with open(diff_path, "w", encoding="utf-8") as f:
@@ -3895,6 +4371,14 @@ def main() -> None:
     )
     session["effortLevel"] = effort_level
     session["commentsOnly"] = comments_only
+    if inc_pkg is not None and not halt_llm_review:
+        session["incrementalFromSha"] = inc_pkg["previousHeadSha"]
+        if inc_pkg.get("previousCliffsNotes"):
+            session["cliffsNotes"] = dict(inc_pkg["previousCliffsNotes"])
+        if inc_pkg.get("carriedChapters") and not comments_only:
+            session["chapters"] = inc_pkg["carriedChapters"]
+        gh_threads_init = [t for t in (session.get("threads") or []) if t.get("kind") == "github_existing"]
+        session["threads"] = gh_threads_init + list(inc_pkg.get("carriedUntouchedThreads") or [])
     if security_gate.get("status") in ("blocked", "warning"):
         session["securityGate"] = security_gate
     if halt_llm_review:

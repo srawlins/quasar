@@ -591,11 +591,17 @@ def post_via_rest_or_gh(
                 pass
             if (
                 http_err.code == 422
-                and "Line could not be resolved" in err_body
-                and payload.get("comments")
+                and (
+                    "Line could not be resolved" in err_body
+                    or "commit_id is not part of the pull request" in err_body
+                    or "PullRequestReviewCommit" in err_body
+                )
+                and (payload.get("comments") or payload.get("commit_id"))
             ):
                 live_patches = fetch_live_pr_file_patches(owner, repo, pr_num, token)
-                if live_patches:
+                retry_payload = dict(payload)
+                retry_payload.pop("commit_id", None)
+                if live_patches and payload.get("comments"):
                     fixed_comments, overflow = build_hunk_constrained_comments(
                         payload["comments"], None, head_root, live_patches=live_patches
                     )
@@ -603,20 +609,19 @@ def post_via_rest_or_gh(
                     for c in fixed_comments:
                         c.pop("start_line", None)
                         c.pop("start_side", None)
-                    retry_payload = dict(payload)
                     retry_payload["comments"] = fixed_comments
                     if overflow:
                         existing_body = (retry_payload.get("body") or "").strip()
                         extra = "\n\n".join(overflow)
                         retry_payload["body"] = f"{existing_body}\n\n{extra}".strip() if existing_body else extra
+                try:
+                    return _send_via_token(retry_payload), replaced_ids
+                except urllib.error.HTTPError as retry_err:
                     try:
-                        return _send_via_token(retry_payload), replaced_ids
-                    except urllib.error.HTTPError as retry_err:
-                        try:
-                            err_body = retry_err.read().decode("utf-8", errors="replace")
-                        except Exception:
-                            pass
-                        http_err = retry_err
+                        err_body = retry_err.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    http_err = retry_err
             if (
                 http_err.code == 403
                 and "Resource not accessible by personal access token" in err_body
@@ -808,6 +813,9 @@ def main() -> None:
             staged, base_root, head_root
         )
         payload: Dict[str, Any] = {"comments": comments_list}
+        reviewed_head_sha = str(pr_meta.get("headSha") or "").strip()
+        if len(reviewed_head_sha) == 40 and all(ch in "0123456789abcdefABCDEF" for ch in reviewed_head_sha):
+            payload["commit_id"] = reviewed_head_sha
         summary_parts: List[str] = []
         base_summary = args.summary_body.strip() or (session.get("topLevelCommentIntro") or "").strip()
         if base_summary and not any(base_summary in note for note in overflow_notes):

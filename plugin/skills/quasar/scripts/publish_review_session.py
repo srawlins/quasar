@@ -639,10 +639,231 @@ def merge_session(existing: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str
     return session
 
 
+def apply_incremental_merge(
+    merged: Dict[str, Any],
+    payload: Dict[str, Any],
+    inc_base: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merges delta findings, prior-finding updates, and carried-forward chapters/threads
+    when publishing an incremental (`oldSha -> newSha`) review.
+    """
+    from_sha = str(inc_base.get("previousHeadSha") or "")
+    to_sha = str(inc_base.get("newHeadSha") or ((merged.get("pr") or {}).get("headSha") or ""))
+    from_short = from_sha[:7]
+    to_short = to_sha[:7]
+    rebased = bool(inc_base.get("rebased", False))
+    comments_only = bool(merged.get("commentsOnly", False))
+
+    # 1. Reconcile threads: GitHub existing + untouched carried + reconciled touched + new delta findings
+    updates_by_id: Dict[str, Dict[str, Any]] = {}
+    raw_upds = payload.get("priorFindingUpdates") or payload.get("prior_finding_updates") or []
+    if isinstance(raw_upds, dict):
+        for k, v in raw_upds.items():
+            if isinstance(v, dict):
+                updates_by_id[str(k)] = v
+    elif isinstance(raw_upds, list):
+        for u in raw_upds:
+            if isinstance(u, dict) and u.get("id"):
+                updates_by_id[str(u["id"])] = u
+
+    carried_untouched: List[Dict[str, Any]] = list(inc_base.get("carriedUntouchedThreads") or [])
+    prior_touched: List[Dict[str, Any]] = list(inc_base.get("priorTouchedThreads") or [])
+    prior_ids = {
+        str(t.get("id"))
+        for t in (carried_untouched + prior_touched)
+        if isinstance(t, dict) and t.get("id")
+    }
+
+    gh_threads = [t for t in (merged.get("threads") or []) if t.get("kind") == "github_existing"]
+    emitted_non_gh = [t for t in (merged.get("threads") or []) if t.get("kind") != "github_existing"]
+    emitted_by_id = {str(t.get("id")): t for t in emitted_non_gh if t.get("id")}
+
+    final_carried_untouched: List[Dict[str, Any]] = []
+    for ut in carried_untouched:
+        uid = str(ut.get("id") or "")
+        if uid and uid in emitted_by_id:
+            # Keep user status (staged / dismissed) if the LLM re-emitted an untouched thread
+            em = dict(emitted_by_id.pop(uid))
+            if ut.get("status") in ("staged", "dismissed", "fixed"):
+                em["status"] = ut["status"]
+            final_carried_untouched.append(em)
+        else:
+            final_carried_untouched.append(ut)
+
+    reconciled_touched: List[Dict[str, Any]] = []
+    resolved_notes: List[str] = []
+    resolved_count = 0
+
+    for pt in prior_touched:
+        pid = str(pt.get("id") or "")
+        if pid and pid in emitted_by_id:
+            em = dict(emitted_by_id.pop(pid))
+            if pt.get("status") in ("staged", "dismissed", "fixed"):
+                em["status"] = pt["status"]
+            reconciled_touched.append(em)
+            continue
+
+        upd = updates_by_id.get(pid) or {}
+        default_act = "resolved" if pt.get("revertedFromPr") else "keep"
+        action = str(upd.get("action") or default_act).strip().lower()
+        t_copy = dict(pt)
+        t_copy.pop("remappedStartLine", None)
+        t_copy.pop("remappedEndLine", None)
+        t_copy.pop("targetLinesModifiedInDelta", None)
+        t_copy.pop("revertedFromPr", None)
+
+        remapped_s = int(upd.get("startLine") or pt.get("remappedStartLine") or pt.get("startLine") or 1)
+        remapped_e = int(upd.get("endLine") or pt.get("remappedEndLine") or remapped_s)
+        t_copy["startLine"] = remapped_s
+        t_copy["endLine"] = max(remapped_s, remapped_e)
+
+        if action in ("resolved", "fixed", "drop"):
+            resolved_count += 1
+            res_note = str(upd.get("resolutionNote") or "Addressed in latest commit").strip()
+            resolved_notes.append(
+                f"✅ Resolved in `{to_short}`: {pt.get('title') or pt.get('path')} — {res_note}"
+            )
+            if pt.get("status") == "staged" or pt.get("kind") == "user_staged":
+                t_copy["status"] = "candidate"
+                old_title = str(t_copy.get("title") or "Comment")
+                if not old_title.startswith("[✅"):
+                    t_copy["title"] = f"[✅ Resolved in {to_short}?] {old_title}"
+                t_copy["whyItMatters"] = f"{res_note} — {t_copy.get('whyItMatters') or ''}".strip(" —")
+                reconciled_touched.append(t_copy)
+            else:
+                t_copy["status"] = "dismissed"
+                reconciled_touched.append(t_copy)
+        else:
+            if upd.get("draftComment"):
+                t_copy["draftComment"] = str(upd["draftComment"])
+                msgs = list(t_copy.get("messages") or [])
+                if msgs and t_copy.get("createdBy") != "user":
+                    msgs[0] = dict(msgs[0])
+                    msgs[0]["body"] = t_copy["draftComment"]
+                    t_copy["messages"] = msgs
+            if upd.get("title"):
+                t_copy["title"] = str(upd["title"])
+            reconciled_touched.append(t_copy)
+
+    existing_loc_sigs = {
+        (
+            str(t.get("path") or ""),
+            int(t.get("startLine") or 1),
+            re.sub(r"^\[[^\]]+\]\s*", "", str(t.get("title") or "")).strip().lower()[:60],
+        )
+        for t in (final_carried_untouched + reconciled_touched)
+    }
+
+    brand_new_delta_threads: List[Dict[str, Any]] = []
+    for rem_t in emitted_non_gh:
+        rid = str(rem_t.get("id") or "")
+        if rid and rid in prior_ids:
+            continue
+        loc_sig = (
+            str(rem_t.get("path") or ""),
+            int(rem_t.get("startLine") or 1),
+            re.sub(r"^\[[^\]]+\]\s*", "", str(rem_t.get("title") or "")).strip().lower()[:60],
+        )
+        if loc_sig in existing_loc_sigs:
+            continue
+        existing_loc_sigs.add(loc_sig)
+        nt = dict(rem_t)
+        nt["addedInDelta"] = True
+        nt["introducedInSha"] = to_sha
+        cur_title = str(nt.get("title") or "")
+        tag_label = "🆕 Updated" if from_sha == to_sha else f"🆕 {to_short}"
+        if to_short and not cur_title.startswith("[🆕"):
+            nt["title"] = f"[{tag_label}] {cur_title}"
+        brand_new_delta_threads.append(nt)
+
+    merged["threads"] = gh_threads + brand_new_delta_threads + reconciled_touched + final_carried_untouched
+
+    # 2. Merge Reading Tour chapters: Delta chapters first (unread), then carried untouched chapters (read preserved!)
+    if not comments_only:
+        carried_chapters: List[Dict[str, Any]] = list(inc_base.get("carriedChapters") or [])
+        delta_chapters: List[Dict[str, Any]] = list(merged.get("chapters") or []) if ("chapters" in payload and payload.get("chapters")) else []
+        if delta_chapters:
+            for d_idx, dch in enumerate(delta_chapters, 1):
+                d_title = str(dch.get("title") or "")
+                if d_idx == 1 and "🆕" not in d_title and "Delta" not in d_title and "Changes Since" not in d_title:
+                    dch["title"] = f"🆕 Changes Since {from_short} → {to_short}: {d_title}"
+                dch["id"] = f"ch-delta-{to_short}-{d_idx}"
+                for stp in dch.get("stops") or []:
+                    stp["read"] = False
+            delta_stop_keys = {
+                (str(s.get("path") or ""), int(s.get("startLine") or 1))
+                for ch in delta_chapters
+                for s in (ch.get("stops") or [])
+            }
+            filtered_carried: List[Dict[str, Any]] = []
+            for cch in carried_chapters:
+                kept_stops = [
+                    s
+                    for s in (cch.get("stops") or [])
+                    if (str(s.get("path") or ""), int(s.get("startLine") or 1)) not in delta_stop_keys
+                ]
+                if kept_stops:
+                    cch_copy = dict(cch)
+                    cch_copy["stops"] = kept_stops
+                    filtered_carried.append(cch_copy)
+            combined_chapters = delta_chapters + filtered_carried
+        else:
+            combined_chapters = carried_chapters
+
+        for c_i, ch_obj in enumerate(combined_chapters, 1):
+            for s_i, st_obj in enumerate(ch_obj.get("stops") or [], 1):
+                st_obj["stopNumber"] = f"{c_i}.{s_i}"
+        merged["chapters"] = combined_chapters
+
+    # 3. Merge CliffsNotes + build `deltaSummary`
+    prev_cn = dict(inc_base.get("previousCliffsNotes") or {})
+    cur_cn = dict(merged.get("cliffsNotes") or {})
+    final_cn = dict(prev_cn)
+    for k, v in cur_cn.items():
+        if v not in (None, "", []):
+            final_cn[k] = v
+
+    raw_ds = (payload.get("cliffsNotes") or {}).get("deltaSummary") or payload.get("deltaSummary")
+    if isinstance(raw_ds, dict):
+        ds_summary = str(raw_ds.get("summary") or "").strip()
+    elif isinstance(raw_ds, str):
+        ds_summary = raw_ds.strip()
+    else:
+        ds_summary = ""
+    delta_files = inc_base.get("deltaFiles") or []
+    unchanged_files = inc_base.get("unchangedFiles") or []
+    if not ds_summary:
+        ds_summary = (
+            f"Updated review from {from_short} to {to_short}: "
+            f"{len(delta_files)} file(s) changed, {len(unchanged_files)} file(s) unchanged, "
+            f"{resolved_count} prior finding(s) resolved, and {len(brand_new_delta_threads)} new finding(s) added."
+        )
+    final_cn["deltaSummary"] = {
+        "fromSha": from_sha,
+        "toSha": to_sha,
+        "rebased": rebased,
+        "deltaFilesCount": len(delta_files),
+        "unchangedFilesCount": len(unchanged_files),
+        "resolvedFindingsCount": resolved_count,
+        "newFindingsCount": len(brand_new_delta_threads),
+        "deltaCommits": inc_base.get("deltaCommits") or [],
+        "summary": ds_summary,
+    }
+    merged["cliffsNotes"] = final_cn
+    merged["incrementalFromSha"] = from_sha
+
+    if resolved_notes:
+        existing_dismissed = list(merged.get("dismissedChecks") or [])
+        merged["dismissedChecks"] = resolved_notes + existing_dismissed
+
+    return merged
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Publish synthesized Quasar session.")
     parser.add_argument("--input", required=True, help="Path to JSON file with synthesized CliffsNotes & findings")
     parser.add_argument("--workspace-dir", default=None, help="Window workspace directory that owns this Quasar session")
+    parser.add_argument("--session-dir", default=None, help="Isolated session staging directory (used by background Inbox watcher)")
     parser.add_argument("--comments-only", action="store_true", help="Publish in Comments-Only mode (skip study guide & reading tour)")
     parser.add_argument("--artifact-out", help="Optional path to also copy the generated cliffs_notes.md")
     args = parser.parse_args()
@@ -654,7 +875,10 @@ def main() -> None:
         payload["commentsOnly"] = True
 
     target_ws = args.workspace_dir or payload.get("workspaceDir") or payload.get("workspace_dir")
-    state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(target_ws)
+    state_dir, active_session_path, cliffs_notes_md_path = get_session_paths(
+        target_ws,
+        session_dir=args.session_dir,
+    )
     os.makedirs(state_dir, exist_ok=True)
 
     existing: Dict[str, Any] = {}
@@ -679,13 +903,45 @@ def main() -> None:
             pass
 
     merged = merge_session(existing, payload)
+
+    inc_base_candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(args.input)), "incremental_base.json"),
+        os.path.join(state_dir, "incremental_base.json"),
+    ]
+    for ib_path in dict.fromkeys(inc_base_candidates):
+        if os.path.isfile(ib_path):
+            try:
+                with open(ib_path, "r", encoding="utf-8") as ibf:
+                    inc_base = json.load(ibf)
+                cur_sha = str(((merged.get("pr") or {}).get("headSha") or ""))
+                if (
+                    isinstance(inc_base, dict)
+                    and inc_base.get("sessionId") == merged.get("sessionId")
+                    and (not cur_sha or inc_base.get("newHeadSha") == cur_sha)
+                ):
+                    merged = apply_incremental_merge(merged, payload, inc_base)
+            except Exception:
+                pass
+            break
+    for ib_path in dict.fromkeys(inc_base_candidates):
+        if os.path.isfile(ib_path):
+            try:
+                os.remove(ib_path)
+            except Exception:
+                pass
+
     merged["stateDir"] = state_dir
-    if not merged.get("windowId"):
+    is_isolated_session = bool(args.session_dir or os.environ.get("QUASAR_SESSION_DIR"))
+    if not merged.get("windowId") and not is_isolated_session:
         win_id, win_pid = resolve_target_window(state_dir, existing)
         if win_id:
             merged["windowId"] = win_id
         if win_pid:
             merged["windowPid"] = win_pid
+    elif is_isolated_session:
+        merged.pop("windowId", None)
+        merged.pop("windowPid", None)
+        merged.pop("workspaceDir", None)
     env_conv_id = (os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or "").strip()
     if env_conv_id:
         merged["conversationId"] = env_conv_id
@@ -705,6 +961,13 @@ def main() -> None:
     with open(cliffs_notes_md_path, "w", encoding="utf-8") as f:
         f.write(md_content)
     archive_review_session(merged, md_content)
+    if not is_isolated_session:
+        try:
+            from inbox_watcher import sync_published_session_to_inbox
+
+            sync_published_session_to_inbox(merged, md_content)
+        except Exception:
+            pass
 
     if args.artifact_out:
         os.makedirs(os.path.dirname(os.path.abspath(args.artifact_out)), exist_ok=True)

@@ -2,7 +2,7 @@
   "name": "codeium-dev",
   "displayName": "Quasar",
   "description": "Comprehension-first GitHub PR & local branch review tool. Features interactive CliffsNotes study guides with expandable code snippets, clickable SVG flowcharts, logical reading tours, native side-by-side diffs, inline Ask-Quasar comment threads, and 1-click GitHub Review publishing.",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "publisher": "codeium",
   "icon": "media/quasar-icon.png",
   "license": "MIT",
@@ -20,6 +20,7 @@
   "activationEvents": [
     "*",
     "onStartupFinished",
+    "onView:quasar.inboxTree",
     "onView:quasar.cliffsNotesTree",
     "onView:quasar.commentsTree",
     "onView:quasar.checksTree"
@@ -37,6 +38,11 @@
     },
     "views": {
       "quasar": [
+        {
+          "id": "quasar.inboxTree",
+          "name": "PR Inbox & Auto-Review",
+          "contextualTitle": "PR Inbox"
+        },
         {
           "id": "quasar.cliffsNotesTree",
           "name": "CliffsNotes & Reading Tour",
@@ -93,6 +99,48 @@
         "title": "Interactive Tutorial: Try Quasar in a Sandbox PR...",
         "category": "Quasar",
         "icon": "$(mortar-board)"
+      },
+      {
+        "command": "quasar.syncInboxNow",
+        "title": "Sync GitHub PR Inbox Now (0 Tokens)",
+        "category": "Quasar",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "quasar.configureInboxWatcher",
+        "title": "Configure PR Inbox & Background Auto-Review Settings...",
+        "category": "Quasar",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "quasar.toggleInboxDaemon",
+        "title": "Start / Pause Background Auto-Review Daemon",
+        "category": "Quasar",
+        "icon": "$(play)"
+      },
+      {
+        "command": "quasar.openInboxItem",
+        "title": "Open PR from Quasar Inbox",
+        "category": "Quasar",
+        "icon": "$(book)"
+      },
+      {
+        "command": "quasar.precomputeInboxItem",
+        "title": "Pre-Review PR in Background Now",
+        "category": "Quasar",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "quasar.markInboxItemReviewed",
+        "title": "Mark PR as Reviewed (Wait for Author Updates)",
+        "category": "Quasar",
+        "icon": "$(pass)"
+      },
+      {
+        "command": "quasar.dismissInboxItem",
+        "title": "Hide PR from Inbox",
+        "category": "Quasar",
+        "icon": "$(close)"
       },
       {
         "command": "quasar.overrideQuarantine",
@@ -488,9 +536,54 @@
           "command": "quasar.openPreferencesGuide",
           "when": "view == quasar.checksTree",
           "group": "navigation@3"
+        },
+        {
+          "command": "quasar.syncInboxNow",
+          "when": "view == quasar.inboxTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "quasar.configureInboxWatcher",
+          "when": "view == quasar.inboxTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "quasar.toggleInboxDaemon",
+          "when": "view == quasar.inboxTree",
+          "group": "1_daemon@1"
         }
       ],
       "view/item/context": [
+        {
+          "command": "quasar.precomputeInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-queued",
+          "group": "inline@1"
+        },
+        {
+          "command": "quasar.markInboxItemReviewed",
+          "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued)",
+          "group": "inline@2"
+        },
+        {
+          "command": "quasar.dismissInboxItem",
+          "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued || viewItem == inbox-item-quarantined)",
+          "group": "inline@3"
+        },
+        {
+          "command": "quasar.precomputeInboxItem",
+          "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued)",
+          "group": "1_inbox@1"
+        },
+        {
+          "command": "quasar.markInboxItemReviewed",
+          "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued)",
+          "group": "1_inbox@2"
+        },
+        {
+          "command": "quasar.dismissInboxItem",
+          "when": "view == quasar.inboxTree && (viewItem == inbox-item-ready || viewItem == inbox-item-queued || viewItem == inbox-item-quarantined)",
+          "group": "1_inbox@3"
+        },
         {
           "command": "quasar.resetReview",
           "when": "view == quasar.cliffsNotesTree && viewItem == pr-header",
