@@ -2106,6 +2106,12 @@ class InboxTreeProvider {
           icon: 'clock',
           expanded: false,
         },
+        {
+          key: 'deleted',
+          label: '🗑️ Deleted Reviews (Re-Queue or Re-Review)',
+          icon: 'trash',
+          expanded: true,
+        },
       ];
 
       for (const g of groupsDef) {
@@ -2163,6 +2169,13 @@ class InboxTreeProvider {
             it.role === 'author' ? 'Waiting on reviewers' : 'Reviewed • waiting on author';
           node.iconPath = new vscode.ThemeIcon('clock');
           node.contextValue = 'inbox-item-waiting';
+        } else if (it.inboxGroup === 'deleted') {
+          node.description = 'Deleted review • click to re-queue or re-review';
+          node.iconPath = new vscode.ThemeIcon(
+            'history',
+            new vscode.ThemeColor('descriptionForeground')
+          );
+          node.contextValue = 'inbox-item-deleted';
         } else {
           node.description = it.skipReason
             ? `${diffStats} • ${it.skipReason}`
@@ -7875,6 +7888,44 @@ function activate(context) {
         }
         return;
       }
+      if (res.wasDeleted) {
+        const delChoice = await vscode.window.showQuickPick(
+          [
+            {
+              label: '$(add) Re-Add to Auto-Review Queue',
+              description: 'Places this PR back in Queued so the background daemon can review it',
+              action: 'requeue',
+            },
+            {
+              label: '$(zap) Re-Review in Background Now',
+              description: 'Starts a clean background pre-review immediately without touching your editor',
+              action: 'background',
+            },
+            {
+              label: '$(git-pull-request) Open & Re-Review Live in This Window Now',
+              description: 'Fetches snapshots immediately and runs a clean live review here',
+              action: 'live',
+            },
+          ],
+          {
+            title: `Deleted Review: ${itemId}`,
+            placeHolder: 'Re-add this PR to the auto-review queue or re-review it now?',
+            ignoreFocusOut: true,
+          }
+        );
+        if (!delChoice) return;
+        if (delChoice.action === 'requeue') {
+          await vscode.commands.executeCommand('quasar.requeueInboxItem', { itemId });
+        } else if (delChoice.action === 'background') {
+          await vscode.commands.executeCommand('quasar.precomputeInboxItem', { itemId });
+        } else if (delChoice.action === 'live' && prUrl) {
+          await vscode.commands.executeCommand('quasar.loadPrFromUrl', {
+            url: prUrl,
+            forceNewReview: true,
+          });
+        }
+        return;
+      }
       // Not pre-computed yet — ask how the user wants to review it
       const choice = await vscode.window.showQuickPick(
         [
@@ -7926,6 +7977,16 @@ function activate(context) {
       if (!itemId) return;
       await runInboxWatcher(['--mark-reviewed', '--item-id', itemId], 15000);
       refreshInboxUI(false);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.requeueInboxItem', async (arg) => {
+      const itemId = resolveInboxItemId(arg);
+      if (!itemId) return;
+      await runInboxWatcher(['--requeue-item', '--item-id', itemId], 15000);
+      refreshInboxUI(false);
+      vscode.window.showInformationMessage(`➕ Re-added ${itemId} to the Quasar Auto-Review queue.`);
     })
   );
 

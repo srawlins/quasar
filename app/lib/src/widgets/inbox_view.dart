@@ -325,6 +325,11 @@ class InboxView extends StatelessWidget {
         label: '⏸️ WAITING ON AUTHOR / REVIEWERS',
         color: Color(0xFF8B949E),
       ),
+      (
+        key: 'deleted',
+        label: '🗑️ DELETED REVIEWS (RE-QUEUE OR RE-REVIEW)',
+        color: Color(0xFF8B949E),
+      ),
     ];
 
     return ListView(
@@ -563,12 +568,30 @@ class InboxView extends StatelessWidget {
                                       style: TextStyle(fontSize: 12),
                                     ),
                                   ),
-                                IconButton(
-                                  tooltip: 'Mark Reviewed',
-                                  onPressed: () =>
-                                      onItemAction(it, 'markReviewed'),
-                                  icon: const Icon(Icons.check, size: 16),
-                                ),
+                                if (it.inboxGroup == 'deleted') ...<Widget>[
+                                  FilledButton.tonal(
+                                    onPressed: () =>
+                                        onItemAction(it, 'requeue'),
+                                    child: const Text(
+                                      '➕ Re-Add to Queue',
+                                      style: TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                                  OutlinedButton(
+                                    onPressed: () => onPrecomputeItem(it),
+                                    child: const Text(
+                                      '⚡ Re-Review Now',
+                                      style: TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                                ],
+                                if (it.inboxGroup != 'deleted')
+                                  IconButton(
+                                    tooltip: 'Mark Reviewed',
+                                    onPressed: () =>
+                                        onItemAction(it, 'markReviewed'),
+                                    icon: const Icon(Icons.check, size: 16),
+                                  ),
                                 IconButton(
                                   tooltip: 'Hide from Inbox',
                                   onPressed: () => onItemAction(it, 'dismiss'),

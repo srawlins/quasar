@@ -1735,6 +1735,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         { key: 'quarantined', title: '🚨 Quarantined by Security Gate', cls: 'text-red-300' },
         { key: 'queued', title: '📋 Queued in GitHub (Not Pre-Reviewed Yet)', cls: 'text-[var(--q-fg)]' },
         { key: 'waiting', title: '⏸️ Waiting on Author / Reviewers', cls: 'text-[var(--q-muted)]' },
+        { key: 'deleted', title: '🗑️ Deleted Reviews (Re-Queue or Re-Review)', cls: 'text-[var(--q-muted)]' },
       ];
 
       const groupsHtml = groupsDef.map((g) => {
@@ -1758,8 +1759,12 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               <div class="flex items-center gap-1.5 flex-wrap">
                 ${isReady ? `<button class="q-btn q-btn-success" onclick="activateInboxItem('${esc(it.id)}')">📖 Open in 0s</button>` : ''}
                 ${it.inboxGroup === 'queued' ? `<button class="q-btn q-btn-primary" onclick="precomputeInboxItem('${esc(it.id)}')">⚡ Pre-Review</button>` : ''}
+                ${it.inboxGroup === 'deleted' ? `
+                  <button class="q-btn q-btn-primary" onclick="inboxItemAction('${esc(it.id)}', 'requeue')">➕ Re-Add to Queue</button>
+                  <button class="q-btn" onclick="precomputeInboxItem('${esc(it.id)}')">⚡ Re-Review Now</button>
+                ` : ''}
                 ${it.url ? `<a href="${esc(it.url)}" target="_blank" class="q-btn">🔗 GitHub</a>` : ''}
-                <button class="q-btn" onclick="inboxItemAction('${esc(it.id)}', 'markReviewed')" title="Mark Reviewed (wait for next commit)">✓ Reviewed</button>
+                ${it.inboxGroup !== 'deleted' ? `<button class="q-btn" onclick="inboxItemAction('${esc(it.id)}', 'markReviewed')" title="Mark Reviewed (wait for next commit)">✓ Reviewed</button>` : ''}
                 <button class="q-btn" onclick="inboxItemAction('${esc(it.id)}', 'dismiss')" title="Hide from Inbox">✕</button>
               </div>
             </div>`;
@@ -4293,8 +4298,15 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                         st["items"][item_id]["dismissed"] = True
                         st["items"][item_id]["unread"] = False
                         st["items"][item_id].pop("analyzedFingerprint", None)
+                    elif act == "requeue":
+                        self._send_json(200, inbox_watcher.requeue_inbox_item(item_id))
+                        return
                     elif act == "delete":
-                        inbox_watcher.delete_stored_review(item_id, include_active_workspace=True, dismiss_in_inbox=True)
+                        inbox_watcher.delete_stored_review(
+                            item_id,
+                            include_active_workspace=True,
+                            repopulate_as_deleted_in_inbox=True,
+                        )
                         self._send_json(200, inbox_watcher.build_inbox_payload())
                         return
                     inbox_watcher.save_inbox_state(st)
@@ -4312,7 +4324,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                     res = inbox_watcher.delete_stored_review(
                         target_sid,
                         include_active_workspace=bool(data.get("includeActive", True)),
-                        dismiss_in_inbox=True,
+                        repopulate_as_deleted_in_inbox=True,
                     )
                 else:
                     res = inbox_watcher.prune_old_reviews(

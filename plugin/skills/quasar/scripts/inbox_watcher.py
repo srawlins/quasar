@@ -447,10 +447,16 @@ def sync_github_queue(
         item_dir = os.path.join(INBOX_ITEMS_DIR, item_id)
         has_ready_session = os.path.isfile(os.path.join(item_dir, "active_session.json"))
 
-        updated_since_review = bool(prev_reviewed_sha and prev_reviewed_sha != head_sha)
+        prev_deleted_sha = str(existing.get("deletedAtSha") or "")
+        updated_since_review = bool(
+            (prev_reviewed_sha and prev_reviewed_sha != head_sha)
+            or (prev_status == "deleted" and prev_deleted_sha and prev_deleted_sha != head_sha)
+        )
 
         if prev_status == "analyzing":
             new_status = "analyzing"
+        elif prev_status == "deleted":
+            new_status = "deleted"
         elif bucket_hint == "waiting_on_reviewers" and prev_analyzed_fp != fingerprint:
             new_status = "waiting_on_reviewers"
         elif prev_analyzed_fp == fingerprint and has_ready_session and prev_status in ("ready", "quarantined"):
@@ -1559,6 +1565,7 @@ def activate_inbox_item(
             "ok": True,
             "instant": False,
             "needsLiveReview": True,
+            "wasDeleted": bool(item.get("status") == "deleted"),
             "itemId": item_id,
             "prUrl": item.get("url"),
             "effort": load_inbox_settings().get("effort", "high"),
@@ -1617,6 +1624,8 @@ def build_inbox_payload() -> Dict[str, Any]:
             group = "author_action_needed"
         elif status == "ready":
             group = "ready_to_review"
+        elif status == "deleted":
+            group = "deleted"
         elif status in ("waiting_on_author", "waiting_on_reviewers"):
             group = "waiting"
         else:
@@ -1631,6 +1640,7 @@ def build_inbox_payload() -> Dict[str, Any]:
         "quarantined": 3,
         "queued": 4,
         "waiting": 5,
+        "deleted": 6,
     }
     items_list.sort(key=lambda x: str(x.get("updatedAt") or ""), reverse=True)
     items_list.sort(key=lambda x: group_order.get(str(x.get("inboxGroup")), 9))
@@ -1645,6 +1655,7 @@ def build_inbox_payload() -> Dict[str, Any]:
     )
     analyzing_count = sum(1 for i in items_list if i.get("inboxGroup") == "in_progress")
     queued_count = sum(1 for i in items_list if i.get("inboxGroup") == "queued")
+    deleted_count = sum(1 for i in items_list if i.get("inboxGroup") == "deleted")
 
     max_day = int(settings.get("maxReviewsPerDay") or 0)
     run_today = int(state.get("reviewsRunToday") or 0)
@@ -1669,6 +1680,7 @@ def build_inbox_payload() -> Dict[str, Any]:
             "unreadReady": unread_ready_count,
             "analyzing": analyzing_count,
             "queued": queued_count,
+            "deleted": deleted_count,
         },
         "items": items_list,
     }
@@ -1890,10 +1902,12 @@ def list_stored_reviews() -> List[Dict[str, Any]]:
 def delete_stored_review(
     review_id: str,
     include_active_workspace: bool = True,
-    dismiss_in_inbox: bool = True,
+    repopulate_as_deleted_in_inbox: bool = True,
 ) -> Dict[str, Any]:
     """Permanently deletes a stored review across `history/`, `inbox/items/`, `snapshots/`,
     and (when `include_active_workspace=True`) any active workspace holding that session.
+    Open GitHub PRs remain visible in the Auto-Review Inbox under `deleted` (`🗑️ Deleted Reviews`)
+    so the user can re-add them to the queue or re-review them in 1 click without auto-burning tokens.
     """
     clean_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", (review_id or "").strip()).strip("-")
     if not clean_id or "/" in clean_id or ".." in clean_id:
@@ -1901,6 +1915,28 @@ def delete_stored_review(
 
     freed_bytes = 0
     removed_paths: List[str] = []
+    captured_pr_meta: Optional[Dict[str, Any]] = None
+
+    def _capture_pr_from_file(json_path: str) -> None:
+        nonlocal captured_pr_meta
+        if captured_pr_meta is not None or not os.path.isfile(json_path):
+            return
+        try:
+            s_obj = json.load(open(json_path, "r", encoding="utf-8"))
+            pr = s_obj.get("pr") if isinstance(s_obj, dict) else None
+            if (
+                isinstance(pr, dict)
+                and pr.get("owner")
+                and str(pr.get("owner")) != "local"
+                and pr.get("repo")
+                and int(pr.get("number") or 0) > 0
+            ):
+                captured_pr_meta = dict(pr)
+        except Exception:
+            pass
+
+    _capture_pr_from_file(os.path.join(HISTORY_STATE_DIR, clean_id, "session.json"))
+    _capture_pr_from_file(os.path.join(INBOX_ITEMS_DIR, clean_id, "active_session.json"))
 
     def _rm_dir(d_path: str) -> None:
         nonlocal freed_bytes
@@ -1919,35 +1955,12 @@ def delete_stored_review(
                 try:
                     s_obj = json.load(open(cand_json, "r", encoding="utf-8"))
                     if _canonical_review_id(s_obj, entry) == clean_id:
+                        _capture_pr_from_file(cand_json)
                         _rm_dir(cand_dir)
                 except Exception:
                     pass
 
-    # 2. Inbox staged item directory + state.json update
-    _rm_dir(os.path.join(INBOX_ITEMS_DIR, clean_id))
-    if os.path.isfile(INBOX_STATE_PATH):
-        st = load_inbox_state()
-        items = st.get("items") or {}
-        if clean_id in items:
-            if dismiss_in_inbox and items[clean_id].get("openInQueue", True):
-                items[clean_id]["dismissed"] = True
-                items[clean_id]["unread"] = False
-                items[clean_id]["status"] = "queued"
-                items[clean_id].pop("analyzedFingerprint", None)
-                items[clean_id].pop("tldr", None)
-                items[clean_id].pop("findingsCount", None)
-            else:
-                items.pop(clean_id, None)
-            save_inbox_state(st)
-
-    # 3. Snapshots (`snapshots/<clean_id>` and `snapshots/<clean_id>-*`)
-    snaps_root = os.path.join(REVIEW_STATE_DIR, "snapshots")
-    if os.path.isdir(snaps_root):
-        for sname in list(os.listdir(snaps_root)):
-            if sname == clean_id or sname.startswith(f"{clean_id}-"):
-                _rm_dir(os.path.join(snaps_root, sname))
-
-    # 4. Active workspaces holding this session
+    # 2. Active workspaces holding this session (capture PR meta before deleting)
     if include_active_workspace and os.path.isdir(WORKSPACES_STATE_DIR):
         for entry in list(os.listdir(WORKSPACES_STATE_DIR)):
             ws_dir = os.path.join(WORKSPACES_STATE_DIR, entry)
@@ -1959,6 +1972,7 @@ def delete_stored_review(
             except Exception:
                 continue
             if _canonical_review_id(s_obj) == clean_id:
+                _capture_pr_from_file(ws_sess)
                 for fn in (
                     "active_session.json",
                     "cliffs_notes.md",
@@ -1979,12 +1993,94 @@ def delete_stored_review(
                         except Exception:
                             pass
 
+    # 3. Inbox staged item directory + repopulate as `status = "deleted"` in state.json
+    _rm_dir(os.path.join(INBOX_ITEMS_DIR, clean_id))
+    if repopulate_as_deleted_in_inbox or os.path.isfile(INBOX_STATE_PATH):
+        st = load_inbox_state()
+        items = st.setdefault("items", {})
+        if clean_id in items:
+            if repopulate_as_deleted_in_inbox and items[clean_id].get("openInQueue", True):
+                it = items[clean_id]
+                it["dismissed"] = False
+                it["unread"] = False
+                it["status"] = "deleted"
+                it["deletedAt"] = _now_iso()
+                it["deletedAtSha"] = str(it.get("headSha") or "")
+                for k in (
+                    "analyzedFingerprint",
+                    "tldr",
+                    "findingsCount",
+                    "blockingCount",
+                    "uncertainCount",
+                    "actionableGhCommentsCount",
+                ):
+                    it.pop(k, None)
+            else:
+                items.pop(clean_id, None)
+            save_inbox_state(st)
+        elif (
+            repopulate_as_deleted_in_inbox
+            and captured_pr_meta is not None
+            and str(captured_pr_meta.get("state") or "open").lower() != "closed"
+        ):
+            own = str(captured_pr_meta.get("owner") or "")
+            rep = str(captured_pr_meta.get("repo") or "")
+            num = int(captured_pr_meta.get("number") or 0)
+            h_sha = str(captured_pr_meta.get("headSha") or "")
+            items[clean_id] = {
+                "id": clean_id,
+                "owner": own,
+                "repo": rep,
+                "number": num,
+                "title": str(captured_pr_meta.get("title") or f"{own}/{rep}#{num}"),
+                "url": str(captured_pr_meta.get("url") or f"https://github.com/{own}/{rep}/pull/{num}"),
+                "author": str(captured_pr_meta.get("author") or ""),
+                "role": "author" if captured_pr_meta.get("isOwnedByUser") else "reviewer",
+                "headSha": h_sha,
+                "currentFingerprint": h_sha,
+                "additions": int(captured_pr_meta.get("additions") or 0),
+                "deletions": int(captured_pr_meta.get("deletions") or 0),
+                "changedFilesCount": int(captured_pr_meta.get("changedFilesCount") or 0),
+                "updatedAt": _now_iso(),
+                "openInQueue": True,
+                "dismissed": False,
+                "unread": False,
+                "status": "deleted",
+                "deletedAt": _now_iso(),
+                "deletedAtSha": h_sha,
+                "sessionDir": os.path.join(INBOX_ITEMS_DIR, clean_id),
+            }
+            save_inbox_state(st)
+
+    # 4. Snapshots (`snapshots/<clean_id>` and `snapshots/<clean_id>-*`)
+    snaps_root = os.path.join(REVIEW_STATE_DIR, "snapshots")
+    if os.path.isdir(snaps_root):
+        for sname in list(os.listdir(snaps_root)):
+            if sname == clean_id or sname.startswith(f"{clean_id}-"):
+                _rm_dir(os.path.join(snaps_root, sname))
+
     return {
         "ok": True,
         "deletedId": clean_id,
         "removedPathsCount": len(removed_paths),
         "freedBytes": freed_bytes,
     }
+
+
+def requeue_inbox_item(item_id: str) -> Dict[str, Any]:
+    """Moves a `deleted` or `dismissed` Inbox PR back into `queued` so the auto-review daemon can review it."""
+    st = load_inbox_state()
+    iid = (item_id or "").strip()
+    if iid in st.get("items", {}):
+        it = st["items"][iid]
+        it["status"] = "queued"
+        it["dismissed"] = False
+        it["openInQueue"] = True
+        it.pop("deletedAt", None)
+        it.pop("deletedAtSha", None)
+        it.pop("reviewedHeadSha", None)
+        save_inbox_state(st)
+    return build_inbox_payload()
 
 
 def prune_old_reviews(
@@ -2006,7 +2102,7 @@ def prune_old_reviews(
             res = delete_stored_review(
                 rec["id"],
                 include_active_workspace=not keep_active_workspaces,
-                dismiss_in_inbox=True,
+                repopulate_as_deleted_in_inbox=True,
             )
             if res.get("ok"):
                 deleted_ids.append(rec["id"])
@@ -2064,6 +2160,7 @@ def main() -> None:
     parser.add_argument("--activate-session", default="", help="Activate any completed session JSON path into the workspace in 0s")
     parser.add_argument("--check-session-freshness", action="store_true", help="Check if the workspace's active_session.json is behind the PR's latest GitHub HEAD SHA")
     parser.add_argument("--mark-reviewed", action="store_true", help="Mark an Inbox item as reviewed at its current HEAD SHA")
+    parser.add_argument("--requeue-item", action="store_true", help="Re-add a deleted/dismissed Inbox PR back into the auto-review queue")
     parser.add_argument("--dismiss-item", action="store_true", help="Dismiss/hide an Inbox item and clean up its staged files")
     parser.add_argument("--list-reviews", action="store_true", help="List all stored reviews across History, Inbox, and Workspaces")
     parser.add_argument("--delete-review", default="", help="Permanently delete a stored review ID across History, Inbox, Snapshots, and Workspaces")
@@ -2211,9 +2308,13 @@ def main() -> None:
         res = delete_stored_review(
             args.delete_review.strip(),
             include_active_workspace=True,
-            dismiss_in_inbox=True,
+            repopulate_as_deleted_in_inbox=True,
         )
         print(json.dumps(res, indent=2))
+        return
+
+    if args.requeue_item and args.item_id:
+        print(json.dumps(requeue_inbox_item(args.item_id.strip()), indent=2))
         return
 
     if args.delete_all_reviews or args.prune_days is not None:

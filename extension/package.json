@@ -137,6 +137,12 @@
         "icon": "$(pass)"
       },
       {
+        "command": "quasar.requeueInboxItem",
+        "title": "Re-Add PR to Auto-Review Queue",
+        "category": "Quasar",
+        "icon": "$(add)"
+      },
+      {
         "command": "quasar.dismissInboxItem",
         "title": "Hide PR from Inbox",
         "category": "Quasar",
@@ -571,6 +577,36 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "quasar.requeueInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-deleted",
+          "group": "inline@1"
+        },
+        {
+          "command": "quasar.precomputeInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-deleted",
+          "group": "inline@2"
+        },
+        {
+          "command": "quasar.dismissInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-deleted",
+          "group": "inline@3"
+        },
+        {
+          "command": "quasar.requeueInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-deleted",
+          "group": "1_inbox@1"
+        },
+        {
+          "command": "quasar.precomputeInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-deleted",
+          "group": "1_inbox@2"
+        },
+        {
+          "command": "quasar.dismissInboxItem",
+          "when": "view == quasar.inboxTree && viewItem == inbox-item-deleted",
+          "group": "1_inbox@3"
+        },
         {
           "command": "quasar.precomputeInboxItem",
           "when": "view == quasar.inboxTree && viewItem == inbox-item-queued",
