@@ -2,6 +2,14 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.3] - 2026-11-18
+
+### Fixed
+- **Restore Direct Antigravity IDE Sidebar Chat Dispatch (`daemon/hub_*.json` Discovery)**:
+  - Updated `discoverAntigravityLsEnv()` (`extension.js`) and `discover_ls_env()` (`server.py`) to read live `~/.gemini/antigravity/daemon/hub_*.json` metadata (where Antigravity 2.0 `agy --hub` writes `httpPort` and `csrfToken` instead of passing `--csrf_token` on the CLI) and prioritize exact workspace path matches over substring matches—restoring direct dispatch to the visible IDE Sidebar Chat instead of falling back to headless `agy --print`.
+- **Prevent Premature `⚠️ Check Fix` During Long Thinking Turns**:
+  - Updated `inspectConversationFixState()` (`extension.js`) to remain `'working'` while an active `agy` CLI job is running and raised the thinking-turn idle timeout from 90s to 240s.
+
 ## [1.7.2] - 2026-11-18
 
 ### Fixed

@@ -118,8 +118,57 @@ def discover_ls_env(workspace_dir: Optional[str] = None) -> Dict[str, str]:
     if env.get("ANTIGRAVITY_LS_ADDRESS") and env.get("ANTIGRAVITY_CSRF_TOKEN"):
         return env
     try:
+        # Load live daemon/hub_*.json metadata (Antigravity 2.0 writes csrfToken & httpPort here)
+        hub_by_pid: Dict[int, Tuple[int, str]] = {}
+        hub_by_port: Dict[int, Tuple[int, str]] = {}
+        all_live_hubs: List[Tuple[int, str]] = []
+        gemini_root = os.path.expanduser("~/.gemini")
+        if os.path.isdir(gemini_root):
+            daemon_dirs = [os.path.join(gemini_root, "antigravity", "daemon")]
+            try:
+                for entry in os.listdir(gemini_root):
+                    d = os.path.join(gemini_root, entry, "daemon")
+                    if d not in daemon_dirs and os.path.isdir(d):
+                        daemon_dirs.append(d)
+            except Exception:
+                pass
+            for daemon_dir in daemon_dirs:
+                if not os.path.isdir(daemon_dir):
+                    continue
+                try:
+                    hub_files = [
+                        os.path.join(daemon_dir, f)
+                        for f in os.listdir(daemon_dir)
+                        if f.startswith("hub_") and f.endswith(".json")
+                    ]
+                    hub_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                except Exception:
+                    continue
+                for hf in hub_files:
+                    try:
+                        with open(hf, "r", encoding="utf-8") as f:
+                            hub = json.load(f)
+                        h_pid = hub.get("pid")
+                        h_port = hub.get("httpPort")
+                        h_csrf = str(hub.get("csrfToken") or "").strip()
+                        if not h_port or not h_csrf:
+                            continue
+                        h_port_int = int(h_port)
+                        if h_pid is not None:
+                            h_pid_int = int(h_pid)
+                            try:
+                                os.kill(h_pid_int, 0)
+                            except OSError:
+                                continue
+                            hub_by_pid[h_pid_int] = (h_port_int, h_csrf)
+                        hub_by_port[h_port_int] = (h_port_int, h_csrf)
+                        all_live_hubs.append((h_port_int, h_csrf))
+                    except Exception:
+                        continue
+
         ps_out = subprocess.check_output(["/bin/ps", "-axww", "-o", "pid=,command="], text=True, timeout=3)
         norm_ws = re.sub(r"[^a-zA-Z0-9]", "_", workspace_dir or "")
+        clean_target_ws = (workspace_dir or "").rstrip("/")
         procs: List[Tuple[int, int, str, Optional[int]]] = []
         my_pid = os.getpid()
         for raw in ps_out.splitlines():
@@ -133,29 +182,39 @@ def discover_ls_env(workspace_dir: Optional[str] = None) -> Dict[str, str]:
             if pid == my_pid:
                 continue
             cmd = m_pid.group(2)
+            if "agentapi" in cmd:
+                continue
             is_ls = "language_server" in cmd
-            is_agy = "/bin/agy" in cmd or " agy " in cmd or cmd.startswith("agy ")
+            is_agy = ("/bin/agy" in cmd or " agy " in cmd or cmd.startswith("agy ")) and "--hub" in cmd
             if not is_ls and not is_agy:
                 continue
-            if "--csrf_token" not in cmd and "--csrf-token" not in cmd:
-                continue
-            m_csrf = re.search(r"--csrf[-_]token[=\s]+(\S+)", cmd)
-            if not m_csrf:
-                continue
-            csrf = m_csrf.group(1)
-            is_lsp = "--enable_lsp" in cmd or "--enable-lsp" in cmd
-            m_ws = re.search(r"--(?:workspace[-_]id|add-dir)[=\s]+(\S+)", cmd)
-            ws_id = m_ws.group(1) if m_ws else ""
-            matches_ws = bool(
-                workspace_dir
-                and (
-                    (norm_ws and norm_ws in ws_id)
-                    or (ws_id and (workspace_dir in ws_id or ws_id in workspace_dir))
-                )
-            )
             m_hub = re.search(r"--hub[-_]port[=\s]+(\d+)", cmd)
             hub_port = int(m_hub.group(1)) if m_hub else None
-            score = (0 if matches_ws else 20) + (10 if is_lsp else 0)
+            m_csrf = re.search(r"--csrf[-_]token[=\s]+(\S+)", cmd)
+            csrf = m_csrf.group(1) if m_csrf else ""
+            if not csrf and is_agy:
+                hub_info = hub_by_pid.get(pid) or (hub_by_port.get(hub_port) if hub_port else None)
+                if hub_info:
+                    if not hub_port:
+                        hub_port = hub_info[0]
+                    csrf = hub_info[1]
+            if not csrf:
+                continue
+            is_lsp = "--enable_lsp" in cmd or "--enable-lsp" in cmd
+            m_ws = re.search(r"--(?:workspace[-_]id|add-dir)[=\s]+(\S+)", cmd)
+            ws_id = (m_ws.group(1) if m_ws else "").rstrip("/")
+            exact_ws = bool(clean_target_ws and ws_id and ws_id == clean_target_ws)
+            matches_ws = bool(
+                exact_ws
+                or (
+                    clean_target_ws
+                    and (
+                        (norm_ws and norm_ws in ws_id)
+                        or (ws_id and (clean_target_ws in ws_id or ws_id in clean_target_ws))
+                    )
+                )
+            )
+            score = (0 if exact_ws else (5 if matches_ws else 20)) + (10 if is_lsp else 0)
             procs.append((score, pid, csrf, hub_port))
         procs.sort(key=lambda x: x[0])
         lsof_bin = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else "lsof"
@@ -188,6 +247,10 @@ def discover_ls_env(workspace_dir: Optional[str] = None) -> Dict[str, str]:
                     return env
             except Exception:
                 continue
+        if all_live_hubs:
+            env["ANTIGRAVITY_LS_ADDRESS"] = f"localhost:{all_live_hubs[0][0]}"
+            env["ANTIGRAVITY_CSRF_TOKEN"] = all_live_hubs[0][1]
+            return env
     except Exception:
         pass
     return env

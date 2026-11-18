@@ -982,6 +982,61 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
   }
 
   try {
+    // Load live daemon/hub_*.json metadata (Antigravity 2.0 writes csrfToken & httpPort here instead of CLI args)
+    const hubByPid = new Map();
+    const hubByPort = new Map();
+    const allLiveHubs = [];
+    const geminiRoot = path.join(os.homedir(), '.gemini');
+    if (fs.existsSync(geminiRoot)) {
+      const daemonDirs = [path.join(geminiRoot, 'antigravity', 'daemon')];
+      try {
+        for (const entry of fs.readdirSync(geminiRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const d = path.join(geminiRoot, entry.name, 'daemon');
+          if (!daemonDirs.includes(d) && fs.existsSync(d)) daemonDirs.push(d);
+        }
+      } catch (_) {}
+
+      for (const daemonDir of daemonDirs) {
+        if (!fs.existsSync(daemonDir)) continue;
+        let hubFiles = [];
+        try {
+          hubFiles = fs
+            .readdirSync(daemonDir)
+            .filter((f) => f.startsWith('hub_') && f.endsWith('.json'))
+            .map((f) => path.join(daemonDir, f));
+        } catch (_) {
+          continue;
+        }
+        hubFiles.sort((a, b) => {
+          try {
+            return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+          } catch (_) {
+            return 0;
+          }
+        });
+        for (const hf of hubFiles) {
+          try {
+            const hub = JSON.parse(fs.readFileSync(hf, 'utf8'));
+            const hPid = hub && hub.pid != null ? Number(hub.pid) : null;
+            const hPort = hub && hub.httpPort != null ? Number(hub.httpPort) : null;
+            const hCsrf = hub && hub.csrfToken ? String(hub.csrfToken) : '';
+            if (!hPort || !hCsrf) continue;
+            if (hPid) {
+              try {
+                process.kill(hPid, 0);
+              } catch (_) {
+                continue; // Stale hub file for dead PID
+              }
+              hubByPid.set(hPid, { httpPort: hPort, csrfToken: hCsrf, pid: hPid });
+            }
+            hubByPort.set(hPort, { httpPort: hPort, csrfToken: hCsrf, pid: hPid });
+            allLiveHubs.push({ httpPort: hPort, csrfToken: hCsrf, pid: hPid });
+          } catch (_) {}
+        }
+      }
+    }
+
     const psOut = execFileSync('/bin/ps', ['-axww', '-o', 'pid=,command='], {
       encoding: 'utf8',
       timeout: 3000,
@@ -990,6 +1045,7 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
     const normWs = targetWorkspaceRoot
       ? targetWorkspaceRoot.replace(/[^a-zA-Z0-9]/g, '_')
       : '';
+    const cleanTargetWs = targetWorkspaceRoot ? targetWorkspaceRoot.replace(/\/+$/, '') : '';
 
     for (const rawLine of psOut.split('\n')) {
       const line = rawLine.trim();
@@ -999,32 +1055,56 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
       const pid = Number(pidMatch[1]);
       if (pid === process.pid) continue;
       const cmd = pidMatch[2];
+      if (cmd.includes('agentapi')) continue;
 
       const isLs = cmd.includes('language_server');
-      const isAgy = cmd.includes('/bin/agy') || cmd.includes(' agy ') || cmd.startsWith('agy ');
+      const isAgy =
+        (cmd.includes('/bin/agy') || cmd.includes(' agy ') || cmd.startsWith('agy ')) &&
+        cmd.includes('--hub');
       if (!isLs && !isAgy) continue;
-      if (!cmd.includes('--csrf_token') && !cmd.includes('--csrf-token')) continue;
 
+      const hubPortMatch = cmd.match(/--hub[-_]port[=\s]+(\d+)/);
+      let hubPort = hubPortMatch ? Number(hubPortMatch[1]) : null;
       const csrfMatch = cmd.match(/--csrf[-_]token[=\s]+([^\s]+)/);
-      if (!csrfMatch) continue;
-      const csrfToken = csrfMatch[1];
+      let csrfToken = csrfMatch ? csrfMatch[1] : '';
+
+      if (!csrfToken && isAgy) {
+        const hubInfo = hubByPid.get(pid) || (hubPort ? hubByPort.get(hubPort) : null);
+        if (hubInfo) {
+          csrfToken = hubInfo.csrfToken;
+          if (!hubPort && hubInfo.httpPort) hubPort = hubInfo.httpPort;
+        }
+      }
+      if (!csrfToken) continue;
+
       const isLspOnly = cmd.includes('--enable_lsp') || cmd.includes('--enable-lsp');
       const wsMatch = cmd.match(/--(?:workspace[-_]id|add-dir)[=\s]+([^\s]+)/);
-      const workspaceId = wsMatch ? wsMatch[1] : '';
+      const workspaceId = wsMatch ? wsMatch[1].replace(/\/+$/, '') : '';
+      const exactTargetWs = Boolean(cleanTargetWs && workspaceId && workspaceId === cleanTargetWs);
       const matchesTargetWs = Boolean(
-        targetWorkspaceRoot &&
-        ((normWs && workspaceId.includes(normWs)) ||
-          (workspaceId && (targetWorkspaceRoot.includes(workspaceId) || workspaceId.includes(targetWorkspaceRoot))))
+        exactTargetWs ||
+          (cleanTargetWs &&
+            ((normWs && workspaceId.includes(normWs)) ||
+              (workspaceId &&
+                (cleanTargetWs.includes(workspaceId) || workspaceId.includes(cleanTargetWs)))))
       );
-      const hubPortMatch = cmd.match(/--hub[-_]port[=\s]+(\d+)/);
-      const hubPort = hubPortMatch ? Number(hubPortMatch[1]) : null;
-      procs.push({ pid, csrfToken, isLspOnly, workspaceId, matchesTargetWs, hubPort });
+      procs.push({
+        pid,
+        csrfToken,
+        isLspOnly,
+        workspaceId,
+        exactTargetWs,
+        matchesTargetWs,
+        hubPort,
+      });
     }
 
-    // Prioritize workspace-matching server, then main agent server (no --enable_lsp)
+    // Prioritize exact workspace match, then partial workspace match, then main agent server
     procs.sort((a, b) => {
-      const scoreA = (a.matchesTargetWs ? 0 : 20) + (!a.isLspOnly ? 0 : 5);
-      const scoreB = (b.matchesTargetWs ? 0 : 20) + (!b.isLspOnly ? 0 : 5);
+      const scoreA =
+        (a.exactTargetWs ? 0 : a.matchesTargetWs ? 5 : 20) + (!a.isLspOnly ? 0 : 10);
+      const scoreB =
+        (b.exactTargetWs ? 0 : b.matchesTargetWs ? 5 : 20) + (!b.isLspOnly ? 0 : 10);
       return scoreA - scoreB;
     });
 
@@ -1063,6 +1143,13 @@ function discoverAntigravityLsEnv(targetWorkspaceRoot = null) {
           };
         }
       } catch (_) {}
+    }
+
+    if (allLiveHubs.length > 0) {
+      return {
+        ANTIGRAVITY_LS_ADDRESS: `localhost:${allLiveHubs[0].httpPort}`,
+        ANTIGRAVITY_CSRF_TOKEN: allLiveHubs[0].csrfToken,
+      };
     }
   } catch (_) {}
 
@@ -1286,7 +1373,8 @@ function inspectConversationFixState(convId) {
 
     const lastStep = parsedSteps[parsedSteps.length - 1];
     if (lastStep.type !== 'PLANNER_RESPONSE') {
-      return ageMs < 90000 ? 'working' : 'idle';
+      if (activeAgyCliJobsCount > 0) return 'working';
+      return ageMs < 240000 ? 'working' : 'idle';
     }
     if (ageMs < 4000) {
       return 'working';
