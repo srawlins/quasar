@@ -2,6 +2,13 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.4] - 2026-11-18
+
+### Fixed
+- **Try `agentapi new-conversation` First Against Antigravity 2.0 `agy --hub` Without Requiring `ANTIGRAVITY_PROJECT_ID`**:
+  - Removed the legacy `if (!ANTIGRAVITY_PROJECT_ID)` skip in `extension.js` (`startNewConversation`) and `server.py` (`dispatch_to_agent`) that bypassed `agentapi new-conversation` and fell through to the deprecated `StartCascade` RPC and headless `agy --print`. New conversations now dispatch directly into the visible Antigravity IDE Sidebar Chat again.
+  - Added unit tests in `tests/test_hub_dispatch.py` covering `daemon/hub_*.json` discovery, exact workspace hub matching, and `agentapi new-conversation` dispatch without `ANTIGRAVITY_PROJECT_ID`.
+
 ## [1.7.3] - 2026-11-18
 
 ### Fixed

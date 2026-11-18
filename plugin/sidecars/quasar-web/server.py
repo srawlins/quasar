@@ -855,14 +855,7 @@ def dispatch_to_agent(
             "stdout": json.dumps({"conversationId": new_cid}),
         }
 
-    if not project_id:
-        try:
-            return _start_cascade_via_ls_http()
-        except Exception as http_err:
-            last_http_err = str(http_err)
-    else:
-        last_http_err = ""
-
+    last_http_err = ""
     try:
         proc = subprocess.run(
             cmd_prefix + ["new-conversation", f"--title={title}", prompt],
@@ -884,11 +877,10 @@ def dispatch_to_agent(
                 "workspaceDir": resolved_ws,
                 "stdout": out_str,
             }
-        if project_id:
-            try:
-                return _start_cascade_via_ls_http()
-            except Exception:
-                pass
+        try:
+            return _start_cascade_via_ls_http()
+        except Exception as http_err:
+            last_http_err = str(http_err)
         # Fallback to direct standalone Antigravity CLI (`agy`) when no IDE server is running!
         cli_res = dispatch_via_agy_cli(
             prompt=prompt,

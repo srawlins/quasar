@@ -1834,14 +1834,9 @@ function sendPromptToQuasar(prompt, title = 'Quasar', targetWorkspaceRoot = null
           });
       };
 
-      // When ANTIGRAVITY_PROJECT_ID is not set (standard IDE workspace mode),
-      // `agentapi new-conversation` always fails with `project_id is required when providing project_env_config`.
-      // Use the direct Connect-RPC StartCascade + SendUserCascadeMessage flow with workspaceUris.
-      if (!env.ANTIGRAVITY_PROJECT_ID) {
-        tryDirectHttpFallback(null);
-        return;
-      }
-
+      // Always try `agentapi new-conversation` first (works directly against Antigravity 2.0 `agy --hub`
+      // without needing ANTIGRAVITY_PROJECT_ID), then fall back to legacy Connect-RPC StartCascade,
+      // and finally to standalone headless `agy` CLI.
       runAgentApi(newConvArgs, (newRes) => {
         if (newRes.success) {
           const newCid = persistNewConvId(newRes.stdout);
