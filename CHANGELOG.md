@@ -2,6 +2,13 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.2] - 2026-11-18
+
+### Fixed
+- **Headless `agy` CLI Fix Agent Aborting on Inspection/Build Commands & Stuck `⏳ Fixing...` State**:
+  - Switched headless `agy --print` fix runs in `extension.js` and `server.py` from `--mode=accept-edits` to `--mode=auto` and expanded `allowRules` with standard read-only and build/test commands (`ls`, `find`, `rg`, `grep`, `cat`, `head`, `tail`, `wc`, `diff`, `swift`, `xcodebuild`, `gradle`, `./gradlew`, `cmake`, `mvn`, `bazel`, `ruby`, `bundle`, `pod`, etc.) so fix agents don't abort mid-run before applying edits.
+  - Added automatic `manage_fixes.py --reconcile-fixes --agent-idle` when `allowRepoEdits` CLI jobs exit and added a stale-transcript guard (>5m with no active CLI job) in `inspectConversationFixState()` so aborted tool calls never stay stuck on `⏳ Fixing with Agent Now`.
+
 ## [1.7.1] - 2026-11-17
 
 ### Added

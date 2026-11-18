@@ -313,8 +313,31 @@ def dispatch_via_agy_cli(
             allow_rules.extend(
                 [
                     f"write_file({real_ws}/)",
+                    "command(ls)",
+                    "command(find)",
+                    "command(rg)",
+                    "command(grep)",
+                    "command(cat)",
+                    "command(head)",
+                    "command(tail)",
+                    "command(wc)",
+                    "command(diff)",
+                    "command(pwd)",
+                    "command(which)",
+                    "command(stat)",
+                    "command(sed)",
+                    "command(awk)",
+                    "command(sort)",
+                    "command(uniq)",
                     "command(flutter)",
                     "command(dart)",
+                    "command(swift)",
+                    "command(xcodebuild)",
+                    "command(gradle)",
+                    "command(./gradlew)",
+                    "command(cmake)",
+                    "command(mvn)",
+                    "command(bazel)",
                     "command(npm)",
                     "command(pnpm)",
                     "command(yarn)",
@@ -324,6 +347,9 @@ def dispatch_via_agy_cli(
                     "command(cargo)",
                     "command(go)",
                     "command(make)",
+                    "command(ruby)",
+                    "command(bundle)",
+                    "command(pod)",
                 ]
             )
     session_settings = json.dumps({"permissions": {"allow": allow_rules}})
@@ -343,7 +369,7 @@ def dispatch_via_agy_cli(
     cmd: List[str] = [
         agy_bin,
         "--output-format=stream-json",
-        f"--mode={'accept-edits' if allow_edits else 'auto'}",
+        "--mode=auto",
     ]
     cli_agent_name = str(cli_settings.get("cliAgent") or "").strip()
     if cli_agent_name:

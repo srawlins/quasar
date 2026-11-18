@@ -654,8 +654,31 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
       if (allowRepoEdits) {
         allowRules.push(
           `write_file(${realWs}/)`,
+          'command(ls)',
+          'command(find)',
+          'command(rg)',
+          'command(grep)',
+          'command(cat)',
+          'command(head)',
+          'command(tail)',
+          'command(wc)',
+          'command(diff)',
+          'command(pwd)',
+          'command(which)',
+          'command(stat)',
+          'command(sed)',
+          'command(awk)',
+          'command(sort)',
+          'command(uniq)',
           'command(flutter)',
           'command(dart)',
+          'command(swift)',
+          'command(xcodebuild)',
+          'command(gradle)',
+          'command(./gradlew)',
+          'command(cmake)',
+          'command(mvn)',
+          'command(bazel)',
           'command(npm)',
           'command(pnpm)',
           'command(yarn)',
@@ -664,7 +687,10 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
           'command(python3)',
           'command(cargo)',
           'command(go)',
-          'command(make)'
+          'command(make)',
+          'command(ruby)',
+          'command(bundle)',
+          'command(pod)'
         );
       }
     }
@@ -681,7 +707,7 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
 
     const args = [
       '--output-format=stream-json',
-      `--mode=${allowRepoEdits || allowAgentConfigEdits ? 'accept-edits' : 'auto'}`,
+      '--mode=auto',
     ];
     if (effectiveModel) {
       args.push(`--model=${effectiveModel}`);
@@ -924,6 +950,19 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
         } else {
           reconcilePendingThread(agentTextBuf, errSummary);
         }
+      }
+
+      if (allowRepoEdits) {
+        try {
+          const fixScript = path.join(getScriptsDir(), 'manage_fixes.py');
+          if (fs.existsSync(fixScript)) {
+            const recArgs = [fixScript, '--reconcile-fixes', '--agent-idle'];
+            if (effectiveWsRoot) {
+              recArgs.push('--workspace-dir', effectiveWsRoot);
+            }
+            execFile('python3', recArgs, { timeout: 15000, env: getQuasarScriptEnv() }, () => {});
+          }
+        } catch (_) {}
       }
     });
   });
@@ -1235,7 +1274,13 @@ function inspectConversationFixState(convId) {
           const nm = String((tc && tc.name) || '');
           return nm === 'ask_question' || nm.endsWith('ask_question');
         });
-        return asksQuestion ? 'paused_on_question' : 'working';
+        if (asksQuestion) return 'paused_on_question';
+        // If the transcript hasn't updated for >5 min while waiting on a tool call
+        // and no agy CLI job is active, treat the turn as idle so fixes can reconcile.
+        if (ageMs > 300000 && activeAgyCliJobsCount === 0) {
+          return 'idle';
+        }
+        return 'working';
       }
     }
 
