@@ -284,7 +284,8 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                     controller: prCtrl,
                     autofocus: true,
                     decoration: const InputDecoration(
-                      labelText: 'GitHub PR URL (e.g. https://github.com/org/repo/pull/123)',
+                      labelText:
+                          'GitHub PR URL (e.g. https://github.com/org/repo/pull/123, or Gerrit URL)',
                       border: OutlineInputBorder(),
                     ),
                   )
@@ -718,14 +719,15 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
     final TextEditingController summaryCtrl =
         TextEditingController(text: sess.topLevelComment);
 
+    final String remoteLabel = sess.pr.remoteLabel;
     final bool? go = await showDialog<bool>(
       context: context,
       builder: (BuildContext ctx) => StatefulBuilder(
         builder: (BuildContext ctx, StateSetter setModalState) => AlertDialog(
           backgroundColor: const Color(0xFF161B22),
-          title: const Text(
-            '☁️ Publish Staged Comments to GitHub',
-            style: TextStyle(fontSize: 16, color: Color(0xFFE6EDF3)),
+          title: Text(
+            '☁️ Publish Staged Comments to $remoteLabel',
+            style: const TextStyle(fontSize: 16, color: Color(0xFFE6EDF3)),
           ),
           content: SizedBox(
             width: 520,
@@ -736,9 +738,9 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                 DropdownButtonFormField<String>(
                   initialValue: event,
                   dropdownColor: const Color(0xFF21262D),
-                  decoration: const InputDecoration(
-                    labelText: 'GitHub Review Action',
-                    border: OutlineInputBorder(),
+                  decoration: InputDecoration(
+                    labelText: '$remoteLabel Review Action',
+                    border: const OutlineInputBorder(),
                   ),
                   items: const <DropdownMenuItem<String>>[
                     DropdownMenuItem<String>(
@@ -783,7 +785,7 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
             ),
             FilledButton(
               onPressed: () => Navigator.of(ctx).pop(true),
-              child: const Text('Publish to GitHub'),
+              child: Text('Publish to $remoteLabel'),
             ),
           ],
         ),
@@ -797,7 +799,7 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
           event: event,
           summaryBody: summaryCtrl.text.trim(),
         );
-        _showSnack('✅ Published review ($event) to GitHub!');
+        _showSnack('✅ Published review ($event) to $remoteLabel!');
         await _refreshState(silent: true);
       } catch (e) {
         _showSnack('Publish failed: $e', isError: true);
@@ -1178,7 +1180,7 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                   onPressed: () => _showPublishDialog(sess),
                   icon: const Icon(Icons.cloud_upload_outlined, size: 15),
                   label: Text(
-                    'Publish to GitHub ($stagedCount)',
+                    'Publish to ${sess.pr.remoteLabel} ($stagedCount)',
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),

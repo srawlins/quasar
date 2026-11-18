@@ -2,6 +2,23 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.0] - 2026-11-17
+
+### Added
+- **Host-Agnostic Gerrit Code Review Support (`gerrit_adapter.py`)**:
+  - Added [`plugin/skills/quasar/scripts/gerrit_adapter.py`](plugin/skills/quasar/scripts/gerrit_adapter.py) while keeping Quasar's UX and defaults GitHub-first (0 Gerrit network calls unless a Gerrit change URL is opened or `gerritHosts` is configured).
+  - Supports any standard Gerrit 2.16+ / 3.x server (`https://<host>[/<prefix>]/c/<project>/+/<change>[/<patchset>]`, `/+/<change>`, legacy `/#/c/...`, and patchset ranges), automatic XSSI `)]}'` stripping, threaded inline comments (`in_reply_to` + `unresolved` status), base/head file snapshot materialization, patchset-to-patchset incremental delta reviews, stale patchset freshness checks, and optional `gerritHosts` Inbox polling.
+  - Agnostic authentication resolution across `~/.gemini/quasar/gerrit_auth.json` (`--set-gerrit-auth`), `git config http.cookiefile` / `~/.gitcookies` (including `#HttpOnly_` cookies), `~/.netrc`, environment variables, HTTP Basic/Digest auth, and anonymous public fallback, plus publishing staged comments as Gerrit **Draft Comments** (`PENDING`) or full reviews (`COMMENT`, `APPROVE`, `REQUEST_CHANGES`).
+- **CLI Model, Quota-Fallback & Agent Selection + Background Failure / Quota Alerts (`quasar.configureInboxModel`, `quasar watch --model` / `--agent`)**:
+  - Added live CLI capability discovery (`agy models` & `agy agents`) and user-configurable `cliModel`, `cliFallbackModels`, and `cliAgent` settings across `inbox_watcher.py`, VS Code (`Quasar: Choose CLI Model, Quota Fallback & Agent...`), `quasar-web`, the standalone Flutter app, and `quasar watch` (`--model`, `--fallback-models`, `--agent`, `--list-models`). Changing the configured model or agent automatically clears any active quota cooldowns so paused items can retry immediately.
+  - Added prominent failure & token/quota-exhaustion visibility across all UIs: warning icons, error badges, retry countdowns, and a top-level **Out of Model Quota** alert banner (with 1-click **Switch CLI Model / Agent** and **Retry Now** actions) in the VS Code `PR Inbox` tree, desktop warning toasts (`notifyOnError`), and the standalone Flutter app, plus a cycle-level quota circuit breaker so remaining queued PRs aren't repeatedly failed when quota runs out.
+- **1-Click Inline Unstage Button**: Added an inline **Unstage** hover button (`quasar.unstageThread`) directly on `Staged for GitHub Review` rows in the VS Code `Review Comments & Cart` sidebar so comments can be moved back to `Open Candidates` without deleting them.
+
+### Fixed
+- **Inline Comment Replies Stuck on `⏳ Quasar is analyzing...` Upon CLI Model Quota Exhaustion**:
+  - `dispatchViaAgyCli` (`extension.js`), `dispatch_agy_background` (`server.py`), and `run_precompute_for_item` (`inbox_watcher.py`) previously resolved as soon as `agy` emitted its `init` event and ignored `429 RESOURCE_EXHAUSTED` (`code 3`) exits on the CLI's default model—leaving inline comment replies stuck on `⏳ Quasar is analyzing...`.
+  - Quasar now automatically retries across configured or auto-discovered `agy` fallback models on model-quota exhaustion, captures plain-text agent responses if `answer_comment_question.py` wasn't invoked, and guarantees any remaining `pending: true` thread placeholder is reconciled on process exit.
+
 ## [1.6.1] - 2026-11-17
 
 ### Added

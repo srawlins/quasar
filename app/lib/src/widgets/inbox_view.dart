@@ -85,6 +85,20 @@ class InboxView extends StatelessWidget {
         TextEditingController(text: cfg.customQuery);
     final TextEditingController extraFlagsCtrl =
         TextEditingController(text: cfg.extraSearchFlags);
+    final List<CliModelOption> modelOpts = <CliModelOption>[
+      const CliModelOption(id: '', label: 'Auto (CLI Default)'),
+      for (final CliModelOption m in inbox.availableModels)
+        if (m.id != 'auto' && m.id.isNotEmpty) m,
+      if (cfg.cliModel.isNotEmpty &&
+          !inbox.availableModels.any((CliModelOption m) => m.id == cfg.cliModel))
+        CliModelOption(id: cfg.cliModel, label: cfg.cliModel),
+    ];
+    String selectedCliModel = cfg.cliModel;
+    final TextEditingController fallbacksCtrl = TextEditingController(
+      text: cfg.cliFallbackModels.join(', '),
+    );
+    final TextEditingController cliAgentCtrl =
+        TextEditingController(text: cfg.cliAgent);
     bool watchReq = cfg.watchReviewRequested;
     bool autoReq = cfg.autoReviewReviewRequested;
     bool watchRevBy = cfg.watchReviewedBy;
@@ -378,6 +392,57 @@ class InboxView extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: selectedCliModel,
+                    decoration: const InputDecoration(
+                      labelText: 'CLI Model (`agy --model`)',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: <DropdownMenuItem<String>>[
+                      for (final CliModelOption m in modelOpts)
+                        DropdownMenuItem<String>(
+                          value: m.id,
+                          child: Text(
+                            m.id.isEmpty ? m.label : '${m.label} (${m.id})',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                    ],
+                    onChanged: (String? v) =>
+                        setModal(() => selectedCliModel = v ?? ''),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: TextField(
+                          controller: fallbacksCtrl,
+                          decoration: const InputDecoration(
+                            labelText: 'Quota Fallback Models (blank = auto)',
+                            hintText: 'auto, or comma-separated IDs, or none',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: TextField(
+                          controller: cliAgentCtrl,
+                          decoration: InputDecoration(
+                            labelText: 'CLI Agent (`agy --agent`)',
+                            hintText: inbox.availableAgents.isNotEmpty
+                                ? 'Default, or: ${inbox.availableAgents.join(', ')}'
+                                : 'Leave blank for Default Agent',
+                            border: const OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
                   Row(
                     children: <Widget>[
                       Expanded(
@@ -521,6 +586,9 @@ class InboxView extends StatelessWidget {
       'restrictToWatchedRepos': restrictRepos,
       'includeDrafts': includeDrafts,
       'commentsOnly': commentsOnly,
+      'cliModel': selectedCliModel,
+      'cliFallbackModels': fallbacksCtrl.text.trim(),
+      'cliAgent': cliAgentCtrl.text.trim(),
     };
     pollCtrl.dispose();
     maxCycleCtrl.dispose();
@@ -530,6 +598,8 @@ class InboxView extends StatelessWidget {
     reposCtrl.dispose();
     customQueryCtrl.dispose();
     extraFlagsCtrl.dispose();
+    fallbacksCtrl.dispose();
+    cliAgentCtrl.dispose();
 
     if (saved == true) {
       onSaveSettings(payload);
@@ -698,8 +768,50 @@ class InboxView extends StatelessWidget {
                   _MetaChip(text: 'Max ${cfg.maxReviewsPerCycle}/cycle'),
                   _MetaChip(text: 'Daily Cap: $dayCap'),
                   _MetaChip(text: 'Concurrency: ${cfg.maxConcurrency}'),
+                  _MetaChip(
+                    text: 'Model: ${cfg.cliModel.isEmpty ? 'Auto' : cfg.cliModel}',
+                  ),
+                  if (cfg.cliAgent.isNotEmpty)
+                    _MetaChip(text: 'Agent: ${cfg.cliAgent}'),
                 ],
               ),
+              if (inbox.errorCount > 0) ...<Widget>[
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2D1619),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFF85149)),
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: Text(
+                          inbox.quotaErrorCount > 0
+                              ? '⚠️ ${inbox.quotaErrorCount} background review(s) paused due to exhausted model quota / tokens.'
+                              : '⚠️ ${inbox.errorCount} background review(s) encountered an error (see Queued below).',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFFFA198),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      OutlinedButton(
+                        onPressed: () => _showSettingsDialog(context),
+                        child: const Text(
+                          'Switch CLI Model / Agent',
+                          style: TextStyle(fontSize: 11.5),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (inbox.lastSyncError.isNotEmpty) ...<Widget>[
                 const SizedBox(height: 10),
                 Text(
@@ -811,6 +923,35 @@ class InboxView extends StatelessWidget {
                                       ),
                                     ),
                                   ],
+                                  if (it.lastError.isNotEmpty) ...<Widget>[
+                                    const SizedBox(height: 5),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: it.isQuotaError
+                                            ? const Color(0xFF2D1619)
+                                            : const Color(0xFF2B2111),
+                                        borderRadius: BorderRadius.circular(6),
+                                        border: Border.all(
+                                          color: it.isQuotaError
+                                              ? const Color(0xFFF85149)
+                                              : const Color(0xFFD29922),
+                                        ),
+                                      ),
+                                      child: Text(
+                                        '⚠️ ${it.lastError}',
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          color: it.isQuotaError
+                                              ? const Color(0xFFFFA198)
+                                              : const Color(0xFFE3B341),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                   if (it.skipReason.isNotEmpty) ...<Widget>[
                                     const SizedBox(height: 3),
                                     Text(
@@ -840,9 +981,11 @@ class InboxView extends StatelessWidget {
                                 if (it.inboxGroup == 'queued')
                                   OutlinedButton(
                                     onPressed: () => onPrecomputeItem(it),
-                                    child: const Text(
-                                      '⚡ Pre-Review',
-                                      style: TextStyle(fontSize: 12),
+                                    child: Text(
+                                      it.lastError.isNotEmpty
+                                          ? '🔄 Retry Now'
+                                          : '⚡ Pre-Review',
+                                      style: const TextStyle(fontSize: 12),
                                     ),
                                   ),
                                 if (it.inboxGroup == 'deleted') ...<Widget>[

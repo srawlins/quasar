@@ -365,7 +365,6 @@ flowchart LR
                   'reviewsRunToday': 2,
                   'maxReviewsPerDay': 6,
                 },
-                'counts': <String, dynamic>{'ready': 1, 'unreadReady': 1},
                 'items': <Map<String, dynamic>>[
                   <String, dynamic>{
                     'id': 'acme-api-pr-101',
@@ -383,6 +382,32 @@ flowchart LR
                     'unread': true,
                     'tldr': 'Adds bounded exponential backoff with jitter.',
                   },
+                  <String, dynamic>{
+                    'id': 'acme-api-pr-102',
+                    'owner': 'acme',
+                    'repo': 'api',
+                    'number': 102,
+                    'title': 'Refactor rate limiter',
+                    'author': 'carol',
+                    'role': 'reviewer',
+                    'status': 'queued',
+                    'inboxGroup': 'queued',
+                    'lastError':
+                        'Out of model quota / tokens (tried: auto). Switch CLI model in Inbox Settings.',
+                    'lastErrorKind': 'quota_exhausted',
+                  },
+                ],
+                'counts': <String, dynamic>{
+                  'total': 2,
+                  'ready': 1,
+                  'unreadReady': 1,
+                  'queued': 1,
+                  'errors': 1,
+                  'quotaErrors': 1,
+                },
+                'availableModels': <Map<String, dynamic>>[
+                  <String, dynamic>{'id': 'auto', 'label': 'Auto Default'},
+                  <String, dynamic>{'id': 'fast-model', 'label': 'Fast Model'},
                 ],
               },
             })),
@@ -411,9 +436,13 @@ flowchart LR
       expect(find.text('Auto-Review: Requested'), findsOneWidget);
       expect(find.textContaining('acme/api#101: Add retry jitter'), findsOneWidget);
       expect(find.text('📖 Open in 0s'), findsOneWidget);
+      expect(find.textContaining('paused due to exhausted model quota'), findsOneWidget);
+      expect(find.text('🔄 Retry Now'), findsOneWidget);
 
       await tester.tap(find.text('Settings & Auto-Review Flags'));
       await tester.pumpAndSettle();
+
+      expect(find.text('CLI Model (`agy --model`)'), findsOneWidget);
 
       expect(
         find.text('Requesting my review (review-requested:@me)'),

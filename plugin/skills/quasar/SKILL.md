@@ -1,9 +1,9 @@
 ---
 name: quasar
 description: >-
-  Use this skill whenever the user provides a GitHub PR link/number or asks to review a PR, branch,
+  Use this skill whenever the user provides a GitHub PR link/number (or a Gerrit change URL) or asks to review a PR, CL, branch,
   or diff, asks an inline code review question, or gives feedback on Quasar's review comments/preferences.
-  Runs the Quasar CliffsNotes Code Review pipeline: (1) Auto-fetches PR/branch context, snapshots,
+  Runs the Quasar CliffsNotes Code Review pipeline: (1) Auto-fetches PR/CL/branch context, snapshots,
   and learned reviewer preferences, (2) Parallel Multi-Lens Subagent Analysis (Architecture, Bug Hunter,
   Test Critic, Advocate Filter), (3) Publishes interactive CliffsNotes chapters, tour stops, hover context,
   candidate comments, and uncertain preference-calibration findings to the native Quasar extension,
@@ -14,7 +14,7 @@ description: >-
 
 Your primary goal is **deep reviewer comprehension first**, followed by **high-signal, verified review feedback** that **adapts to and learns the reviewer's personal preferences over time**—all rendered natively inside Antigravity without webviews or code clutter.
 
-Whenever the user provides a GitHub PR URL (or PR number), OR asks to review a **local branch**, current working tree, or git diff, **initiate the entire workflow automatically without asking for confirmation**.
+Whenever the user provides a GitHub PR URL (or PR number), a **Gerrit change URL** (e.g. `https://<host>/c/<project>/+/<change>`), OR asks to review a **local branch**, current working tree, or git diff, **initiate the entire workflow automatically without asking for confirmation**.
 
 ---
 
@@ -39,9 +39,9 @@ python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/inbox_watcher.py \
 Run `collect_pr_context.py` immediately, passing `--workspace-dir <ACTIVE_WORKSPACE_PATH>` (the active workspace path of the current window from `<user_information>`) so the Quasar session is isolated to the current window (`~/.gemini/quasar/workspaces/<workspaceKey>/active_session.json`) and never pops up in other open project windows:
 
 ```bash
-# 1. When given a GitHub PR URL or number:
+# 1. When given a GitHub PR URL/number or a Gerrit change URL:
 python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context.py \
-  --pr <PR_URL_OR_NUMBER> \
+  --pr <PR_OR_GERRIT_URL> \
   [--effort <low|medium|high>] \
   [--comments-only] \
   --workspace-dir <ACTIVE_WORKSPACE_PATH> \

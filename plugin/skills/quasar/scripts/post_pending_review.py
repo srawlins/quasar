@@ -659,12 +659,21 @@ def post_via_rest_or_gh(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Configure GitHub API Key or publish a review to a GitHub PR.")
+    parser = argparse.ArgumentParser(description="Configure GitHub/Gerrit credentials or publish a review.")
     parser.add_argument("--set-token", help="Verify and save a GitHub Personal Access Token (API Key) for publishing reviews as you")
     parser.add_argument("--auth-status", action="store_true", help="Print current GitHub authentication status as JSON")
     parser.add_argument("--clear-token", action="store_true", help="Remove stored GitHub API Key from ~/.gemini/quasar/github_auth.json")
+    parser.add_argument(
+        "--set-gerrit-auth",
+        nargs=3,
+        metavar=("HOST_OR_URL", "USERNAME", "HTTP_PASSWORD"),
+        help="Verify and save Gerrit HTTP credentials for a Gerrit host",
+    )
+    parser.add_argument("--gerrit-auth-status", action="store_true", help="Print Gerrit authentication status as JSON")
+    parser.add_argument("--gerrit-host", default=None, help="Optional Gerrit host/URL to inspect with --gerrit-auth-status")
+    parser.add_argument("--clear-gerrit-auth", default=None, metavar="HOST_OR_URL", help="Remove stored Gerrit credentials for a host")
     parser.add_argument("--from-session", action="store_true", help="Publish/export staged comments from active_session.json")
-    parser.add_argument("--pr", help="GitHub PR number or URL (optional if --from-session is used)")
+    parser.add_argument("--pr", help="GitHub PR number/URL or Gerrit Change URL (optional if --from-session is used)")
     parser.add_argument("--comments-file", help="Path to JSON file with draft comments")
     parser.add_argument("--repo-dir", default=os.getcwd(), help="Repository directory")
     parser.add_argument(
@@ -679,6 +688,33 @@ def main() -> None:
 
     if args.auth_status:
         print(json.dumps(get_auth_status(), indent=2))
+        return
+
+    if args.gerrit_auth_status:
+        from gerrit_adapter import get_gerrit_auth_status
+
+        print(json.dumps(get_gerrit_auth_status(args.gerrit_host), indent=2))
+        return
+
+    if args.clear_gerrit_auth:
+        from gerrit_adapter import _normalize_host_key, load_stored_gerrit_auth, save_stored_gerrit_auth
+
+        hk, _bu = _normalize_host_key(args.clear_gerrit_auth)
+        stored_g = load_stored_gerrit_auth()
+        if isinstance(stored_g.get("hosts"), dict):
+            stored_g["hosts"].pop(hk, None)
+            save_stored_gerrit_auth(stored_g)
+        print(json.dumps({"ok": True, "clearedHost": hk}, indent=2))
+        return
+
+    if args.set_gerrit_auth:
+        from gerrit_adapter import set_gerrit_host_auth
+
+        g_host, g_user, g_pwd = args.set_gerrit_auth
+        res_g = set_gerrit_host_auth(g_host, username=g_user, password=g_pwd, verify=True)
+        print(json.dumps(res_g, indent=2))
+        if not res_g.get("ok"):
+            sys.exit(1)
         return
 
     if args.clear_token:
@@ -766,6 +802,57 @@ def main() -> None:
                     indent=2,
                 )
             )
+            return
+
+        from gerrit_adapter import is_gerrit_url, parse_gerrit_url, post_gerrit_review
+
+        if pr_meta.get("provider") == "gerrit" or is_gerrit_url(args.pr) or is_gerrit_url(str(pr_meta.get("url") or "")):
+            if not pr_meta.get("gerritBaseUrl"):
+                spec = parse_gerrit_url(args.pr or str(pr_meta.get("url") or ""))
+                if spec:
+                    pr_meta = dict(pr_meta)
+                    pr_meta["provider"] = "gerrit"
+                    pr_meta["gerritBaseUrl"] = spec["baseUrl"]
+                    pr_meta["gerritProject"] = spec.get("project") or pr_meta.get("repo") or ""
+                    pr_meta["number"] = spec["number"]
+            base_summary_g = args.summary_body.strip() or (session.get("topLevelCommentIntro") or "").strip()
+            prior_drafts = session.get("gerritDraftIds") if isinstance(session.get("gerritDraftIds"), list) else []
+            try:
+                g_resp = post_gerrit_review(
+                    pr_meta=pr_meta,
+                    staged_threads=staged,
+                    summary_body=base_summary_g,
+                    review_event=args.event,
+                    prior_draft_ids=prior_drafts,
+                )
+            except Exception as exc:
+                sys.stderr.write(f"Failed to publish Gerrit review: {exc}\n")
+                sys.exit(1)
+
+            if os.path.isfile(active_session_path):
+                try:
+                    if args.event == "PENDING" and g_resp.get("gerrit_draft_ids"):
+                        session["gerritDraftIds"] = g_resp["gerrit_draft_ids"]
+                        session["githubPendingReviewUrl"] = g_resp.get("html_url")
+                    else:
+                        session.pop("gerritDraftIds", None)
+                        session.pop("githubPendingReviewUrl", None)
+                    with open(active_session_path, "w", encoding="utf-8") as sf:
+                        json.dump(session, sf, indent=2)
+                except Exception:
+                    pass
+
+            g_body_txt = (g_resp.get("review_body") or "").strip()
+            copied_cb = False
+            if g_body_txt and args.event == "PENDING":
+                try:
+                    proc_pb = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                    proc_pb.communicate(input=g_body_txt.encode("utf-8"), timeout=3)
+                    copied_cb = proc_pb.returncode == 0
+                except Exception:
+                    pass
+            g_resp["copied_body_to_clipboard"] = copied_cb
+            print(json.dumps(g_resp, indent=2))
             return
 
         if not pr_num or owner == "local":

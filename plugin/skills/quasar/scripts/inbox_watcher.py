@@ -70,6 +70,7 @@ INBOX_DAEMON_PATH = os.path.join(INBOX_DIR, "daemon.json")
 INBOX_LOG_PATH = os.path.join(INBOX_DIR, "daemon.log")
 INBOX_ITEMS_DIR = os.path.join(INBOX_DIR, "items")
 INBOX_ETAG_CACHE_PATH = os.path.join(INBOX_DIR, "etag_cache.json")
+INBOX_CLI_CAP_CACHE_PATH = os.path.join(INBOX_DIR, "cli_capabilities_cache.json")
 
 _ETAG_LOCK = threading.Lock()
 _ETAG_MEM_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
@@ -103,10 +104,14 @@ DEFAULT_INBOX_SETTINGS: Dict[str, Any] = {
     "customQuery": "",
     "extraSearchFlags": "",
     "watchedRepos": [],
+    "gerritHosts": [],
     "restrictToWatchedRepos": False,
     "includeDrafts": False,
     "effort": "high",  # "low" | "medium" | "high"
     "commentsOnly": False,
+    "cliModel": "",  # "" / "auto" = agy default model
+    "cliFallbackModels": [],  # [] = auto-discover fallbacks on quota exhaustion; ["none"] = no fallback
+    "cliAgent": "",  # "" = agy default main agent
     "pollIntervalMinutes": 15,
     "maxConcurrency": 1,
     "maxReviewsPerCycle": 1,
@@ -114,6 +119,7 @@ DEFAULT_INBOX_SETTINGS: Dict[str, Any] = {
     "onlyUpdatedWithinDays": 14,
     "incrementalUpdates": True,
     "notifyWhenReady": True,
+    "notifyOnError": True,
 }
 
 ROLE_PRIORITY: Dict[str, int] = {
@@ -231,6 +237,15 @@ def normalize_inbox_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             repos = []
         out["watchedRepos"] = list(dict.fromkeys(repos))
+    if "gerritHosts" in raw:
+        g_val = raw["gerritHosts"]
+        if isinstance(g_val, str):
+            g_hosts = [h.strip().rstrip("/") for h in re.split(r"[,\s]+", g_val) if "." in h.strip() or "localhost" in h.strip() or "127.0.0.1" in h.strip()]
+        elif isinstance(g_val, list):
+            g_hosts = [str(h).strip().rstrip("/") for h in g_val if str(h).strip()]
+        else:
+            g_hosts = []
+        out["gerritHosts"] = list(dict.fromkeys(g_hosts))
     if "restrictToWatchedRepos" in raw:
         out["restrictToWatchedRepos"] = bool(raw["restrictToWatchedRepos"])
     if "includeDrafts" in raw:
@@ -239,6 +254,27 @@ def normalize_inbox_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out["effort"] = str(raw["effort"]).lower()
     if "commentsOnly" in raw:
         out["commentsOnly"] = bool(raw["commentsOnly"])
+    if "cliModel" in raw:
+        m_raw = str(raw.get("cliModel") or "").strip()
+        out["cliModel"] = "" if m_raw.lower() in ("auto", "default") else m_raw
+    if "cliFallbackModels" in raw:
+        fb_raw = raw.get("cliFallbackModels")
+        if isinstance(fb_raw, str):
+            s_fb = fb_raw.strip()
+            if not s_fb or s_fb.lower() == "auto":
+                fb_list: List[str] = []
+            elif s_fb.lower() == "none":
+                fb_list = ["none"]
+            else:
+                fb_list = [x.strip() for x in re.split(r"[,\s]+", s_fb) if x.strip()]
+        elif isinstance(fb_raw, list):
+            fb_list = [str(x).strip() for x in fb_raw if str(x).strip()]
+        else:
+            fb_list = []
+        out["cliFallbackModels"] = list(dict.fromkeys(fb_list))
+    if "cliAgent" in raw:
+        a_raw = str(raw.get("cliAgent") or "").strip()
+        out["cliAgent"] = "" if a_raw.lower() in ("default", "main", "none", "auto") else a_raw
     if "pollIntervalMinutes" in raw:
         try:
             out["pollIntervalMinutes"] = max(2, min(720, int(raw["pollIntervalMinutes"])))
@@ -268,6 +304,8 @@ def normalize_inbox_settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out["incrementalUpdates"] = bool(raw["incrementalUpdates"])
     if "notifyWhenReady" in raw:
         out["notifyWhenReady"] = bool(raw["notifyWhenReady"])
+    if "notifyOnError" in raw:
+        out["notifyOnError"] = bool(raw["notifyOnError"])
     return out
 
 
@@ -404,6 +442,29 @@ def save_inbox_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     norm = normalize_inbox_settings(merged_raw)
     norm["updatedAt"] = _now_iso()
     _atomic_write_json(INBOX_SETTINGS_PATH, norm)
+
+    # If the user changed CLI model/fallback/agent, clear quota-exhaustion cooldowns so queued items can retry immediately
+    if (
+        norm.get("cliModel") != current.get("cliModel")
+        or norm.get("cliFallbackModels") != current.get("cliFallbackModels")
+        or norm.get("cliAgent") != current.get("cliAgent")
+    ) and os.path.isfile(INBOX_STATE_PATH):
+        try:
+            st = load_inbox_state()
+            cleared_any = False
+            for it in (st.get("items") or {}).values():
+                if isinstance(it, dict) and (it.get("retryAfter") or it.get("failureCount")):
+                    for k in ("failureCount", "retryAfter", "failedFingerprint", "skipReason"):
+                        it.pop(k, None)
+                    cleared_any = True
+            if st.get("lastQuotaExhaustedAt"):
+                st.pop("lastQuotaExhaustedAt", None)
+                cleared_any = True
+            if cleared_any:
+                save_inbox_state(st)
+        except Exception:
+            pass
+
     return norm
 
 
@@ -473,6 +534,157 @@ def find_agy_binary() -> Optional[str]:
         if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
     return None
+
+
+def _strip_ansi_and_cr(raw: str) -> str:
+    no_ansi = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw or "")
+    lines: List[str] = []
+    for line in no_ansi.splitlines():
+        if "\r" in line:
+            line = line.split("\r")[-1]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def discover_agy_models_and_agents(
+    force_refresh: bool = False,
+    allow_subprocess: bool = True,
+    ttl_seconds: float = 600.0,
+) -> Dict[str, Any]:
+    """Discovers available CLI models (`agy models`) and custom agents (`agy agents`), cached for 10m."""
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    now_ts = time.time()
+    cached: Dict[str, Any] = {}
+    if os.path.isfile(INBOX_CLI_CAP_CACHE_PATH):
+        try:
+            with open(INBOX_CLI_CAP_CACHE_PATH, "r", encoding="utf-8") as cf:
+                cached = json.load(cf) or {}
+        except Exception:
+            cached = {}
+
+    if (
+        not force_refresh
+        and isinstance(cached, dict)
+        and cached.get("models")
+        and (now_ts - float(cached.get("updatedAtTs") or 0.0) < ttl_seconds or not allow_subprocess)
+    ):
+        return {
+            "models": list(cached.get("models") or []),
+            "agents": list(cached.get("agents") or []),
+            "cached": True,
+        }
+
+    if not allow_subprocess:
+        return {
+            "models": list(cached.get("models") or [{"id": "auto", "label": "Auto (CLI Default)"}]),
+            "agents": list(cached.get("agents") or []),
+            "cached": True,
+        }
+
+    agy_bin = find_agy_binary()
+    models: List[Dict[str, str]] = []
+    agents: List[str] = []
+
+    if agy_bin:
+        try:
+            res_m = subprocess.run(
+                [agy_bin, "models"],
+                capture_output=True,
+                text=True,
+                timeout=6.0,
+            )
+            cleaned_m = _strip_ansi_and_cr(res_m.stdout or "")
+            seen_m = set()
+            for ln in cleaned_m.splitlines():
+                s = ln.strip()
+                if not s or "fetching available models" in s.lower() or s.lower().startswith("available"):
+                    continue
+                m_row = re.match(r"^([a-zA-Z0-9._-]+)(?:\t+|\s{2,})(.+)$", s)
+                if m_row:
+                    mid, mlabel = m_row.group(1).strip(), m_row.group(2).strip()
+                    if mid not in seen_m:
+                        seen_m.add(mid)
+                        models.append({"id": mid, "label": mlabel})
+        except Exception:
+            pass
+
+        try:
+            res_a = subprocess.run(
+                [agy_bin, "agents"],
+                capture_output=True,
+                text=True,
+                timeout=4.0,
+            )
+            cleaned_a = _strip_ansi_and_cr(res_a.stdout or "")
+            for ln in cleaned_a.splitlines():
+                s = ln.strip()
+                if not s or s.lower().startswith("available agents"):
+                    continue
+                if re.match(r"^[a-zA-Z0-9._-]+$", s) and s not in agents:
+                    agents.append(s)
+        except Exception:
+            pass
+
+    user_agents_dir = os.path.expanduser("~/.gemini/config/agents")
+    if os.path.isdir(user_agents_dir):
+        try:
+            for fn in sorted(os.listdir(user_agents_dir)):
+                if fn.endswith(".md"):
+                    aname = fn[:-3].strip()
+                    if aname and aname not in agents and not aname.startswith("review-"):
+                        agents.append(aname)
+        except Exception:
+            pass
+
+    if not models:
+        models = list(cached.get("models") or [{"id": "auto", "label": "Auto (CLI Default)"}])
+
+    out_cache = {
+        "updatedAtTs": now_ts,
+        "updatedAt": _now_iso(),
+        "models": models,
+        "agents": agents,
+    }
+    try:
+        _atomic_write_json(INBOX_CLI_CAP_CACHE_PATH, out_cache)
+    except Exception:
+        pass
+    return {"models": models, "agents": agents, "cached": False}
+
+
+def resolve_cli_model_chain(settings: Dict[str, Any]) -> List[str]:
+    """Builds the ordered list of `--model` overrides (`""` = CLI default) to try when running `agy`."""
+    primary_raw = str(settings.get("cliModel") or "").strip()
+    primary = "" if primary_raw.lower() in ("", "auto", "default") else primary_raw
+    chain: List[str] = [primary]
+
+    fb_cfg = settings.get("cliFallbackModels")
+    if isinstance(fb_cfg, list) and fb_cfg == ["none"]:
+        return chain
+    if isinstance(fb_cfg, list) and len(fb_cfg) > 0:
+        for fb in fb_cfg:
+            fb_s = str(fb or "").strip()
+            fb_norm = "" if fb_s.lower() in ("auto", "default") else fb_s
+            if fb_norm not in chain:
+                chain.append(fb_norm)
+        return chain
+
+    caps = discover_agy_models_and_agents(allow_subprocess=True)
+    avail_ids = [
+        str(m.get("id") or "").strip()
+        for m in (caps.get("models") or [])
+        if isinstance(m, dict) and str(m.get("id") or "").strip()
+    ]
+    preferred_fallbacks: List[str] = []
+    for mid in avail_ids:
+        if mid in ("auto", primary) or "lite" in mid.lower() or "coordinator" in mid.lower():
+            continue
+        if mid.endswith("-high") or mid.endswith("-next"):
+            preferred_fallbacks.append(mid)
+    for mid in preferred_fallbacks[:2]:
+        if mid not in chain:
+            chain.append(mid)
+    return chain
 
 
 def _load_etag_cache() -> Dict[str, Dict[str, Any]]:
@@ -593,7 +805,14 @@ def sync_github_queue(
     cfg = settings or load_inbox_settings()
     st = state or load_inbox_state()
     token = get_github_token()
+    gerrit_hosts = list(cfg.get("gerritHosts") or [])
     if not token:
+        if gerrit_hosts:
+            g_cnt = _sync_configured_gerrit_hosts(cfg, st)
+            st["lastSyncedAt"] = _now_iso()
+            st["lastSyncError"] = ""
+            save_inbox_state(st)
+            return {"ok": True, "login": "", "discoveredCount": g_cnt, "state": st}
         st["lastSyncError"] = (
             "No GitHub token configured. Connect your GitHub API key in Quasar to sync your PR Inbox."
         )
@@ -756,8 +975,10 @@ def sync_github_queue(
     items_map: Dict[str, Any] = st.setdefault("items", {})
     open_ids = set(discovered.keys())
 
-    # Mark previously tracked open items that were closed/merged or unassigned
+    # Mark previously tracked open GitHub items that were closed/merged or unassigned
     for old_id, old_item in list(items_map.items()):
+        if old_item.get("provider") == "gerrit":
+            continue
         if old_id not in open_ids and old_item.get("openInQueue", True):
             if truncated_search_cutoff is not None:
                 old_dt = _parse_iso_dt(str(old_item.get("updatedAt") or ""))
@@ -1165,6 +1386,9 @@ def sync_github_queue(
                 "sessionDir": os.path.join(INBOX_ITEMS_DIR, item_id),
             }
 
+    if gerrit_hosts:
+        _sync_configured_gerrit_hosts(cfg, st)
+
     st["lastSyncedAt"] = _now_iso()
     st["lastScopeSig"] = scope_sig
     if do_full_sweep or truncated_search_cutoff is None:
@@ -1180,6 +1404,80 @@ def sync_github_queue(
         "cachedUnchangedCount": len(unchanged_entries),
         "state": st,
     }
+
+
+def _sync_configured_gerrit_hosts(cfg: Dict[str, Any], st: Dict[str, Any]) -> int:
+    """Polls optional `gerritHosts` configured in Inbox settings (0 calls when `gerritHosts` is empty)."""
+    hosts = list(cfg.get("gerritHosts") or [])
+    if not hosts:
+        return 0
+    from gerrit_adapter import poll_gerrit_host_open_changes
+
+    items_map: Dict[str, Any] = st.setdefault("items", {})
+    authored_all_open = str(cfg.get("authoredPrMode") or "feedback_only") == "all_open"
+    open_gerrit_ids = set()
+    total_polled = 0
+
+    for h in hosts:
+        polled = poll_gerrit_host_open_changes(
+            h,
+            watch_requested=bool(cfg.get("watchReviewRequested", True)),
+            watch_authored=bool(cfg.get("watchAuthoredPrs", True)),
+        )
+        for g_item in polled:
+            iid = str(g_item["id"])
+            open_gerrit_ids.add(iid)
+            total_polled += 1
+            existing = items_map.get(iid) or {}
+            head_sha = str(g_item.get("headSha") or "")
+            role = str(g_item.get("role") or "reviewer")
+            rc_cnt = int(g_item.get("reviewCommentsCount") or 0)
+            has_fb = bool(g_item.get("hasExternalFeedback"))
+            fp = f"{head_sha}:rc={rc_cnt}" if role == "author" else head_sha
+            item_dir = os.path.join(INBOX_ITEMS_DIR, iid)
+            prev_status = str(existing.get("status") or "queued")
+            prev_fp = str(existing.get("analyzedFingerprint") or "")
+            prev_rev_sha = str(existing.get("reviewedHeadSha") or "")
+            has_ready_sess = os.path.isfile(os.path.join(item_dir, "active_session.json"))
+
+            if prev_status == "deleted":
+                new_status = "deleted"
+            elif role == "author" and not (authored_all_open or has_fb) and prev_fp != fp:
+                new_status = "waiting_on_reviewers"
+            elif fp and prev_fp == fp and has_ready_sess and prev_status in ("ready", "quarantined"):
+                new_status = prev_status
+            elif head_sha and prev_rev_sha == head_sha and role != "author":
+                new_status = "waiting_on_author"
+            else:
+                new_status = "queued"
+
+            merged_g = {
+                **existing,
+                **g_item,
+                "matchedRoles": [role],
+                "currentFingerprint": fp,
+                "openInQueue": True,
+                "status": new_status,
+                "sessionDir": item_dir,
+            }
+            if new_status == "queued":
+                adopt_completed_session_into_inbox(
+                    merged_g,
+                    owner=str(g_item.get("owner") or ""),
+                    repo=str(g_item.get("repo") or ""),
+                    pr_num=int(g_item.get("number") or 0),
+                    head_sha=head_sha,
+                    fingerprint=fp,
+                    role=role,
+                    expected_review_comments=rc_cnt,
+                )
+            items_map[iid] = merged_g
+
+    for old_id, old_it in list(items_map.items()):
+        if old_it.get("provider") == "gerrit" and old_id not in open_gerrit_ids and old_it.get("openInQueue", True):
+            old_it["openInQueue"] = False
+
+    return total_polled
 
 
 def _is_completed_review_session(sess: Any) -> bool:
@@ -1272,14 +1570,25 @@ def _scan_completed_sessions_for_pr(
             }
         )
 
+    safe_default_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", f"{owner}-{repo}-pr-{pr_num}").strip("-")
+
     if include_inbox:
-        default_iid = f"{owner}-{repo}-pr-{pr_num}"
         _add_candidate(
-            os.path.join(INBOX_ITEMS_DIR, default_iid, "active_session.json"),
+            os.path.join(INBOX_ITEMS_DIR, safe_default_id, "active_session.json"),
             "inbox",
             "Auto-Review Inbox",
-            default_iid,
+            safe_default_id,
         )
+        from gerrit_adapter import make_gerrit_session_id
+
+        gerrit_iid = make_gerrit_session_id(owner, repo, pr_num)
+        if gerrit_iid != safe_default_id:
+            _add_candidate(
+                os.path.join(INBOX_ITEMS_DIR, gerrit_iid, "active_session.json"),
+                "inbox",
+                "Auto-Review Inbox",
+                gerrit_iid,
+            )
         if os.path.isdir(INBOX_ITEMS_DIR):
             st = load_inbox_state()
             for iid, it in (st.get("items") or {}).items():
@@ -1300,7 +1609,7 @@ def _scan_completed_sessions_for_pr(
             )
 
     if os.path.isdir(HISTORY_STATE_DIR):
-        direct_hist = os.path.join(HISTORY_STATE_DIR, f"{owner}-{repo}-pr-{pr_num}", "session.json")
+        direct_hist = os.path.join(HISTORY_STATE_DIR, safe_default_id, "session.json")
         _add_candidate(direct_hist, "history", "Review History")
         for entry in os.listdir(HISTORY_STATE_DIR):
             _add_candidate(
@@ -1578,14 +1887,132 @@ def find_existing_completed_branch_review(
     }
 
 
+def find_existing_completed_gerrit_review(
+    gerrit_url: str,
+    check_live_head: bool = True,
+) -> Dict[str, Any]:
+    """Checks whether a Gerrit Change URL already has a completed review in Inbox, Workspace, or History."""
+    from gerrit_adapter import fetch_gerrit_live_head_sha, make_gerrit_session_id, parse_gerrit_url
+
+    spec = parse_gerrit_url(gerrit_url)
+    if not spec:
+        return {"ok": True, "found": False}
+    owner = str(spec["host"]).lower()
+    req_proj = str(spec.get("project") or "").strip()
+    pr_num = int(spec["number"])
+    req_ps = spec.get("patchSet")
+
+    candidates: List[Dict[str, Any]] = []
+    if req_proj:
+        candidates = _scan_completed_sessions_for_pr(owner, req_proj, pr_num, include_inbox=True)
+    else:
+        # Short Gerrit URL (`/+/<num>`) without project slug in URL: match by Gerrit host + change number
+        for base_d, fn, src, lbl in (
+            (INBOX_ITEMS_DIR, "active_session.json", "inbox", "Auto-Review Inbox"),
+            (WORKSPACES_STATE_DIR, "active_session.json", "workspace", "Active Workspace"),
+            (HISTORY_STATE_DIR, "session.json", "history", "Review History"),
+        ):
+            if not os.path.isdir(base_d):
+                continue
+            for entry in os.listdir(base_d):
+                p = os.path.join(base_d, entry, fn)
+                if not os.path.isfile(p):
+                    continue
+                try:
+                    sess = json.load(open(p, "r", encoding="utf-8"))
+                except Exception:
+                    continue
+                pr_m = sess.get("pr") or {}
+                if (
+                    str(pr_m.get("owner") or "").lower() == owner
+                    and int(pr_m.get("number") or 0) == pr_num
+                    and _is_completed_review_session(sess)
+                ):
+                    candidates.extend(
+                        _scan_completed_sessions_for_pr(owner, str(pr_m.get("repo") or ""), pr_num, include_inbox=True)
+                    )
+                    break
+            if candidates:
+                break
+
+    if not candidates:
+        return {
+            "ok": True,
+            "found": False,
+            "provider": "gerrit",
+            "owner": owner,
+            "repo": req_proj,
+            "number": pr_num,
+        }
+
+    resolved_proj = req_proj or str(((candidates[0]["session"].get("pr") or {}).get("repo") or ""))
+    live_head_sha = ""
+    if check_live_head and not req_ps:
+        try:
+            live_head_sha, _live_ps = fetch_gerrit_live_head_sha(
+                spec["baseUrl"], resolved_proj or None, pr_num, timeout=4.0
+            )
+        except Exception:
+            live_head_sha = ""
+
+    source_prio = {"inbox": 0, "workspace": 1, "history": 2}
+
+    def _sort_g(c: Dict[str, Any]) -> Tuple[int, int, float]:
+        if req_ps:
+            c_ps = int(((c["session"].get("pr") or {}).get("patchSet") or 0))
+            m_live = 0 if c_ps == int(req_ps) else 1
+        else:
+            m_live = 0 if (not live_head_sha or c.get("headSha") == live_head_sha) else 1
+        return (m_live, source_prio.get(str(c.get("source")), 9), -float(c.get("mtime") or 0.0))
+
+    candidates.sort(key=_sort_g)
+    best = candidates[0]
+    cached_sha = str(best.get("headSha") or "")
+    best_ps = int(((best["session"].get("pr") or {}).get("patchSet") or 0))
+    if req_ps:
+        is_up_to_date = bool(best_ps == int(req_ps))
+    else:
+        is_up_to_date = bool(not live_head_sha or (cached_sha and cached_sha == live_head_sha))
+
+    return {
+        "ok": True,
+        "found": True,
+        "provider": "gerrit",
+        "owner": owner,
+        "repo": resolved_proj,
+        "number": pr_num,
+        "patchSet": best_ps,
+        "title": best.get("title") or f"{resolved_proj} #{pr_num}",
+        "prUrl": best.get("prUrl") or spec["canonicalUrl"],
+        "itemId": best.get("itemId") or make_gerrit_session_id(owner, resolved_proj, pr_num),
+        "source": best.get("source"),
+        "sourceLabel": best.get("sourceLabel"),
+        "sessionPath": best.get("sessionPath"),
+        "cachedHeadSha": cached_sha,
+        "liveHeadSha": live_head_sha,
+        "isUpToDate": is_up_to_date,
+        "effort": best.get("effort") or "high",
+        "commentsOnly": bool(best.get("commentsOnly", False)),
+        "findingsCount": int(best.get("findingsCount") or 0),
+        "blockingCount": int(best.get("blockingCount") or 0),
+        "chaptersCount": int(best.get("chaptersCount") or 0),
+        "tldr": best.get("tldr") or "",
+        "completedAt": best.get("completedAt") or "",
+    }
+
+
 def find_existing_completed_review(
     pr_arg: str,
     repo_dir: Optional[str] = None,
     check_live_head: bool = True,
 ) -> Dict[str, Any]:
-    """Checks whether `pr_arg` (GitHub PR or local branch) already has a completed review in Inbox, Workspace, or History."""
+    """Checks whether `pr_arg` (GitHub PR, Gerrit Change URL, or local branch) already has a completed review."""
     if not pr_arg:
         return {"ok": True, "found": False}
+    from gerrit_adapter import is_gerrit_url
+
+    if is_gerrit_url(pr_arg):
+        return find_existing_completed_gerrit_review(pr_arg.strip(), check_live_head=check_live_head)
     if not is_github_pr_arg(pr_arg):
         return find_existing_completed_branch_review(pr_arg, repo_dir=repo_dir)
     try:
@@ -1727,7 +2154,14 @@ def run_precompute_for_item(
         int(item.get("number") or 0),
         include_inbox=False,
     )
-    if local_manual_cands and not item.get("headSha") and item.get("owner") and item.get("repo") and item.get("number"):
+    if (
+        local_manual_cands
+        and not item.get("headSha")
+        and item.get("provider") != "gerrit"
+        and item.get("owner")
+        and item.get("repo")
+        and item.get("number")
+    ):
         gh_tok = get_github_token()
         if gh_tok:
             try:
@@ -1807,7 +2241,12 @@ def run_precompute_for_item(
     pr_url = str(item.get("url") or "")
     owner = str(item.get("owner") or "")
     repo = str(item.get("repo") or "")
-    repo_dir = auto_detect_repo_dir(owner, repo, None)
+    if item.get("provider") == "gerrit":
+        from gerrit_adapter import auto_detect_gerrit_repo_dir
+
+        repo_dir = auto_detect_gerrit_repo_dir(owner, repo, None)
+    else:
+        repo_dir = auto_detect_repo_dir(owner, repo, None)
 
     env = dict(os.environ)
     env["QUASAR_SESSION_DIR"] = item_dir
@@ -1910,6 +2349,9 @@ def run_precompute_for_item(
         "--output-format=stream-json",
         "--mode=auto",
     ]
+    cli_agent = str(cfg.get("cliAgent") or "").strip()
+    if cli_agent:
+        agy_cmd.append(f"--agent={cli_agent}")
     for d in dict.fromkeys([d for d in (real_repo, real_item_dir, real_state_dir, real_plugin_dir) if d and os.path.isdir(d)]):
         agy_cmd.extend(["--add-dir", d])
     agy_cmd.append(f"--settings={session_settings}")
@@ -1920,56 +2362,123 @@ def run_precompute_for_item(
     log_path = os.path.join(item_dir, "precompute.log")
     run_cwd = real_repo if (real_repo and os.path.isdir(real_repo)) else item_dir
     run_start_ts = time.time()
+    error_kind = "cli_error"
+    tried_models: List[str] = []
     try:
-        with open(log_path, "w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(
-                agy_cmd,
-                cwd=run_cwd,
-                env=env,
-                stdout=lf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                start_new_session=True,
-            )
-            published_at_ts: Optional[float] = None
-            while proc.poll() is None:
-                time.sleep(3.0)
-                if os.path.isfile(session_file) and os.path.getmtime(session_file) >= run_start_ts:
-                    if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
-                        if published_at_ts is None:
-                            published_at_ts = time.time()
-                        elif time.time() - published_at_ts > 20.0:
-                            # `publish_review_session.py` already wrote the completed session; reap lingering CLI
-                            try:
-                                os.killpg(proc.pid, signal.SIGTERM)
-                            except Exception:
-                                proc.terminate()
+        models_to_try = resolve_cli_model_chain(cfg)
+        rc = -1
+        saw_quota_exhaustion = False
+        last_log_detail = ""
+        for model_override in models_to_try:
+            tried_models.append(model_override or "auto")
+            attempt_cmd = list(agy_cmd)
+            if model_override:
+                attempt_cmd.insert(2, f"--model={model_override}")
+            attempt_start_ts = time.time()
+            with open(log_path, "w", encoding="utf-8") as lf:
+                proc = subprocess.Popen(
+                    attempt_cmd,
+                    cwd=run_cwd,
+                    env=env,
+                    stdout=lf,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    start_new_session=True,
+                )
+                published_at_ts: Optional[float] = None
+                while proc.poll() is None:
+                    time.sleep(3.0)
+                    if os.path.isfile(session_file) and os.path.getmtime(session_file) >= run_start_ts:
+                        if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
+                            if published_at_ts is None:
+                                published_at_ts = time.time()
+                            elif time.time() - published_at_ts > 20.0:
+                                try:
+                                    os.killpg(proc.pid, signal.SIGTERM)
+                                except Exception:
+                                    proc.terminate()
+                                break
+                    if time.time() - attempt_start_ts > timeout_sec:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except Exception:
+                            proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                        if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
                             break
-                if time.time() - run_start_ts > timeout_sec:
+                        error_kind = "timeout"
+                        raise TimeoutError(
+                            f"Timed out after {timeout_sec // 60}m ({effort} effort). Click ⚡ to retry or try Medium/Low effort."
+                        )
+            rc = proc.returncode if proc.returncode is not None else -1
+            if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
+                break
+
+            log_tail = ""
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as rf:
+                    log_tail = rf.read()[-4000:]
+            except Exception:
+                pass
+            is_quota = bool(
+                rc == 3
+                or re.search(
+                    r"RESOURCE_EXHAUSTED|exhausted your capacity|quota exceeded|out of tokens|rate.?limit",
+                    log_tail,
+                    re.I,
+                )
+            )
+            if is_quota:
+                saw_quota_exhaustion = True
+                continue
+
+            # Capture concise diagnostic line if non-quota CLI error
+            for raw_ln in reversed(log_tail.splitlines()):
+                s_ln = raw_ln.strip()
+                if not s_ln:
+                    continue
+                if s_ln.startswith("{") and s_ln.endswith("}"):
                     try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except Exception:
-                        proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
+                        ev_j = json.loads(s_ln)
+                        err_v = ev_j.get("error") or ((ev_j.get("result") or {}).get("error"))
+                        if err_v:
+                            last_log_detail = str(err_v)[:160]
+                            break
                     except Exception:
                         pass
-                    if _extract_session_metrics(session_file).get("analysisStatus") == "ready":
-                        break
-                    raise TimeoutError(f"Background pre-review timed out after {timeout_sec // 60}m")
+                elif "error" in s_ln.lower() or "failed" in s_ln.lower():
+                    last_log_detail = s_ln[:160]
+                    break
+            break
+
         metrics = _extract_session_metrics(session_file)
         if metrics.get("analysisStatus") != "ready":
-            rc = proc.returncode if proc.returncode is not None else -1
-            raise RuntimeError(f"agy exited (code {rc}) before publishing ready session")
+            if saw_quota_exhaustion:
+                error_kind = "quota_exhausted"
+                models_str = ", ".join(tried_models)
+                raise RuntimeError(
+                    f"Out of model quota / tokens (tried: {models_str}). Switch CLI model in Inbox Settings or wait for quota reset."
+                )
+            detail_suffix = f": {last_log_detail}" if last_log_detail else ""
+            raise RuntimeError(f"CLI exited (code {rc}) before completing review{detail_suffix}")
     except Exception as exc:
         if has_prior_backup and os.path.isfile(prior_backup_path):
             shutil.copy2(prior_backup_path, session_file)
         st = load_inbox_state()
+        err_now = _now_iso()
+        if error_kind == "quota_exhausted":
+            st["lastQuotaExhaustedAt"] = err_now
         if item_id in st.get("items", {}):
             it_err = st["items"][item_id]
             it_err["status"] = "queued"
             it_err["lastError"] = str(exc)[:300]
+            it_err["lastErrorKind"] = error_kind
+            it_err["lastErrorAt"] = err_now
+            it_err["lastErrorModels"] = tried_models
             fails = int(it_err.get("failureCount") or 0) + 1
             it_err["failureCount"] = fails
             it_err["failedFingerprint"] = str(
@@ -1980,7 +2489,7 @@ def run_precompute_for_item(
                 _now_utc() + datetime.timedelta(minutes=cooldown_min)
             ).isoformat()
             save_inbox_state(st)
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "errorKind": error_kind}
 
     st = load_inbox_state()
     if count_against_daily_budget:
@@ -1997,6 +2506,9 @@ def run_precompute_for_item(
         it["unread"] = True
         for k in (
             "lastError",
+            "lastErrorKind",
+            "lastErrorAt",
+            "lastErrorModels",
             "failureCount",
             "retryAfter",
             "failedFingerprint",
@@ -2004,6 +2516,7 @@ def run_precompute_for_item(
             "manualAutoReviewQueued",
         ):
             it.pop(k, None)
+    st.pop("lastQuotaExhaustedAt", None)
     save_inbox_state(st)
     return {"ok": True, "itemId": item_id, "status": "ready"}
 
@@ -2138,7 +2651,10 @@ def run_watch_cycle(force_sync_only: bool = False) -> Dict[str, Any]:
     try:
         if max_conc == 1 or len(chosen_ids) == 1:
             for iid in chosen_ids:
-                results.append(run_precompute_for_item(iid, settings=settings, count_against_daily_budget=True))
+                item_res = run_precompute_for_item(iid, settings=settings, count_against_daily_budget=True)
+                results.append(item_res)
+                if item_res.get("errorKind") == "quota_exhausted":
+                    break
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_conc) as pool:
                 futs = [
@@ -2203,16 +2719,40 @@ def activate_existing_session_file(
         and pr_meta.get("owner") != "local"
     ):
         try:
-            r_dir = auto_detect_repo_dir(str(pr_meta.get("owner")), str(pr_meta.get("repo")), clean_ws)
-            b_root, h_root = materialize_snapshots(
-                session_id=str(sess.get("sessionId") or f"{pr_meta.get('owner')}-{pr_meta.get('repo')}-pr-{pr_meta.get('number')}"),
-                owner=str(pr_meta.get("owner")),
-                repo=str(pr_meta.get("repo")),
-                base_sha=str(pr_meta.get("baseSha") or ""),
-                head_sha=str(pr_meta.get("headSha") or ""),
-                files_list=sess["files"],
-                repo_dir=r_dir,
-            )
+            if pr_meta.get("provider") == "gerrit" and pr_meta.get("gerritBaseUrl"):
+                from collect_pr_context import SNAPSHOTS_DIR
+                from gerrit_adapter import auto_detect_gerrit_repo_dir, make_gerrit_session_id, materialize_gerrit_snapshots
+
+                r_dir = auto_detect_gerrit_repo_dir(
+                    str(pr_meta.get("gerritHost") or pr_meta.get("owner") or ""),
+                    str(pr_meta.get("gerritProject") or pr_meta.get("repo") or ""),
+                    clean_ws,
+                )
+                b_root, h_root = materialize_gerrit_snapshots(
+                    session_id=str(
+                        sess.get("sessionId")
+                        or make_gerrit_session_id(
+                            str(pr_meta.get("owner") or "gerrit"),
+                            str(pr_meta.get("repo") or "repo"),
+                            int(pr_meta.get("number") or 0),
+                        )
+                    ),
+                    snapshots_dir=SNAPSHOTS_DIR,
+                    metadata=pr_meta,
+                    files_list=sess["files"],
+                    repo_dir=r_dir,
+                )
+            else:
+                r_dir = auto_detect_repo_dir(str(pr_meta.get("owner")), str(pr_meta.get("repo")), clean_ws)
+                b_root, h_root = materialize_snapshots(
+                    session_id=str(sess.get("sessionId") or f"{pr_meta.get('owner')}-{pr_meta.get('repo')}-pr-{pr_meta.get('number')}"),
+                    owner=str(pr_meta.get("owner")),
+                    repo=str(pr_meta.get("repo")),
+                    base_sha=str(pr_meta.get("baseSha") or ""),
+                    head_sha=str(pr_meta.get("headSha") or ""),
+                    files_list=sess["files"],
+                    repo_dir=r_dir,
+                )
             sess["baseSnapshotRoot"] = b_root
             sess["headSnapshotRoot"] = h_root
         except Exception:
@@ -2328,17 +2868,34 @@ def check_session_head_freshness(
         if entry.get("headSha"):
             latest_sha = str(entry["headSha"])
     elif allow_network:
-        token = get_github_token()
-        if token:
+        if pr.get("provider") == "gerrit" and pr.get("gerritBaseUrl"):
             try:
-                pr_obj = _gh_api_get(f"/repos/{owner}/{repo}/pulls/{pr_num}", token, timeout=3.5)
-                fetched_sha = str(((pr_obj or {}).get("head") or {}).get("sha") or "")
+                from gerrit_adapter import fetch_gerrit_live_head_sha
+
+                fetched_sha, _ps = fetch_gerrit_live_head_sha(
+                    str(pr["gerritBaseUrl"]),
+                    str(pr.get("gerritProject") or repo) or None,
+                    pr_num,
+                    timeout=3.5,
+                )
                 if fetched_sha:
                     latest_sha = fetched_sha
                     cache_data[cache_key] = {"headSha": fetched_sha, "checkedAt": now_ts}
                     _atomic_write_json(cache_path, cache_data)
             except Exception:
                 pass
+        else:
+            token = get_github_token()
+            if token:
+                try:
+                    pr_obj = _gh_api_get(f"/repos/{owner}/{repo}/pulls/{pr_num}", token, timeout=3.5)
+                    fetched_sha = str(((pr_obj or {}).get("head") or {}).get("sha") or "")
+                    if fetched_sha:
+                        latest_sha = fetched_sha
+                        cache_data[cache_key] = {"headSha": fetched_sha, "checkedAt": now_ts}
+                        _atomic_write_json(cache_path, cache_data)
+                except Exception:
+                    pass
 
     is_stale = bool(latest_sha and reviewed_sha and latest_sha != reviewed_sha)
     return {
@@ -2480,7 +3037,13 @@ def build_inbox_payload() -> Dict[str, Any]:
         "deleted": 6,
     }
     items_list.sort(key=lambda x: str(x.get("updatedAt") or ""), reverse=True)
-    items_list.sort(key=lambda x: group_order.get(str(x.get("inboxGroup")), 9))
+    # Surface erred items at the top of the Queued section so quota/timeout issues are immediately visible
+    items_list.sort(
+        key=lambda x: (
+            group_order.get(str(x.get("inboxGroup")), 9),
+            0 if (x.get("inboxGroup") == "queued" and x.get("lastError")) else 1,
+        )
+    )
 
     ready_count = sum(
         1 for i in items_list if i.get("inboxGroup") in ("ready_to_review", "author_action_needed")
@@ -2493,18 +3056,30 @@ def build_inbox_payload() -> Dict[str, Any]:
     analyzing_count = sum(1 for i in items_list if i.get("inboxGroup") == "in_progress")
     queued_count = sum(1 for i in items_list if i.get("inboxGroup") == "queued")
     deleted_count = sum(1 for i in items_list if i.get("inboxGroup") == "deleted")
+    error_count = sum(1 for i in items_list if i.get("inboxGroup") == "queued" and i.get("lastError"))
+    quota_error_count = sum(
+        1
+        for i in items_list
+        if i.get("inboxGroup") == "queued" and i.get("lastError") and i.get("lastErrorKind") == "quota_exhausted"
+    )
 
     max_day = int(settings.get("maxReviewsPerDay") or 0)
     run_today = int(state.get("reviewsRunToday") or 0)
+    cli_caps = discover_agy_models_and_agents(
+        allow_subprocess=not os.path.isfile(INBOX_CLI_CAP_CACHE_PATH)
+    )
 
     return {
         "ok": True,
         "settings": settings,
+        "availableModels": cli_caps.get("models") or [],
+        "availableAgents": cli_caps.get("agents") or [],
         "daemon": daemon,
         "githubLogin": state.get("githubLogin") or "",
         "lastSyncedAt": state.get("lastSyncedAt"),
         "lastCycleAt": state.get("lastCycleAt"),
         "lastSyncError": state.get("lastSyncError") or "",
+        "lastQuotaExhaustedAt": state.get("lastQuotaExhaustedAt") or "",
         "budget": {
             "date": state.get("budgetDate"),
             "reviewsRunToday": run_today,
@@ -2518,6 +3093,8 @@ def build_inbox_payload() -> Dict[str, Any]:
             "analyzing": analyzing_count,
             "queued": queued_count,
             "deleted": deleted_count,
+            "errors": error_count,
+            "quotaErrors": quota_error_count,
         },
         "items": items_list,
     }
@@ -2999,8 +3576,15 @@ def main() -> None:
     parser.add_argument("--max-concurrency", type=int, default=None, help="Max concurrent background reviews (default 1)")
     parser.add_argument("--recency-days", type=int, default=None, help="Only auto-review PRs updated within N days (0 = any)")
     parser.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Background review effort")
+    parser.add_argument("--model", default=None, help="Primary CLI model ID from `agy models` (or 'auto' for CLI default)")
+    parser.add_argument("--fallback-models", default=None, help="Comma-separated fallback model IDs on quota exhaustion ('auto' or 'none')")
+    parser.add_argument("--agent", default=None, help="CLI agent name from `agy agents` (or 'default')")
+    parser.add_argument("--list-models", action="store_true", help="List available CLI models and agents from `agy` as JSON")
+    parser.add_argument("--notify-errors", dest="notify_errors", action="store_true", default=None, help="Enable failure/quota toast alerts")
+    parser.add_argument("--no-notify-errors", dest="notify_errors", action="store_false", help="Disable failure/quota toast alerts")
     parser.add_argument("--mode", choices=["auto_precompute", "sync_queue_only"], default=None, help="Watcher mode")
     parser.add_argument("--watched-repos", default=None, help="Comma-separated owner/repo watchlist")
+    parser.add_argument("--gerrit-hosts", default=None, help="Optional comma-separated Gerrit hosts/URLs to poll in Inbox")
     parser.add_argument("--watch-requested", dest="watch_requested", action="store_true", default=None, help="Sync PRs requesting your review (review-requested:@me) to Inbox")
     parser.add_argument("--no-watch-requested", dest="watch_requested", action="store_false", help="Stop syncing review-requested:@me PRs")
     parser.add_argument("--auto-review-requested", dest="auto_review_requested", action="store_true", default=None, help="Auto-review PRs requesting your review (review-requested:@me)")
@@ -3062,6 +3646,10 @@ def main() -> None:
         run_daemon_loop()
         return
 
+    if args.list_models:
+        print(json.dumps({"ok": True, **discover_agy_models_and_agents(force_refresh=True)}, indent=2))
+        return
+
     updates: Dict[str, Any] = {}
     if args.settings_json.strip():
         updates.update(json.loads(args.settings_json))
@@ -3081,10 +3669,20 @@ def main() -> None:
         updates["onlyUpdatedWithinDays"] = args.recency_days
     if args.effort is not None:
         updates["effort"] = args.effort
+    if args.model is not None:
+        updates["cliModel"] = args.model
+    if args.fallback_models is not None:
+        updates["cliFallbackModels"] = args.fallback_models
+    if args.agent is not None:
+        updates["cliAgent"] = args.agent
+    if args.notify_errors is not None:
+        updates["notifyOnError"] = bool(args.notify_errors)
     if args.mode is not None:
         updates["mode"] = args.mode
     if args.watched_repos is not None:
         updates["watchedRepos"] = args.watched_repos
+    if args.gerrit_hosts is not None:
+        updates["gerritHosts"] = args.gerrit_hosts
     if args.watch_involved is not None:
         updates["watchInvolvedPrs"] = bool(args.watch_involved)
     if args.watch_requested is not None:

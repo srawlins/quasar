@@ -83,18 +83,24 @@ class InboxSettings {
     required this.includeDrafts,
     required this.effort,
     required this.commentsOnly,
+    this.cliModel = '',
+    this.cliFallbackModels = const <String>[],
+    this.cliAgent = '',
     required this.pollIntervalMinutes,
     required this.maxConcurrency,
     required this.maxReviewsPerCycle,
     required this.maxReviewsPerDay,
     required this.onlyUpdatedWithinDays,
     required this.notifyWhenReady,
+    this.notifyOnError = true,
     this.incrementalUpdates = true,
   });
 
   factory InboxSettings.fromJson(Map<String, dynamic> json) {
     final List<dynamic> rawRepos =
         (json['watchedRepos'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<dynamic> rawFallbacks =
+        (json['cliFallbackModels'] as List<dynamic>?) ?? const <dynamic>[];
     final bool legacyInvolved = json['watchInvolvedPrs'] != false;
     final bool watchReq = json['watchReviewRequested'] != false;
     final bool watchRevBy = json.containsKey('watchReviewedBy')
@@ -143,6 +149,12 @@ class InboxSettings {
       includeDrafts: json['includeDrafts'] == true,
       effort: '${json['effort'] ?? 'high'}',
       commentsOnly: json['commentsOnly'] == true,
+      cliModel: '${json['cliModel'] ?? ''}',
+      cliFallbackModels: rawFallbacks
+          .map((dynamic e) => '$e'.trim())
+          .where((String s) => s.isNotEmpty)
+          .toList(),
+      cliAgent: '${json['cliAgent'] ?? ''}',
       pollIntervalMinutes:
           (json['pollIntervalMinutes'] as num?)?.toInt() ?? 15,
       maxConcurrency: (json['maxConcurrency'] as num?)?.toInt() ?? 1,
@@ -151,6 +163,7 @@ class InboxSettings {
       onlyUpdatedWithinDays:
           (json['onlyUpdatedWithinDays'] as num?)?.toInt() ?? 14,
       notifyWhenReady: json['notifyWhenReady'] != false,
+      notifyOnError: json['notifyOnError'] != false,
       incrementalUpdates: json['incrementalUpdates'] != false,
     );
   }
@@ -180,13 +193,30 @@ class InboxSettings {
   final bool includeDrafts;
   final String effort;
   final bool commentsOnly;
+  final String cliModel;
+  final List<String> cliFallbackModels;
+  final String cliAgent;
   final int pollIntervalMinutes;
   final int maxConcurrency;
   final int maxReviewsPerCycle;
   final int maxReviewsPerDay;
   final int onlyUpdatedWithinDays;
   final bool notifyWhenReady;
+  final bool notifyOnError;
   final bool incrementalUpdates;
+}
+
+class CliModelOption {
+  const CliModelOption({required this.id, required this.label});
+
+  factory CliModelOption.fromJson(Map<String, dynamic> json) {
+    final String id = '${json['id'] ?? 'auto'}'.trim();
+    final String lbl = '${json['label'] ?? id}'.trim();
+    return CliModelOption(id: id.isEmpty ? 'auto' : id, label: lbl);
+  }
+
+  final String id;
+  final String label;
 }
 
 class InboxItem {
@@ -213,6 +243,7 @@ class InboxItem {
     required this.tldr,
     required this.skipReason,
     required this.lastError,
+    this.lastErrorKind = '',
     this.headSha = '',
   });
 
@@ -241,6 +272,7 @@ class InboxItem {
       tldr: '${json['tldr'] ?? ''}',
       skipReason: '${json['skipReason'] ?? ''}',
       lastError: '${json['lastError'] ?? ''}',
+      lastErrorKind: '${json['lastErrorKind'] ?? ''}',
       headSha: '${json['headSha'] ?? ''}',
     );
   }
@@ -268,6 +300,12 @@ class InboxItem {
   final String tldr;
   final String skipReason;
   final String lastError;
+  final String lastErrorKind;
+
+  bool get isQuotaError =>
+      lastErrorKind == 'quota_exhausted' ||
+      lastError.toLowerCase().contains('quota') ||
+      lastError.toLowerCase().contains('out of model');
 
   bool get isReadyToOpen => status == 'ready' || status == 'quarantined';
 }
@@ -281,8 +319,12 @@ class InboxPayload {
     required this.maxReviewsPerDay,
     required this.readyCount,
     required this.unreadReadyCount,
+    this.errorCount = 0,
+    this.quotaErrorCount = 0,
     required this.lastSyncError,
     required this.items,
+    this.availableModels = const <CliModelOption>[],
+    this.availableAgents = const <String>[],
   });
 
   factory InboxPayload.fromJson(Map<String, dynamic> json) {
@@ -300,6 +342,10 @@ class InboxPayload {
             const <String, dynamic>{};
     final List<dynamic> rawItems =
         (json['items'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<dynamic> rawModels =
+        (json['availableModels'] as List<dynamic>?) ?? const <dynamic>[];
+    final List<dynamic> rawAgents =
+        (json['availableAgents'] as List<dynamic>?) ?? const <dynamic>[];
     return InboxPayload(
       settings: InboxSettings.fromJson(rawCfg),
       daemonRunning: rawDaemon['running'] == true,
@@ -308,10 +354,20 @@ class InboxPayload {
       maxReviewsPerDay: (rawBudget['maxReviewsPerDay'] as num?)?.toInt() ?? 6,
       readyCount: (rawCounts['ready'] as num?)?.toInt() ?? 0,
       unreadReadyCount: (rawCounts['unreadReady'] as num?)?.toInt() ?? 0,
+      errorCount: (rawCounts['errors'] as num?)?.toInt() ?? 0,
+      quotaErrorCount: (rawCounts['quotaErrors'] as num?)?.toInt() ?? 0,
       lastSyncError: '${json['lastSyncError'] ?? ''}',
       items: rawItems
           .whereType<Map<String, dynamic>>()
           .map(InboxItem.fromJson)
+          .toList(),
+      availableModels: rawModels
+          .whereType<Map<String, dynamic>>()
+          .map(CliModelOption.fromJson)
+          .toList(),
+      availableAgents: rawAgents
+          .map((dynamic e) => '$e'.trim())
+          .where((String s) => s.isNotEmpty)
           .toList(),
     );
   }
@@ -323,8 +379,12 @@ class InboxPayload {
   final int maxReviewsPerDay;
   final int readyCount;
   final int unreadReadyCount;
+  final int errorCount;
+  final int quotaErrorCount;
   final String lastSyncError;
   final List<InboxItem> items;
+  final List<CliModelOption> availableModels;
+  final List<String> availableAgents;
 }
 
 class SessionSummary {
@@ -536,6 +596,8 @@ class ReviewSession {
 
 class PrMetadata {
   const PrMetadata({
+    this.provider = 'github',
+    this.patchSet,
     required this.owner,
     required this.repo,
     required this.number,
@@ -552,6 +614,8 @@ class PrMetadata {
 
   factory PrMetadata.fromJson(Map<String, dynamic> json) {
     return PrMetadata(
+      provider: '${json['provider'] ?? 'github'}',
+      patchSet: (json['patchSet'] as num?)?.toInt(),
       owner: '${json['owner'] ?? ''}',
       repo: '${json['repo'] ?? ''}',
       number: (json['number'] as num?)?.toInt(),
@@ -567,6 +631,10 @@ class PrMetadata {
     );
   }
 
+  final String provider;
+  final int? patchSet;
+  bool get isGerrit => provider == 'gerrit';
+  String get remoteLabel => isGerrit ? 'Gerrit' : 'GitHub';
   final String owner;
   final String repo;
   final int? number;

@@ -555,6 +555,60 @@ function safeRealpath(p) {
  * `--settings` permissions scoped strictly to Quasar's scripts and state directory (plus
  * working-tree edits/tests only when explicitly requested by user action).
  */
+function readCliDispatchConfigSync() {
+  let cliModel = '';
+  let cliFallbackModels = [];
+  let cliAgent = '';
+  let cachedModels = [];
+  try {
+    const settingsPath = path.join(REVIEW_STATE_DIR, 'inbox', 'settings.json');
+    if (fs.existsSync(settingsPath)) {
+      const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8') || '{}');
+      const m = String(s.cliModel || '').trim();
+      if (m && m.toLowerCase() !== 'auto' && m.toLowerCase() !== 'default') {
+        cliModel = m;
+      }
+      if (Array.isArray(s.cliFallbackModels)) {
+        cliFallbackModels = s.cliFallbackModels.map((x) => String(x || '').trim()).filter(Boolean);
+      }
+      const a = String(s.cliAgent || '').trim();
+      if (a && !['default', 'main', 'none', 'auto'].includes(a.toLowerCase())) {
+        cliAgent = a;
+      }
+    }
+  } catch (_) {}
+  try {
+    const capPath = path.join(REVIEW_STATE_DIR, 'inbox', 'cli_capabilities_cache.json');
+    if (fs.existsSync(capPath)) {
+      const cap = JSON.parse(fs.readFileSync(capPath, 'utf8') || '{}');
+      if (Array.isArray(cap.models)) {
+        cachedModels = cap.models
+          .map((m) => String((m && m.id) || '').trim())
+          .filter(Boolean);
+      }
+    }
+  } catch (_) {}
+
+  let fallbacks = [];
+  if (cliFallbackModels.length === 1 && cliFallbackModels[0].toLowerCase() === 'none') {
+    fallbacks = [];
+  } else if (cliFallbackModels.length > 0) {
+    fallbacks = cliFallbackModels.filter((m) => m !== cliModel);
+  } else {
+    fallbacks = cachedModels
+      .filter(
+        (id) =>
+          id !== 'auto' &&
+          id !== cliModel &&
+          !id.toLowerCase().includes('lite') &&
+          !id.toLowerCase().includes('coordinator') &&
+          (id.endsWith('-high') || id.endsWith('-next'))
+      )
+      .slice(0, 2);
+  }
+  return { cliModel, fallbacks, cliAgent };
+}
+
 function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
   return new Promise((resolve) => {
     const agyBin = findAgyBinary();
@@ -619,10 +673,22 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
       permissions: { allow: allowRules },
     });
 
+    const cliCfg = readCliDispatchConfigSync();
+    const effectiveModel =
+      options && options.cliModel !== undefined ? String(options.cliModel || '') : cliCfg.cliModel;
+    const effectiveAgent =
+      options && options.cliAgent !== undefined ? String(options.cliAgent || '') : cliCfg.cliAgent;
+
     const args = [
       '--output-format=stream-json',
       `--mode=${allowRepoEdits || allowAgentConfigEdits ? 'accept-edits' : 'auto'}`,
     ];
+    if (effectiveModel) {
+      args.push(`--model=${effectiveModel}`);
+    }
+    if (effectiveAgent) {
+      args.push(`--agent=${effectiveAgent}`);
+    }
     const addedDirs = new Set();
     for (const d of [realWs, realStateDir, realPluginDir]) {
       if (d && fs.existsSync(d) && !addedDirs.has(d)) {
@@ -636,8 +702,48 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
     const runCwd = realWs && fs.existsSync(realWs) ? realWs : os.homedir();
     let settled = false;
     let discoveredConvId = null;
+    let persistedConvId = false;
     let stdoutBuf = '';
     let stderrBuf = '';
+    let agentTextBuf = '';
+    let streamErrorMsg = '';
+    let sawModelExecution = false;
+
+    const reconcilePendingThread = (fallbackReplyText, errText) => {
+      const pendingTid = options && options.pendingThreadId;
+      if (!pendingTid) return;
+      try {
+        const latestSess = loadActiveSession();
+        if (!latestSess || !Array.isArray(latestSess.threads)) return;
+        const targetT = latestSess.threads.find((t) => t.id === pendingTid);
+        if (!targetT || !Array.isArray(targetT.messages)) return;
+        const hasPending = targetT.messages.some((m) => m && m.pending);
+        if (!hasPending) return;
+
+        targetT.messages = targetT.messages.filter((m) => !m || !m.pending);
+        const cleanReply = String(fallbackReplyText || '').trim();
+        if (cleanReply) {
+          targetT.messages.push({
+            author: 'Quasar',
+            body: cleanReply,
+            timestamp: new Date().toISOString(),
+          });
+          delete targetT.pendingInlineDraft;
+        } else {
+          const cleanErr = String(errText || 'Agent exited before posting a reply').trim();
+          targetT.messages.push({
+            author: 'Quasar',
+            body: `⚠️ *Quasar could not complete the reply (${cleanErr}).*`,
+            timestamp: new Date().toISOString(),
+          });
+          if (settled) {
+            vscode.window.showWarningMessage(`Quasar inline reply failed: ${cleanErr}`);
+          }
+        }
+        saveActiveSession(latestSess);
+        refreshAllUI(false);
+      } catch (_) {}
+    };
 
     let proc;
     try {
@@ -662,8 +768,8 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
     }
 
     const persistCliConvId = (cid) => {
-      if (!cid || discoveredConvId) return;
-      discoveredConvId = cid;
+      if (!cid || persistedConvId) return;
+      persistedConvId = true;
       try {
         const latestSess = loadActiveSession();
         if (latestSess) {
@@ -682,7 +788,7 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
       resolve(payload);
     };
 
-    // Resolve promptly once `agy` starts running (or emits `init` with its conversation_id)
+    // Wait 3.5s before early-resolving so immediate startup/429 quota errors (usually <1.5s) are caught cleanly
     const earlyResolveTimer = setTimeout(() => {
       finishResolve({
         success: true,
@@ -690,7 +796,7 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
         conversationId: discoveredConvId,
         stdout: '',
       });
-    }, 2500);
+    }, 3500);
 
     if (proc.stdout) {
       proc.stdout.on('data', (chunk) => {
@@ -709,24 +815,35 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
                 (ev.step_update && ev.step_update.conversation_id) ||
                 (ev.result && ev.result.conversation_id) ||
                 '';
-              if (cid) {
-                persistCliConvId(String(cid));
+              if (cid && !discoveredConvId) {
+                discoveredConvId = String(cid);
+              }
+              const su = ev.step_update;
+              if (su && su.step_type && su.step_type !== 'user_input') {
+                sawModelExecution = true;
+                if (discoveredConvId) {
+                  persistCliConvId(discoveredConvId);
+                }
+                if (su.step_type === 'agent_response' && typeof su.text_delta === 'string') {
+                  agentTextBuf += su.text_delta;
+                }
                 clearTimeout(earlyResolveTimer);
                 finishResolve({
                   success: true,
                   mode: 'agy-cli',
-                  conversationId: String(cid),
+                  conversationId: discoveredConvId || '',
                   stdout: line,
                 });
               }
               if (ev.event === 'result' && ev.result && ev.result.status === 'ERROR') {
+                streamErrorMsg = String(ev.result.error || 'agy CLI returned ERROR');
                 clearTimeout(earlyResolveTimer);
-                finishResolve({
-                  success: false,
-                  error: ev.result.error || 'agy CLI returned ERROR',
-                });
+              } else if (ev.error) {
+                streamErrorMsg = String(ev.error);
               }
             } catch (_) {}
+          } else if (/RESOURCE_EXHAUSTED|exhausted your capacity|error:/i.test(line)) {
+            streamErrorMsg = line.slice(0, 300);
           }
         }
       });
@@ -742,34 +859,71 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
 
     proc.on('error', (err) => {
       clearTimeout(earlyResolveTimer);
+      const msg = (err && err.message) || 'agy CLI process error';
+      reconcilePendingThread('', msg);
       finishResolve({
         success: false,
-        error: (err && err.message) || 'agy CLI process error',
+        error: msg,
       });
     });
 
     proc.on('close', (code) => {
       clearTimeout(earlyResolveTimer);
       activeAgyCliJobsCount = Math.max(0, activeAgyCliJobsCount - 1);
-      if (!settled) {
-        if (code === 0) {
+      if (typeof onAgyCliJobStateChanged === 'function') {
+        try {
+          onAgyCliJobStateChanged();
+        } catch (_) {}
+      }
+
+      const combinedErr = [streamErrorMsg, stderrBuf.trim()].filter(Boolean).join(' — ');
+      const isQuotaExhausted =
+        !sawModelExecution &&
+        (code === 3 || /RESOURCE_EXHAUSTED|exhausted your capacity|quota/i.test(combinedErr));
+
+      if (isQuotaExhausted) {
+        const fallbackModels = cliCfg.fallbacks;
+        const triedIdx = Number((options && options._fallbackModelIdx) || 0);
+        if (triedIdx < fallbackModels.length) {
+          const nextModel = fallbackModels[triedIdx];
+          dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, {
+            ...options,
+            cliModel: nextModel,
+            _fallbackModelIdx: triedIdx + 1,
+          }).then((retryRes) => {
+            finishResolve(retryRes);
+          });
+          return;
+        }
+      }
+
+      const errSummary =
+        combinedErr ||
+        (code === 3
+          ? 'Model quota exhausted on CLI default model'
+          : code !== 0
+          ? `agy CLI exited with code ${code}`
+          : '');
+
+      if (code === 0) {
+        reconcilePendingThread(agentTextBuf, '');
+        if (!settled) {
           finishResolve({
             success: true,
             mode: 'agy-cli',
             conversationId: discoveredConvId,
             stdout: '',
           });
-        } else {
+        }
+      } else {
+        if (!settled) {
           finishResolve({
             success: false,
-            error: stderrBuf.trim() || `agy CLI exited with code ${code}`,
+            error: errSummary || `agy CLI exited with code ${code}`,
           });
+        } else {
+          reconcilePendingThread(agentTextBuf, errSummary);
         }
-      }
-      if (typeof onAgyCliJobStateChanged === 'function') {
-        try {
-          onAgyCliJobStateChanged();
-        } catch (_) {}
       }
     });
   });
@@ -1771,12 +1925,16 @@ const DEFAULT_INBOX_SETTINGS = {
   includeDrafts: false,
   effort: 'high',
   commentsOnly: false,
+  cliModel: '',
+  cliFallbackModels: [],
+  cliAgent: '',
   pollIntervalMinutes: 15,
   maxConcurrency: 1,
   maxReviewsPerCycle: 1,
   maxReviewsPerDay: 6,
   onlyUpdatedWithinDays: 14,
   notifyWhenReady: true,
+  notifyOnError: true,
 };
 
 const INBOX_ROLE_SHORT_LABELS = {
@@ -1969,6 +2127,11 @@ function loadInboxPayloadSync() {
     const ga = orderMap[a.inboxGroup] ?? 9;
     const gb = orderMap[b.inboxGroup] ?? 9;
     if (ga !== gb) return ga - gb;
+    if (a.inboxGroup === 'queued') {
+      const ea = a.lastError ? 0 : 1;
+      const eb = b.lastError ? 0 : 1;
+      if (ea !== eb) return ea - eb;
+    }
     return String(b.updatedAt || '').localeCompare(String(a.updatedAt || ''));
   });
 
@@ -1976,6 +2139,8 @@ function loadInboxPayloadSync() {
     (i) => i.inboxGroup === 'ready_to_review' || i.inboxGroup === 'author_action_needed'
   );
   const unreadReady = readyItems.filter((i) => Boolean(i.unread));
+  const erredQueued = itemsList.filter((i) => i.inboxGroup === 'queued' && Boolean(i.lastError));
+  const quotaErred = erredQueued.filter((i) => i.lastErrorKind === 'quota_exhausted');
   const maxDay = Number(settings.maxReviewsPerDay || 0);
   const runToday = state.budgetDate === today ? Number(state.reviewsRunToday || 0) : 0;
 
@@ -1985,6 +2150,7 @@ function loadInboxPayloadSync() {
     githubLogin: state.githubLogin || '',
     lastSyncedAt: state.lastSyncedAt || null,
     lastSyncError: state.lastSyncError || '',
+    lastQuotaExhaustedAt: state.lastQuotaExhaustedAt || '',
     budget: {
       reviewsRunToday: runToday,
       maxReviewsPerDay: maxDay,
@@ -1997,6 +2163,8 @@ function loadInboxPayloadSync() {
       analyzing: itemsList.filter((i) => i.inboxGroup === 'in_progress').length,
       queued: itemsList.filter((i) => i.inboxGroup === 'queued').length,
       deleted: itemsList.filter((i) => i.inboxGroup === 'deleted').length,
+      errors: erredQueued.length,
+      quotaErrors: quotaErred.length,
     },
     items: itemsList,
   };
@@ -2187,6 +2355,41 @@ class InboxTreeProvider {
         roots.push(errItem);
       }
 
+      const erredItems = items.filter((i) => i.inboxGroup === 'queued' && Boolean(i.lastError));
+      if (erredItems.length > 0) {
+        const hasQuotaErr = erredItems.some(
+          (i) =>
+            i.lastErrorKind === 'quota_exhausted' ||
+            /quota|token|exhausted/i.test(String(i.lastError || ''))
+        );
+        const failBanner = new vscode.TreeItem(
+          hasQuotaErr
+            ? `Out of Model Quota (${erredItems.length} PR${erredItems.length === 1 ? '' : 's'} paused)`
+            : `Background Review Issue (${erredItems.length} PR${erredItems.length === 1 ? '' : 's'})`,
+          vscode.TreeItemCollapsibleState.None
+        );
+        failBanner.description = hasQuotaErr
+          ? 'Click to switch CLI Model / Agent'
+          : 'See Queued items below or click to configure';
+        failBanner.iconPath = new vscode.ThemeIcon(
+          'warning',
+          new vscode.ThemeColor(hasQuotaErr ? 'charts.red' : 'charts.yellow')
+        );
+        failBanner.tooltip = new vscode.MarkdownString(
+          `### ⚠️ Background Pre-Review Alert\n\n` +
+            erredItems
+              .slice(0, 5)
+              .map((i) => `- **${i.repo}#${i.number}**: ${i.lastError}`)
+              .join('\n') +
+            `\n\n*Click to choose a different CLI Model, Fallback chain, or Agent.*`
+        );
+        failBanner.command = {
+          command: 'quasar.configureInboxModel',
+          title: 'Choose CLI Model, Quota Fallback & Agent',
+        };
+        roots.push(failBanner);
+      }
+
       if (items.length === 0) {
         const syncNowItem = new vscode.TreeItem(
           'Sync My GitHub PR Queue Now (0 Tokens)',
@@ -2312,6 +2515,23 @@ class InboxTreeProvider {
             new vscode.ThemeColor('descriptionForeground')
           );
           node.contextValue = 'inbox-item-deleted';
+        } else if (it.lastError) {
+          const isQuota =
+            it.lastErrorKind === 'quota_exhausted' ||
+            /quota|token|exhausted/i.test(String(it.lastError || ''));
+          const shortErr = isQuota
+            ? 'Out of model quota'
+            : it.lastErrorKind === 'timeout'
+            ? 'Timed out'
+            : 'Failed';
+          node.description = it.skipReason
+            ? `${shortErr} • ${it.skipReason}`
+            : `${shortErr} — click ⚡ to retry`;
+          node.iconPath = new vscode.ThemeIcon(
+            'warning',
+            new vscode.ThemeColor(isQuota ? 'charts.red' : 'charts.yellow')
+          );
+          node.contextValue = 'inbox-item-queued';
         } else {
           node.description = it.skipReason
             ? `${hasDiffStats ? `${diffStats} • ` : ''}${it.skipReason}`
@@ -2341,6 +2561,9 @@ class InboxTreeProvider {
         ];
         if (it.tldr) {
           tipLines.push('', `**TL;DR**: ${it.tldr}`);
+        }
+        if (it.lastError) {
+          tipLines.push('', `> ⚠️ **Last Background Run Failed**: ${it.lastError}`);
         }
         if (it.status === 'ready') {
           tipLines.push('', '*Click to open this pre-computed review in **0 seconds**.*');
@@ -7440,6 +7663,7 @@ function activate(context) {
   }
 
   const notifiedReadyInboxKeys = new Set();
+  const notifiedErrorInboxKeys = new Set();
   let inboxNotifyInitialized = false;
 
   function refreshInboxUI(allowReadyToast = false) {
@@ -7462,6 +7686,9 @@ function activate(context) {
           if (it.status === 'ready' && it.analyzedFingerprint) {
             notifiedReadyInboxKeys.add(`${it.id}:${it.analyzedFingerprint}`);
           }
+          if (it.lastError) {
+            notifiedErrorInboxKeys.add(`${it.id}:${it.lastErrorAt || it.lastError}`);
+          }
         }
         return;
       }
@@ -7469,24 +7696,51 @@ function activate(context) {
       if (
         allowReadyToast &&
         inboxPayload.settings &&
-        inboxPayload.settings.notifyWhenReady !== false &&
         (!vscode.window.state || vscode.window.state.focused)
       ) {
-        for (const it of inboxPayload.items || []) {
-          if (it.status === 'ready' && it.analyzedFingerprint) {
-            const key = `${it.id}:${it.analyzedFingerprint}`;
-            if (!notifiedReadyInboxKeys.has(key)) {
-              notifiedReadyInboxKeys.add(key);
-              vscode.window
-                .showInformationMessage(
-                  `📥 Ready in Quasar Inbox (0s open): ${it.repo}#${it.number} — ${it.title || ''}`,
-                  'Open Review Now'
-                )
-                .then((choice) => {
-                  if (choice === 'Open Review Now') {
-                    vscode.commands.executeCommand('quasar.openInboxItem', it);
-                  }
-                });
+        if (inboxPayload.settings.notifyWhenReady !== false) {
+          for (const it of inboxPayload.items || []) {
+            if (it.status === 'ready' && it.analyzedFingerprint) {
+              const key = `${it.id}:${it.analyzedFingerprint}`;
+              if (!notifiedReadyInboxKeys.has(key)) {
+                notifiedReadyInboxKeys.add(key);
+                vscode.window
+                  .showInformationMessage(
+                    `📥 Ready in Quasar Inbox (0s open): ${it.repo}#${it.number} — ${it.title || ''}`,
+                    'Open Review Now'
+                  )
+                  .then((choice) => {
+                    if (choice === 'Open Review Now') {
+                      vscode.commands.executeCommand('quasar.openInboxItem', it);
+                    }
+                  });
+              }
+            }
+          }
+        }
+
+        if (inboxPayload.settings.notifyOnError !== false) {
+          for (const it of inboxPayload.items || []) {
+            if (it.inboxGroup === 'queued' && it.lastError) {
+              const errKey = `${it.id}:${it.lastErrorAt || it.lastError}`;
+              if (!notifiedErrorInboxKeys.has(errKey)) {
+                notifiedErrorInboxKeys.add(errKey);
+                const isQuota =
+                  it.lastErrorKind === 'quota_exhausted' ||
+                  /quota|token|exhausted/i.test(String(it.lastError || ''));
+                const msg = isQuota
+                  ? `⚠️ Quasar Background Review Paused (Out of Model Quota): ${it.repo}#${it.number} — ${it.lastError}`
+                  : `⚠️ Quasar Background Review Failed: ${it.repo}#${it.number} — ${it.lastError}`;
+                vscode.window
+                  .showWarningMessage(msg, 'Switch CLI Model / Agent...', 'Retry Now')
+                  .then((choice) => {
+                    if (choice === 'Switch CLI Model / Agent...') {
+                      vscode.commands.executeCommand('quasar.configureInboxModel');
+                    } else if (choice === 'Retry Now') {
+                      vscode.commands.executeCommand('quasar.precomputeInboxItemNow', it);
+                    }
+                  });
+              }
             }
           }
         }
@@ -8263,6 +8517,18 @@ function activate(context) {
             act: 'effort',
           },
           {
+            label: `$(hubot) CLI Model, Quota Fallback & Agent: ${cfg.cliModel || 'Auto (CLI Default)'}${
+              cfg.cliAgent ? ` • Agent: ${cfg.cliAgent}` : ''
+            }`,
+            description:
+              Array.isArray(cfg.cliFallbackModels) && cfg.cliFallbackModels[0] === 'none'
+                ? 'Fallback: Off (click to choose model / fallback / agent from `agy models`)'
+                : Array.isArray(cfg.cliFallbackModels) && cfg.cliFallbackModels.length > 0
+                ? `Fallback: ${cfg.cliFallbackModels.join(' → ')}`
+                : 'Fallback: Auto-discover on quota exhaustion (click to customize)',
+            act: 'cli_model',
+          },
+          {
             label: `$(repo) Watched Repositories Filter / Extra Repos (${(cfg.watchedRepos || []).length
               })`,
             description:
@@ -8289,6 +8555,11 @@ function activate(context) {
             label: `$(bell) Ready Notification Toast: ${cfg.notifyWhenReady ? 'ON' : 'OFF'}`,
             description: 'Show a quiet IDE toast when a background PR finishes pre-computing',
             act: 'notify',
+          },
+          {
+            label: `$(warning) Failure & Quota Exhaustion Toast: ${cfg.notifyOnError !== false ? 'ON' : 'OFF'}`,
+            description: 'Alert immediately if a background review runs out of model quota or times out',
+            act: 'notify_error',
           },
         ];
 
@@ -8649,11 +8920,220 @@ function activate(context) {
             ]);
             refreshInboxUI(false);
           }
+        } else if (picked.act === 'cli_model') {
+          await vscode.commands.executeCommand('quasar.configureInboxModel');
         } else if (picked.act === 'notify') {
           await runInboxWatcher([
             '--configure',
             '--settings-json',
             JSON.stringify({ notifyWhenReady: !cfg.notifyWhenReady }),
+          ]);
+          refreshInboxUI(false);
+        } else if (picked.act === 'notify_error') {
+          await runInboxWatcher([
+            '--configure',
+            '--settings-json',
+            JSON.stringify({ notifyOnError: cfg.notifyOnError === false }),
+          ]);
+          refreshInboxUI(false);
+        }
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.configureInboxModel', async () => {
+      const caps = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Quasar: Discovering available CLI models & agents (`agy models`)...',
+          cancellable: false,
+        },
+        () => runInboxWatcher(['--list-models'], 10000)
+      );
+      const availModels =
+        caps && Array.isArray(caps.models) && caps.models.length > 0
+          ? caps.models
+          : [{ id: 'auto', label: 'Auto (CLI Default)' }];
+      const availAgents = caps && Array.isArray(caps.agents) ? caps.agents : [];
+
+      while (true) {
+        const snap = loadInboxPayloadSync();
+        const cfg = snap.settings;
+        const curModel = cfg.cliModel || 'auto';
+        const curModelObj = availModels.find((m) => m.id === curModel);
+        const curModelDisplay = curModelObj
+          ? `${curModelObj.label} (${curModelObj.id})`
+          : curModel;
+        const fbArr = Array.isArray(cfg.cliFallbackModels) ? cfg.cliFallbackModels : [];
+        const fbDisplay =
+          fbArr.length === 0
+            ? 'Auto-discover on quota exhaustion'
+            : fbArr[0] === 'none'
+            ? 'Disabled (no fallback)'
+            : fbArr.join(' → ');
+        const curAgentDisplay = cfg.cliAgent || 'Default Agent (main)';
+
+        const topPick = await vscode.window.showQuickPick(
+          [
+            {
+              label: `$(hubot) Primary CLI Model: ${curModelDisplay}`,
+              description: 'Model passed via `agy --model` for background reviews & CLI replies',
+              act: 'primary_model',
+            },
+            {
+              label: `$(sync) Quota-Exhaustion Fallback Chain: ${fbDisplay}`,
+              description: 'Models automatically tried if the primary model runs out of tokens/quota',
+              act: 'fallback_models',
+            },
+            {
+              label: `$(person) CLI Agent: ${curAgentDisplay}`,
+              description:
+                availAgents.length > 0
+                  ? `Available custom agents: ${availAgents.join(', ')}`
+                  : 'Agent passed via `agy --agent` (leave Default for standard Quasar skill)',
+              act: 'agent',
+            },
+          ],
+          {
+            title: '🤖 Quasar: CLI Model, Quota Fallback & Agent (`agy`)',
+            placeHolder: 'Choose which model or agent Quasar uses (Esc when finished)',
+          }
+        );
+        if (!topPick) break;
+
+        if (topPick.act === 'primary_model') {
+          const modelItems = availModels.map((m) => ({
+            label: `${m.id === curModel ? '$(check) ' : ''}${m.label}`,
+            description: m.id === 'auto' ? 'auto (CLI default)' : m.id,
+            modelId: m.id === 'auto' ? '' : m.id,
+          }));
+          modelItems.push({
+            label: '$(edit) Enter custom model ID manually...',
+            description: 'Any model ID accepted by `agy --model`',
+            act: 'custom',
+          });
+          const mPick = await vscode.window.showQuickPick(modelItems, {
+            title: 'Select Primary CLI Model (`agy --model`)',
+            placeHolder: 'Pick a model from `agy models`',
+          });
+          if (!mPick) continue;
+          let chosenModel = mPick.modelId;
+          if (mPick.act === 'custom') {
+            const customM = await vscode.window.showInputBox({
+              title: 'Custom CLI Model ID',
+              prompt: 'Enter model ID (or leave empty for CLI default `auto`)',
+              value: cfg.cliModel || '',
+            });
+            if (customM === undefined) continue;
+            chosenModel = customM.trim();
+          }
+          await runInboxWatcher([
+            '--configure',
+            '--settings-json',
+            JSON.stringify({ cliModel: chosenModel }),
+          ]);
+          refreshInboxUI(false);
+        } else if (topPick.act === 'fallback_models') {
+          const modePick = await vscode.window.showQuickPick(
+            [
+              {
+                label: '$(sparkle) Auto-Discover Fallback Models (Recommended)',
+                description: 'Automatically tries up to 2 alternate models if primary hits quota exhaustion',
+                mode: 'auto',
+              },
+              {
+                label: '$(list-selection) Choose Specific Fallback Models...',
+                description: 'Pick exact fallback model(s) from `agy models`',
+                mode: 'custom',
+              },
+              {
+                label: '$(circle-slash) Disable Model Fallback',
+                description: 'Fail & pause immediately if the primary model runs out of quota',
+                mode: 'none',
+              },
+            ],
+            { title: 'Quota-Exhaustion Fallback Mode' }
+          );
+          if (!modePick) continue;
+          if (modePick.mode === 'auto') {
+            await runInboxWatcher([
+              '--configure',
+              '--settings-json',
+              JSON.stringify({ cliFallbackModels: [] }),
+            ]);
+            refreshInboxUI(false);
+          } else if (modePick.mode === 'none') {
+            await runInboxWatcher([
+              '--configure',
+              '--settings-json',
+              JSON.stringify({ cliFallbackModels: ['none'] }),
+            ]);
+            refreshInboxUI(false);
+          } else {
+            const curSet = new Set(fbArr.filter((x) => x !== 'none'));
+            const multiPicks = await vscode.window.showQuickPick(
+              availModels
+                .filter((m) => m.id !== 'auto' && m.id !== cfg.cliModel)
+                .map((m) => ({
+                  label: m.label,
+                  description: m.id,
+                  picked: curSet.has(m.id),
+                  id: m.id,
+                })),
+              {
+                canPickMany: true,
+                title: 'Select Quota Fallback Models (Ordered)',
+                placeHolder: 'Check 1 or more models to try when primary quota is exhausted',
+              }
+            );
+            if (multiPicks !== undefined) {
+              const ids = multiPicks.map((p) => p.id);
+              await runInboxWatcher([
+                '--configure',
+                '--settings-json',
+                JSON.stringify({ cliFallbackModels: ids.length > 0 ? ids : ['none'] }),
+              ]);
+              refreshInboxUI(false);
+            }
+          }
+        } else if (topPick.act === 'agent') {
+          const agentItems = [
+            {
+              label: `${!cfg.cliAgent ? '$(check) ' : ''}Default Main Agent (Recommended)`,
+              description: 'Uses standard Antigravity agent with Quasar skill & review-* subagents',
+              agentName: '',
+            },
+            ...availAgents.map((a) => ({
+              label: `${cfg.cliAgent === a ? '$(check) ' : ''}${a}`,
+              description: `agy --agent=${a}`,
+              agentName: a,
+            })),
+            {
+              label: '$(edit) Enter custom agent name...',
+              description: 'Pass a custom `--agent` name to `agy`',
+              act: 'custom_agent',
+            },
+          ];
+          const aPick = await vscode.window.showQuickPick(agentItems, {
+            title: 'Select CLI Agent (`agy --agent`)',
+            placeHolder: 'Choose Default Main Agent or a custom agent from `agy agents`',
+          });
+          if (!aPick) continue;
+          let chosenAgent = aPick.agentName;
+          if (aPick.act === 'custom_agent') {
+            const customA = await vscode.window.showInputBox({
+              title: 'Custom CLI Agent Name',
+              prompt: 'Enter agent name for `agy --agent` (or leave empty for Default)',
+              value: cfg.cliAgent || '',
+            });
+            if (customA === undefined) continue;
+            chosenAgent = customA.trim();
+          }
+          await runInboxWatcher([
+            '--configure',
+            '--settings-json',
+            JSON.stringify({ cliAgent: chosenAgent }),
           ]);
           refreshInboxUI(false);
         }
@@ -8952,7 +9432,7 @@ function activate(context) {
         providedUrl ||
         (await vscode.window.showInputBox({
           title: 'Quasar: GitHub PR Link or Local Branch',
-          prompt: 'Paste a GitHub PR URL/number, or enter a local branch name (e.g. feature/my-branch or HEAD)',
+          prompt: 'Paste a GitHub PR URL/number, a local branch name, or a Gerrit change URL',
           placeHolder: 'https://github.com/owner/repo/pull/123 or feature/my-branch',
         }));
       if (!prUrl || !prUrl.trim()) return;
@@ -9707,7 +10187,9 @@ function activate(context) {
       prompt,
       isUpdatingExisting
         ? `Quasar Comment Q&A: ${path.basename(relPath)}:${startLine}`
-        : `Comment Question: ${path.basename(relPath)}:${startLine}`
+        : `Comment Question: ${path.basename(relPath)}:${startLine}`,
+      null,
+      { pendingThreadId: threadId }
     );
 
     if (dispatchRes && dispatchRes.success) {
@@ -10109,7 +10591,9 @@ function activate(context) {
 
     const dispatchRes = await sendPromptToQuasar(
       prompt,
-      `Add Inline Comment: ${isTop ? 'Top-Level' : `${path.basename(loc.relPath)}:${loc.startLine}`}`
+      `Add Inline Comment: ${isTop ? 'Top-Level' : `${path.basename(loc.relPath)}:${loc.startLine}`}`,
+      null,
+      { pendingThreadId: newId }
     );
 
     if (dispatchRes && dispatchRes.success) {
@@ -12640,13 +13124,78 @@ function activate(context) {
     return true;
   }
 
+  async function promptAndConfigureGerritAuth(gerritBaseUrl) {
+    const cleanBase = String(gerritBaseUrl || '').replace(/\/+$/, '');
+    let hostLabel = cleanBase || 'gerrit.example.com';
+    try {
+      hostLabel = new URL(cleanBase).host || hostLabel;
+    } catch (_) {}
+
+    const settingsUrl = cleanBase ? `${cleanBase}/settings/#HTTPCredentials` : '';
+    if (settingsUrl) {
+      const preChoice = await vscode.window.showInformationMessage(
+        `Gerrit Authentication (${hostLabel}): If ~/.gitcookies or ~/.netrc is not configured for ${hostLabel}, generate an HTTP Password in Gerrit Settings and enter it here.`,
+        'Enter Gerrit Username & HTTP Password...',
+        'Open Gerrit HTTP Credentials Page',
+        'Cancel'
+      );
+      if (!preChoice || preChoice === 'Cancel') return false;
+      if (preChoice === 'Open Gerrit HTTP Credentials Page') {
+        vscode.env.openExternal(vscode.Uri.parse(settingsUrl));
+      }
+    }
+
+    const gUser = await vscode.window.showInputBox({
+      title: `Gerrit HTTP Username (${hostLabel})`,
+      prompt: `Enter your Gerrit HTTP username for ${hostLabel}`,
+      placeHolder: 'username',
+      ignoreFocusOut: true,
+    });
+    if (!gUser || !gUser.trim()) return false;
+
+    const gPass = await vscode.window.showInputBox({
+      title: `Gerrit HTTP Password / Token (${hostLabel})`,
+      prompt: `Enter your Gerrit HTTP password for ${hostLabel} (stored locally with 0600 permissions)`,
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (!gPass || !gPass.trim()) return false;
+
+    const verifyRes = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Quasar: Verifying Gerrit credentials on ${hostLabel}...`,
+        cancellable: false,
+      },
+      () =>
+        runPostReviewScript([
+          '--set-gerrit-auth',
+          cleanBase || hostLabel,
+          gUser.trim(),
+          gPass.trim(),
+        ])
+    );
+    if (!verifyRes || !verifyRes.ok) {
+      vscode.window.showErrorMessage(
+        `Gerrit credential verification failed: ${(verifyRes && verifyRes.error) || 'Invalid credentials'}`
+      );
+      return false;
+    }
+    const acctName =
+      (verifyRes.account && (verifyRes.account.username || verifyRes.account.name)) || gUser.trim();
+    vscode.window.showInformationMessage(
+      `🔑 Authenticated with Gerrit (${hostLabel}) as ${acctName}!`
+    );
+    return true;
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.configureGithubToken', async () => {
       await promptAndConfigureGithubToken();
     })
   );
 
-  // 10. Publish / Export Review to GitHub (as Authenticated User)
+  // 10. Publish / Export Review to GitHub or Gerrit (as Authenticated User)
   context.subscriptions.push(
     vscode.commands.registerCommand('quasar.exportPendingReview', async () => {
       const session = loadActiveSession();
@@ -12656,27 +13205,50 @@ function activate(context) {
         (t) => isReviewCommentThread(t) && (t.status === 'open' || t.status === 'candidate')
       );
 
-      // Check authentication status first
-      let authStatus = await runPostReviewScript(['--auth-status']);
+      const isGerritSession = Boolean(session.pr && session.pr.provider === 'gerrit');
+      const remoteName = isGerritSession ? 'Gerrit' : 'GitHub';
       const isLocalSession =
         session.pr && (session.pr.mode === 'local' || !session.pr.number || !session.pr.owner);
 
-      if ((!authStatus || !authStatus.authenticated) && !isLocalSession) {
-        const setupChoice = await vscode.window.showInformationMessage(
-          'To publish this review to GitHub as you, please provide your GitHub Personal Access Token (API Key).',
-          'Configure GitHub API Key...',
-          'Export Local Markdown Instead'
-        );
-        if (!setupChoice) return;
-        if (setupChoice === 'Configure GitHub API Key...') {
-          const ok = await promptAndConfigureGithubToken({ forcePrompt: true });
-          if (!ok) return;
-          authStatus = await runPostReviewScript(['--auth-status']);
-        }
-      }
+      let userHandle = isGerritSession ? 'your Gerrit account' : 'your GitHub account';
 
-      const userHandle =
-        (authStatus && authStatus.login && `@${authStatus.login}`) || 'your GitHub account';
+      if (isGerritSession) {
+        const gBase = session.pr.gerritBaseUrl || session.pr.url || session.pr.owner || '';
+        let gStatus = await runPostReviewScript(['--gerrit-auth-status', '--gerrit-host', gBase]);
+        const isAuthed = Boolean(gStatus && gStatus.targetHost && gStatus.targetHost.authenticated);
+        if (!isAuthed) {
+          const setupChoice = await vscode.window.showInformationMessage(
+            `To publish this review to Gerrit (${session.pr.owner || 'Gerrit'}), configure Gerrit HTTP credentials (or ~/.gitcookies / ~/.netrc).`,
+            'Configure Gerrit Credentials...',
+            'Cancel'
+          );
+          if (setupChoice !== 'Configure Gerrit Credentials...') return;
+          const ok = await promptAndConfigureGerritAuth(gBase);
+          if (!ok) return;
+          gStatus = await runPostReviewScript(['--gerrit-auth-status', '--gerrit-host', gBase]);
+        }
+        if (gStatus && gStatus.targetHost && gStatus.targetHost.source) {
+          userHandle = `Gerrit (${gStatus.targetHost.source})`;
+        }
+      } else {
+        // Check GitHub authentication status
+        let authStatus = await runPostReviewScript(['--auth-status']);
+        if ((!authStatus || !authStatus.authenticated) && !isLocalSession) {
+          const setupChoice = await vscode.window.showInformationMessage(
+            'To publish this review to GitHub as you, please provide your GitHub Personal Access Token (API Key).',
+            'Configure GitHub API Key...',
+            'Export Local Markdown Instead'
+          );
+          if (!setupChoice) return;
+          if (setupChoice === 'Configure GitHub API Key...') {
+            const ok = await promptAndConfigureGithubToken({ forcePrompt: true });
+            if (!ok) return;
+            authStatus = await runPostReviewScript(['--auth-status']);
+          }
+        }
+        userHandle =
+          (authStatus && authStatus.login && `@${authStatus.login}`) || 'your GitHub account';
+      }
 
       // If no comments are staged yet but there are open candidates, offer to stage or publish summary-only
       if (staged.length === 0 && candidates.length > 0) {
@@ -12710,15 +13282,28 @@ function activate(context) {
       }
 
       const finalStaged = (session.threads || []).filter((t) => t.status === 'staged');
-      const hasExistingPending = Boolean(session.githubPendingReviewId);
+      const hasExistingPending = isGerritSession
+        ? Boolean(Array.isArray(session.gerritDraftIds) && session.gerritDraftIds.length > 0)
+        : Boolean(session.githubPendingReviewId);
+      const authConfigOption = isGerritSession
+        ? {
+            label: '$(key) Update / Configure Gerrit HTTP Credentials...',
+            description: `Current auth: ${userHandle}`,
+            event: 'CONFIGURE_TOKEN',
+          }
+        : {
+            label: '$(key) Update / Configure GitHub API Key...',
+            description: `Current auth: ${userHandle}`,
+            event: 'CONFIGURE_TOKEN',
+          };
 
       const pendingOption = {
         label: hasExistingPending
-          ? `$(sync) Update Existing Pending Review on GitHub as ${userHandle} (PENDING)`
-          : `$(clock) Create / Update Draft Pending Review on GitHub as ${userHandle} (PENDING)`,
+          ? `$(sync) Update Existing Draft Review on ${remoteName} as ${userHandle} (PENDING)`
+          : `$(clock) Create / Update Draft Review on ${remoteName} as ${userHandle} (PENDING)`,
         description: hasExistingPending
-          ? `Replaces your existing pending draft review on GitHub with the latest ${finalStaged.length} staged comment(s) & top-level summary`
-          : `Uploads ${finalStaged.length} inline comment(s) as an unpublished Pending Review on GitHub (or updates your existing pending review)`,
+          ? `Replaces your existing draft comments on ${remoteName} with the latest ${finalStaged.length} staged comment(s)`
+          : `Uploads ${finalStaged.length} inline comment(s) as unpublished Drafts on ${remoteName}`,
         event: 'PENDING',
       };
 
@@ -12727,51 +13312,51 @@ function activate(context) {
             pendingOption,
             {
               label: `$(comment-discussion) Publish Review Now as ${userHandle} (COMMENT)`,
-              description: `Posts ${finalStaged.length} inline comment(s) immediately to the PR under ${userHandle}`,
+              description: `Posts ${finalStaged.length} inline comment(s) immediately to ${remoteName}`,
               event: 'COMMENT',
             },
             {
-              label: `$(check) Approve PR & Publish Review as ${userHandle} (APPROVE)`,
-              description: `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              label: `$(check) Approve & Publish Review as ${userHandle} (APPROVE)`,
+              description: isGerritSession
+                ? `Votes Code-Review +1 and publishes ${finalStaged.length} inline comment(s)`
+                : `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
               event: 'APPROVE',
             },
             {
               label: `$(request-changes) Request Changes & Publish Review as ${userHandle} (REQUEST_CHANGES)`,
-              description: `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              description: isGerritSession
+                ? `Votes Code-Review -1 and publishes ${finalStaged.length} inline comment(s)`
+                : `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
               event: 'REQUEST_CHANGES',
             },
-            {
-              label: '$(key) Update / Configure GitHub API Key...',
-              description: `Current auth: ${userHandle}`,
-              event: 'CONFIGURE_TOKEN',
-            },
+            authConfigOption,
           ]
         : [
             {
               label: `$(comment-discussion) Publish Review Now as ${userHandle} (COMMENT)`,
-              description: `Posts ${finalStaged.length} inline comment(s) immediately to the PR under ${userHandle}`,
+              description: `Posts ${finalStaged.length} inline comment(s) immediately to ${remoteName}`,
               event: 'COMMENT',
             },
             {
-              label: `$(check) Approve PR & Publish Review as ${userHandle} (APPROVE)`,
-              description: `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              label: `$(check) Approve & Publish Review as ${userHandle} (APPROVE)`,
+              description: isGerritSession
+                ? `Votes Code-Review +1 and publishes ${finalStaged.length} inline comment(s)`
+                : `Approves the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
               event: 'APPROVE',
             },
             {
               label: `$(request-changes) Request Changes & Publish Review as ${userHandle} (REQUEST_CHANGES)`,
-              description: `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
+              description: isGerritSession
+                ? `Votes Code-Review -1 and publishes ${finalStaged.length} inline comment(s)`
+                : `Requests changes on the PR and publishes ${finalStaged.length} inline comment(s) under ${userHandle}`,
               event: 'REQUEST_CHANGES',
             },
             pendingOption,
-            {
-              label: '$(key) Update / Configure GitHub API Key...',
-              description: `Current auth: ${userHandle}`,
-              event: 'CONFIGURE_TOKEN',
-            },
+            authConfigOption,
           ];
 
       const pickedEvent = await vscode.window.showQuickPick(eventChoices, {
-        title: `Publish Review to GitHub (${finalStaged.length} Staged Comment${
+        title: `Publish Review to ${remoteName} (${finalStaged.length} Staged Comment${
           finalStaged.length === 1 ? '' : 's'
         })`,
         placeHolder: `Choose how to publish or update this review as ${userHandle}`,
@@ -12779,7 +13364,11 @@ function activate(context) {
       if (!pickedEvent) return;
 
       if (pickedEvent.event === 'CONFIGURE_TOKEN') {
-        const ok = await promptAndConfigureGithubToken({ forcePrompt: true });
+        const ok = isGerritSession
+          ? await promptAndConfigureGerritAuth(
+              (session.pr && (session.pr.gerritBaseUrl || session.pr.url || session.pr.owner)) || ''
+            )
+          : await promptAndConfigureGithubToken({ forcePrompt: true });
         if (ok) {
           await vscode.commands.executeCommand('quasar.exportPendingReview');
         }
@@ -12817,7 +13406,7 @@ function activate(context) {
       const res = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Quasar: Publishing ${pickedEvent.event} review to GitHub as ${userHandle}...`,
+          title: `Quasar: Publishing ${pickedEvent.event} review to ${remoteName} as ${userHandle}...`,
           cancellable: false,
         },
         () =>
@@ -12831,8 +13420,20 @@ function activate(context) {
       );
 
       if (!res || !res.ok) {
-        const rawErr = (res && res.error) || 'Failed to publish review to GitHub.';
-        const cleanErr = rawErr.replace(/^Failed to publish review:\s*/i, '');
+        const rawErr = (res && res.error) || `Failed to publish review to ${remoteName}.`;
+        const cleanErr = rawErr.replace(/^Failed to publish (?:Gerrit )?review:\s*/i, '');
+        if (isGerritSession) {
+          const retryG = await vscode.window.showErrorMessage(
+            `Failed to publish Gerrit review: ${cleanErr}`,
+            'Configure Gerrit Credentials...'
+          );
+          if (retryG === 'Configure Gerrit Credentials...') {
+            await promptAndConfigureGerritAuth(
+              (session.pr && (session.pr.gerritBaseUrl || session.pr.url || session.pr.owner)) || ''
+            );
+          }
+          return;
+        }
         const isFineGrained403 =
           /403/.test(cleanErr) &&
           (/Resource not accessible by personal access token/i.test(cleanErr) ||
@@ -12887,16 +13488,17 @@ function activate(context) {
           : 'Created Draft Pending Review';
       const asWho = res.published_as ? ` as @${res.published_as}` : '';
       const clipboardHint =
-        res.event === 'PENDING' && res.review_body
+        !isGerritSession && res.event === 'PENDING' && res.review_body
           ? ' 📋 Top-level comment copied to clipboard (paste with Cmd+V in GitHub\'s "Finish your review" box, or publish directly from Quasar).'
           : '';
+      const openBtnLabel = `Open Review on ${remoteName}`;
       const choice = await vscode.window.showInformationMessage(
-        `✅ ${actionLabel}${asWho} on GitHub (${res.comments_exported || 0} inline comment${
+        `✅ ${actionLabel}${asWho} on ${remoteName} (${res.comments_exported || 0} inline comment${
           res.comments_exported === 1 ? '' : 's'
         })!${clipboardHint}`,
-        'Open Review on GitHub'
+        openBtnLabel
       );
-      if (choice === 'Open Review on GitHub' && res.html_url) {
+      if (choice === openBtnLabel && res.html_url) {
         vscode.env.openExternal(vscode.Uri.parse(res.html_url));
       }
     })

@@ -2,7 +2,7 @@
 
 A **comprehension-first, 100% native** GitHub PR & local branch code review tool for Antigravity.
 
-Point **Quasar** at any **GitHub PR URL** or **local branch / working-tree diff** and it automatically:
+Point **Quasar** at any **GitHub PR URL** or **local branch / working-tree diff** (as well as any **Gerrit change URL**) and it automatically:
 1. Fetches the PR metadata or local branch commit history, unified diff, and existing comments.
 2. Materializes clean local `base/` and `head/` file snapshots so native side-by-side diffs (`vscode.diff`) work immediately without dirtying your active branch.
 3. Runs parallel specialist review lenses (architecture, bugs, security, tests, performance, concurrency, compatibility, docs, and more, plus any custom `review-*` subagents you add), with configurable lenses per effort level.
@@ -13,8 +13,8 @@ Point **Quasar** at any **GitHub PR URL** or **local branch / working-tree diff*
 ## 🚀 Foolproof Human Setup Guide (2 Minutes)
 
 ### Step 1: Check Prerequisites
-- **Required**: **`git`** and **`python3`** (both pre-installed on macOS). **Local branches and public GitHub PRs work immediately with zero extra setup.**
-- **Optional** (`gh` CLI or `GITHUB_TOKEN`): *Only needed if you want to review **private** GitHub PRs or use 1-click **Export Staged Comments to GitHub Pending Review***:
+- **Required**: **`git`** and **`python3`** (both pre-installed on macOS). **Local branches, public GitHub PRs, and public Gerrit changes work immediately with zero extra setup.**
+- **Optional** (`gh` CLI or `GITHUB_TOKEN`, or `~/.gitcookies` / `~/.netrc` for Gerrit): *Only needed if you want to review **private** PRs/CLs or publish staged comments & draft reviews directly from Quasar*:
   ```bash
   brew install gh && gh auth login
   ```

@@ -59,7 +59,7 @@ def _apply_triage_to_existing_thread(
             "created_at": m.get("timestamp") or "",
         }
         for m in msgs[1:]
-        if "(GitHub" in str(m.get("author") or "")
+        if ("(GitHub" in str(m.get("author") or "") or "(Gerrit" in str(m.get("author") or ""))
     ]
 
     raw_path = (thread.get("path") or "").strip()
@@ -209,7 +209,7 @@ def _apply_triage_to_existing_thread(
     qa_msgs: List[Dict[str, Any]] = []
     for idx_m, m in enumerate(msgs):
         m_auth = str(m.get("author") or "")
-        if idx_m == 0 or "(GitHub" in m_auth:
+        if idx_m == 0 or "(GitHub" in m_auth or "(Gerrit" in m_auth:
             gh_msgs.append(m)
         else:
             qa_msgs.append(m)

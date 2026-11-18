@@ -677,6 +677,19 @@ def build_incremental_delta_package(
             b_cand = os.path.join(base_root, rel_path)
             if os.path.isfile(b_cand):
                 return open(b_cand, "r", encoding="utf-8", errors="replace").read()
+        if metadata.get("provider") == "gerrit" and metadata.get("gerritBaseUrl"):
+            from gerrit_adapter import fetch_gerrit_file_content
+
+            g_txt = fetch_gerrit_file_content(
+                base_url=str(metadata["gerritBaseUrl"]),
+                project=str(metadata.get("gerritProject") or repo),
+                change_num=int(metadata.get("number") or 0),
+                revision_sha_or_ps=old_head_sha,
+                rel_path=rel_path,
+                parent=False,
+                repo_dir=repo_dir,
+            )
+            return g_txt or ""
         fetched = fetch_raw_file_content(owner, repo, old_head_sha, rel_path, repo_dir)
         return fetched or ""
 
@@ -684,11 +697,30 @@ def build_incremental_delta_package(
         cand = os.path.join(head_root, rel_path)
         if os.path.isfile(cand):
             return open(cand, "r", encoding="utf-8", errors="replace").read()
+        if metadata.get("provider") == "gerrit" and metadata.get("gerritBaseUrl"):
+            from gerrit_adapter import fetch_gerrit_file_content
+
+            g_txt = fetch_gerrit_file_content(
+                base_url=str(metadata["gerritBaseUrl"]),
+                project=str(metadata.get("gerritProject") or repo),
+                change_num=int(metadata.get("number") or 0),
+                revision_sha_or_ps=new_head_sha,
+                rel_path=rel_path,
+                parent=False,
+                repo_dir=repo_dir,
+            )
+            return g_txt or ""
         fetched = fetch_raw_file_content(owner, repo, new_head_sha, rel_path, repo_dir)
         return fetched or ""
 
     delta_commits: List[Dict[str, str]] = []
-    if not rebased and not same_commit_refresh and owner and owner != "local":
+    if (
+        not rebased
+        and not same_commit_refresh
+        and owner
+        and owner != "local"
+        and metadata.get("provider") != "gerrit"
+    ):
         try:
             cmp_data = github_api_get(
                 f"https://api.github.com/repos/{owner}/{repo}/compare/{old_head_sha}...{new_head_sha}"
@@ -1351,6 +1383,7 @@ def assess_existing_github_comment(
     base_root: str = "",
     repo_dir: str = "",
     code_state: Optional[Dict[str, Any]] = None,
+    unresolved: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Evaluates an existing GitHub PR inline comment against thread replies AND the actual
     code in HEAD (`code_state` / `head_root`), returning normalized triage metadata plus
@@ -1379,7 +1412,27 @@ def assess_existing_github_comment(
         )
     cs = code_state or {}
 
-    # 0. Code-level check: Is the commented file no longer modified in this PR's diff?
+    # 0. Explicit remote resolved flag (e.g. Gerrit `unresolved: false`)
+    if unresolved is False:
+        return normalize_and_format_quasar_followup(
+            {
+                "triageStatus": "addressed_or_refuted",
+                "triageCategory": "addressed",
+                "triageBadge": "✅ Marked Resolved",
+                "triageLabel": "✅ Thread Marked Resolved on Remote",
+                "triageSummary": f"This thread from @{author} on `{loc_short}` is already marked resolved.",
+                "whatIsDone": f"Thread on `{loc_short}` was marked resolved.",
+                "whatIsNotDone": "None — thread is resolved.",
+                "whatShouldBeDone": "No further changes needed unless reopening.",
+                "recommendedForFix": False,
+            },
+            author=author,
+            rel_path=rel_path,
+            line=line,
+            code_state=cs,
+        )
+
+    # 0a. Code-level check: Is the commented file no longer modified in this PR's diff?
     if cs.get("has_diff_scope") and rel_path and not cs.get("file_in_pr_diff", True):
         return normalize_and_format_quasar_followup(
             {
@@ -1905,12 +1958,14 @@ def build_initial_cliffs_notes_session(
             base_root=base_root,
             repo_dir=repo_dir,
             code_state=c.get("code_check"),
+            unresolved=c.get("unresolved") if "unresolved" in c else None,
         )
         left_tag = triage["triageLeftTag"]
+        remote_label = "Gerrit" if metadata.get("provider") == "gerrit" else "GitHub"
 
         msgs: List[Dict[str, Any]] = [
             {
-                "author": f"@{author} (GitHub)",
+                "author": f"@{author} ({remote_label})",
                 "body": raw_body,
                 "timestamp": c.get("created_at") or "",
             }
@@ -1919,7 +1974,7 @@ def build_initial_cliffs_notes_session(
             rep_author = rep.get("author") or "reviewer"
             msgs.append(
                 {
-                    "author": f"@{rep_author} (GitHub Reply)",
+                    "author": f"@{rep_author} ({remote_label} Reply)",
                     "body": (rep.get("body") or "").strip(),
                     "timestamp": rep.get("created_at") or "",
                 }
@@ -2635,9 +2690,12 @@ def render_cliffs_notes_markdown(session: Dict[str, Any]) -> str:
     url = pr.get("url") or ""
     author = pr.get("author") or "local"
 
-    lines.append(f"# 📖 Quasar CliffsNotes: PR #{pr_num} — {title}" if pr_num else f"# 📖 Quasar CliffsNotes: {title}")
+    is_gerrit_pr = pr.get("provider") == "gerrit"
+    pr_prefix = "CL" if is_gerrit_pr else "PR"
+    lines.append(f"# 📖 Quasar CliffsNotes: {pr_prefix} #{pr_num} — {title}" if pr_num else f"# 📖 Quasar CliffsNotes: {title}")
     if url:
-        lines.append(f"**PR**: [#{pr_num}]({url}) • **Author**: `@{author}` • **Diff**: `+{pr.get('additions', 0)} / -{pr.get('deletions', 0)}` across `{pr.get('changedFilesCount', 0)}` files")
+        ps_part = f" • **Patchset**: `PS#{pr.get('patchSet')}`" if (is_gerrit_pr and pr.get("patchSet")) else ""
+        lines.append(f"**{pr_prefix}**: [#{pr_num}]({url}){ps_part} • **Author**: `@{author}` • **Diff**: `+{pr.get('additions', 0)} / -{pr.get('deletions', 0)}` across `{pr.get('changedFilesCount', 0)}` files")
     else:
         head_ref = pr.get("headRefName") or "HEAD"
         base_ref = pr.get("baseRefName") or "main"
@@ -3165,6 +3223,20 @@ def detect_pr_ownership(metadata: Dict[str, Any], repo_dir: str) -> Tuple[bool, 
         if author in candidate_identities or (norm_author and norm_author in candidate_identities):
             return True, f"author_match (@{metadata.get('author')})"
 
+    author_email = (metadata.get("authorEmail") or "").strip().lower()
+    if author_email and author_email in candidate_identities:
+        return True, f"author_email_match ({author_email})"
+    if metadata.get("provider") == "gerrit" and metadata.get("gerritBaseUrl"):
+        try:
+            from gerrit_adapter import resolve_gerrit_auth
+
+            g_auth = resolve_gerrit_auth(str(metadata["gerritBaseUrl"]))
+            g_user = str(g_auth.get("username") or "").strip().lower()
+            if g_user and (g_user == author or (author_email and g_user == author_email.split("@", 1)[0])):
+                return True, f"gerrit_auth_match ({g_user})"
+        except Exception:
+            pass
+
     return False, "external_pr"
 
 
@@ -3174,6 +3246,7 @@ def inspect_local_repo_branch_state(metadata: Dict[str, Any], repo_dir: str) -> 
     repo = str(metadata.get("repo") or "").strip()
     pr_num = int(metadata.get("number") or 0)
     head_ref = str(metadata.get("headBranch") or metadata.get("headRefName") or "").replace(" + working tree", "").strip()
+    head_sha = str(metadata.get("headSha") or "").strip()
     is_owned = bool(metadata.get("isOwnedByUser"))
 
     if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
@@ -3185,12 +3258,22 @@ def inspect_local_repo_branch_state(metadata: Dict[str, Any], repo_dir: str) -> 
             "needsBranchSwitch": False,
         }
 
-    is_matching_clone = True if owner == "local" or not pr_num else repo_matches_remote(repo_dir, owner, repo)
+    if owner == "local" or not pr_num:
+        is_matching_clone = True
+    elif metadata.get("provider") == "gerrit":
+        proj_leaf = repo.rstrip("/").split("/")[-1]
+        is_matching_clone = repo_matches_remote(repo_dir, owner, proj_leaf)
+    else:
+        is_matching_clone = repo_matches_remote(repo_dir, owner, repo)
     cur_branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_dir, check=False).stdout.strip()
+    cur_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=False).stdout.strip()
     has_uncommitted = bool(
         run_cmd(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo_dir, check=False).stdout.strip()
     )
-    is_on_pr_branch = bool(head_ref and cur_branch and cur_branch == head_ref)
+    is_on_pr_branch = bool(
+        (head_ref and cur_branch and cur_branch == head_ref)
+        or (head_sha and cur_sha and cur_sha == head_sha)
+    )
     needs_switch = bool(
         is_owned
         and pr_num > 0
@@ -3916,14 +3999,23 @@ def main() -> None:
         repo = str(pr_meta.get("repo") or "")
         pr_num = int(pr_meta.get("number") or 0)
         head_ref = str(pr_meta.get("headBranch") or pr_meta.get("headRefName") or "").replace(" + working tree", "").strip()
-        res = checkout_pr_branch_in_repo(
-            repo_dir=r_dir,
-            owner=owner,
-            repo=repo,
-            pr_num=pr_num,
-            head_ref=head_ref,
-            stash_if_dirty=args.stash_if_dirty,
-        )
+        if pr_meta.get("provider") == "gerrit":
+            from gerrit_adapter import checkout_gerrit_patchset_in_repo
+
+            res = checkout_gerrit_patchset_in_repo(
+                repo_dir=r_dir,
+                pr_meta=pr_meta,
+                stash_if_dirty=args.stash_if_dirty,
+            )
+        else:
+            res = checkout_pr_branch_in_repo(
+                repo_dir=r_dir,
+                owner=owner,
+                repo=repo,
+                pr_num=pr_num,
+                head_ref=head_ref,
+                stash_if_dirty=args.stash_if_dirty,
+            )
         if res.get("ok"):
             pr_meta["localCurrentBranch"] = res.get("checkedOutBranch") or head_ref
             pr_meta["isOnPrBranch"] = True
@@ -3949,13 +4041,24 @@ def main() -> None:
             sys.exit(1)
         return
 
-    # Support passing a local branch, range, or repo path via --pr or --branch
+    from gerrit_adapter import (
+        auto_detect_gerrit_repo_dir,
+        fetch_gerrit_change,
+        is_gerrit_url,
+        make_gerrit_session_id,
+        materialize_gerrit_snapshots,
+    )
+
+    # Support passing a GitHub PR, a Gerrit Change URL, or a local branch/range/repo path
     pr_arg = args.pr
+    gerrit_arg = pr_arg.strip() if (pr_arg and is_gerrit_url(pr_arg)) else None
     branch_arg = args.branch or args.head
     repo_dir_arg = args.repo_dir
     base_arg = args.base
 
-    if pr_arg and not is_github_pr_arg(pr_arg):
+    if gerrit_arg:
+        pr_arg = None
+    elif pr_arg and not is_github_pr_arg(pr_arg):
         branch_arg = pr_arg.strip()
         pr_arg = None
 
@@ -3978,7 +4081,30 @@ def main() -> None:
             base_arg = base_arg or b_part.strip()
             branch_arg = h_part.strip() or "HEAD"
 
-    if pr_arg:
+    if gerrit_arg:
+        metadata, comments, files_list, diff_text = fetch_gerrit_change(
+            gerrit_arg,
+            parse_first_changed_line_fn=parse_first_changed_line,
+            parse_all_hunks_fn=parse_all_hunks,
+        )
+        repo_dir = auto_detect_gerrit_repo_dir(
+            gerrit_host=str(metadata.get("gerritHost") or metadata.get("owner") or ""),
+            project=str(metadata.get("gerritProject") or metadata.get("repo") or ""),
+            provided_dir=repo_dir_arg,
+        )
+        session_id = make_gerrit_session_id(
+            str(metadata.get("owner") or "gerrit"),
+            str(metadata.get("repo") or "repo"),
+            int(metadata.get("number") or 0),
+        )
+        base_root, head_root = materialize_gerrit_snapshots(
+            session_id=session_id,
+            snapshots_dir=SNAPSHOTS_DIR,
+            metadata=metadata,
+            files_list=files_list,
+            repo_dir=repo_dir,
+        )
+    elif pr_arg:
         owner, repo, pr_num = infer_owner_repo(pr_arg, repo_dir_arg or os.getcwd())
         repo_dir = auto_detect_repo_dir(owner, repo, repo_dir_arg)
         metadata, comments, files_list, diff_text = fetch_pr_via_rest(owner, repo, pr_num)
@@ -4203,7 +4329,7 @@ def main() -> None:
         metadata["needsBranchSwitch"] = False
 
     full_summary: Dict[str, Any] = {
-        "mode": "pr" if pr_arg else "local_branch",
+        "mode": "pr" if (pr_arg or gerrit_arg) else "local_branch",
         "session_id": session_id,
         "effort_level": effort_level,
         "comments_only": comments_only,
@@ -4246,7 +4372,7 @@ def main() -> None:
                     prior_sess_cand = json.load(pf)
             except Exception:
                 prior_sess_cand = None
-        if prior_sess_cand is None and pr_arg:
+        if prior_sess_cand is None and (pr_arg or gerrit_arg):
             try:
                 from inbox_watcher import _scan_completed_sessions_for_pr
 

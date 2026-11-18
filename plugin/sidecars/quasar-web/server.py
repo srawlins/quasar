@@ -328,11 +328,26 @@ def dispatch_via_agy_cli(
             )
     session_settings = json.dumps({"permissions": {"allow": allow_rules}})
 
+    cli_settings: Dict[str, Any] = {}
+    models_chain: List[str] = [""]
+    try:
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        from inbox_watcher import load_inbox_settings as _load_iw_cfg, resolve_cli_model_chain as _res_chain
+
+        cli_settings = _load_iw_cfg()
+        models_chain = _res_chain(cli_settings)
+    except Exception:
+        pass
+
     cmd: List[str] = [
         agy_bin,
         "--output-format=stream-json",
         f"--mode={'accept-edits' if allow_edits else 'auto'}",
     ]
+    cli_agent_name = str(cli_settings.get("cliAgent") or "").strip()
+    if cli_agent_name:
+        cmd.append(f"--agent={cli_agent_name}")
     seen_dirs = set()
     for d in (real_ws, real_state_dir, real_plugin_dir):
         if d and os.path.isdir(d) and d not in seen_dirs:
@@ -356,61 +371,124 @@ def dispatch_via_agy_cli(
         "completedAt": None,
     })
 
+    def _reconcile_any_pending_threads(fallback_text: str, err_text: str) -> None:
+        try:
+            sess, s_path = load_target_session(None)
+            if not isinstance(sess, dict) or not isinstance(sess.get("threads"), list):
+                return
+            changed = False
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            clean_reply = (fallback_text or "").strip()
+            clean_err = (err_text or "Agent exited before posting a reply").strip()
+            for t in sess["threads"]:
+                msgs = t.get("messages")
+                if not isinstance(msgs, list) or not any(isinstance(m, dict) and m.get("pending") for m in msgs):
+                    continue
+                t["messages"] = [m for m in msgs if not (isinstance(m, dict) and m.get("pending"))]
+                if clean_reply:
+                    t["messages"].append({"author": "Quasar", "body": clean_reply, "timestamp": now_iso})
+                    t.pop("pendingInlineDraft", None)
+                else:
+                    t["messages"].append({
+                        "author": "Quasar",
+                        "body": f"⚠️ *Quasar could not complete the reply ({clean_err}).*",
+                        "timestamp": now_iso,
+                    })
+                changed = True
+            if changed:
+                save_session_everywhere(sess, s_path)
+        except Exception:
+            pass
+
     def _run_stream() -> None:
+        agent_text_chunks: List[str] = []
+        stream_err = ""
+        saw_execution = False
         try:
             run_cwd = workspace_dir if (workspace_dir and os.path.isdir(workspace_dir)) else os.getcwd()
-            proc = subprocess.Popen(
-                cmd,
-                cwd=run_cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            ACTIVE_AGENT_JOB["pid"] = proc.pid
-            if proc.stdout:
-                for raw_line in proc.stdout:
-                    ln = raw_line.strip()
-                    if not ln:
-                        continue
-                    m_uuid = re.search(
-                        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
-                        ln,
-                    )
-                    if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
-                        ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
-                    if ln.startswith("{") and ln.endswith("}"):
-                        try:
-                            ev = json.loads(ln)
-                            cid_cand = (
-                                ev.get("conversation_id")
-                                or ev.get("conversationId")
-                                or ev.get("session_id")
-                                or ""
-                            )
-                            if cid_cand:
-                                ACTIVE_AGENT_JOB["conversationId"] = str(cid_cand)
-                            if "collect_pr_context" in ln:
-                                ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
-                                ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
-                            elif "invoke_subagent" in ln or "review-" in ln:
-                                ACTIVE_AGENT_JOB["cliStage"] = "🔬 Phase 2/3 — Running specialist review lenses"
-                                for m_ag in re.findall(r"review-[a-z-]+", ln):
-                                    subs = ACTIVE_AGENT_JOB.setdefault("subagents", [])
-                                    if m_ag not in subs:
-                                        subs.append(m_ag)
-                                ACTIVE_AGENT_JOB["cliDetail"] = "Analyzing architecture, bugs, & edge cases..."
-                            elif "publish_review_session" in ln:
-                                ACTIVE_AGENT_JOB["cliStage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
-                                ACTIVE_AGENT_JOB["cliDetail"] = "Writing session & rendering diffs..."
-                            elif "answer_comment_question" in ln:
-                                ACTIVE_AGENT_JOB["cliStage"] = "💬 Posting inline answer to thread"
-                                ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
-                        except Exception:
-                            pass
-            proc.wait()
+            models_to_try = models_chain or [""]
+            rc = 0
+            for idx_m, model_override in enumerate(models_to_try):
+                agent_text_chunks.clear()
+                stream_err = ""
+                saw_execution = False
+                run_cmd = list(cmd)
+                if model_override:
+                    run_cmd.insert(2, f"--model={model_override}")
+                    if idx_m > 0:
+                        ACTIVE_AGENT_JOB["cliDetail"] = f"Quota exhausted — retrying on {model_override}..."
+                proc = subprocess.Popen(
+                    run_cmd,
+                    cwd=run_cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                ACTIVE_AGENT_JOB["pid"] = proc.pid
+                if proc.stdout:
+                    for raw_line in proc.stdout:
+                        ln = raw_line.strip()
+                        if not ln:
+                            continue
+                        m_uuid = re.search(
+                            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+                            ln,
+                        )
+                        if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
+                            ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
+                        if ln.startswith("{") and ln.endswith("}"):
+                            try:
+                                ev = json.loads(ln)
+                                cid_cand = (
+                                    ev.get("conversation_id")
+                                    or ev.get("conversationId")
+                                    or ev.get("session_id")
+                                    or ""
+                                )
+                                if cid_cand:
+                                    ACTIVE_AGENT_JOB["conversationId"] = str(cid_cand)
+                                su = ev.get("step_update") or {}
+                                if su.get("step_type") and su.get("step_type") != "user_input":
+                                    saw_execution = True
+                                    if su.get("step_type") == "agent_response" and isinstance(su.get("text_delta"), str):
+                                        agent_text_chunks.append(su["text_delta"])
+                                if ev.get("event") == "result" and isinstance(ev.get("result"), dict) and ev["result"].get("status") == "ERROR":
+                                    stream_err = str(ev["result"].get("error") or "")
+                                if "collect_pr_context" in ln:
+                                    ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
+                                    ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
+                                elif "invoke_subagent" in ln or "review-" in ln:
+                                    ACTIVE_AGENT_JOB["cliStage"] = "🔬 Phase 2/3 — Running specialist review lenses"
+                                    for m_ag in re.findall(r"review-[a-z-]+", ln):
+                                        subs = ACTIVE_AGENT_JOB.setdefault("subagents", [])
+                                        if m_ag not in subs:
+                                            subs.append(m_ag)
+                                    ACTIVE_AGENT_JOB["cliDetail"] = "Analyzing architecture, bugs, & edge cases..."
+                                elif "publish_review_session" in ln:
+                                    ACTIVE_AGENT_JOB["cliStage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
+                                    ACTIVE_AGENT_JOB["cliDetail"] = "Writing session & rendering diffs..."
+                                elif "answer_comment_question" in ln:
+                                    ACTIVE_AGENT_JOB["cliStage"] = "💬 Posting inline answer to thread"
+                                    ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
+                            except Exception:
+                                pass
+                        elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity", ln, re.I):
+                            stream_err = ln[:300]
+                rc = proc.wait()
+                if not saw_execution and (
+                    rc == 3 or re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity", stream_err, re.I)
+                ):
+                    continue
+                break
+            if rc != 0 and not stream_err:
+                stream_err = "Model quota exhausted" if rc == 3 else f"agy exited with code {rc}"
+            if stream_err:
+                ACTIVE_AGENT_JOB["cliError"] = stream_err
+            _reconcile_any_pending_threads("".join(agent_text_chunks), stream_err)
         except Exception as exc:
             ACTIVE_AGENT_JOB["cliError"] = str(exc)
+            _reconcile_any_pending_threads("", str(exc))
         finally:
             ACTIVE_AGENT_JOB["active"] = False
             ACTIVE_AGENT_JOB["completedAt"] = time.time()
