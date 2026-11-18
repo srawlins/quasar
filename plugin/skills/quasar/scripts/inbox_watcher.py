@@ -163,6 +163,36 @@ def _now_iso() -> str:
     return _now_utc().isoformat()
 
 
+def _format_duration_short(seconds: float) -> str:
+    total_sec = max(0, int(seconds))
+    if total_sec < 60:
+        return "<1m"
+    mins = (total_sec + 30) // 60
+    if mins < 60:
+        return f"{mins}m"
+    hrs = mins // 60
+    rem_m = mins % 60
+    return f"{hrs}h {rem_m}m" if rem_m > 0 else f"{hrs}h"
+
+
+def _parse_quota_reset_seconds(text: str) -> Optional[int]:
+    """Extracts exact quota reset seconds from CLI output like 'Your quota will reset after 6h27m31s'."""
+    if not text:
+        return None
+    m = re.search(
+        r"reset\s+after\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
+        text,
+        re.I,
+    )
+    if not m or not any(m.groups()):
+        return None
+    hrs = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    secs = int(m.group(3) or 0)
+    total = hrs * 3600 + mins * 60 + secs
+    return total if total > 0 else None
+
+
 def _today_local_str() -> str:
     return datetime.date.today().isoformat()
 
@@ -2362,15 +2392,44 @@ def run_precompute_for_item(
     log_path = os.path.join(item_dir, "precompute.log")
     run_cwd = real_repo if (real_repo and os.path.isdir(real_repo)) else item_dir
     run_start_ts = time.time()
+    run_started_iso = _now_iso()
     error_kind = "cli_error"
     tried_models: List[str] = []
+    quota_reset_candidates_sec: List[int] = []
+
+    def _update_daemon_active_run(active_model: Optional[str]) -> None:
+        try:
+            d_st = load_daemon_status()
+            if active_model is None:
+                d_st.pop("activeRun", None)
+                if d_st.get("running"):
+                    d_st["phase"] = "idle"
+            else:
+                d_st["phase"] = "reviewing"
+                d_st["activeRun"] = {
+                    "itemId": item_id,
+                    "owner": owner,
+                    "repo": repo,
+                    "number": int(item.get("number") or 0),
+                    "label": f"{repo}#{item.get('number')}",
+                    "title": str(item.get("title") or ""),
+                    "startedAt": run_started_iso,
+                    "effort": effort,
+                    "model": active_model or "auto",
+                }
+            save_daemon_status(d_st)
+        except Exception:
+            pass
+
     try:
         models_to_try = resolve_cli_model_chain(cfg)
         rc = -1
         saw_quota_exhaustion = False
         last_log_detail = ""
         for model_override in models_to_try:
-            tried_models.append(model_override or "auto")
+            model_label = model_override or "auto"
+            tried_models.append(model_label)
+            _update_daemon_active_run(model_label)
             attempt_cmd = list(agy_cmd)
             if model_override:
                 attempt_cmd.insert(2, f"--model={model_override}")
@@ -2434,6 +2493,9 @@ def run_precompute_for_item(
             )
             if is_quota:
                 saw_quota_exhaustion = True
+                parsed_rst = _parse_quota_reset_seconds(log_tail)
+                if parsed_rst:
+                    quota_reset_candidates_sec.append(parsed_rst)
                 continue
 
             # Capture concise diagnostic line if non-quota CLI error
@@ -2460,18 +2522,32 @@ def run_precompute_for_item(
             if saw_quota_exhaustion:
                 error_kind = "quota_exhausted"
                 models_str = ", ".join(tried_models)
+                rst_hint = (
+                    f" (quota resets in ~{_format_duration_short(min(quota_reset_candidates_sec))})"
+                    if quota_reset_candidates_sec
+                    else ""
+                )
                 raise RuntimeError(
-                    f"Out of model quota / tokens (tried: {models_str}). Switch CLI model in Inbox Settings or wait for quota reset."
+                    f"Out of model quota / tokens (tried: {models_str}){rst_hint}. Switch CLI model in Inbox Settings or wait for reset."
                 )
             detail_suffix = f": {last_log_detail}" if last_log_detail else ""
             raise RuntimeError(f"CLI exited (code {rc}) before completing review{detail_suffix}")
     except Exception as exc:
+        _update_daemon_active_run(None)
         if has_prior_backup and os.path.isfile(prior_backup_path):
             shutil.copy2(prior_backup_path, session_file)
         st = load_inbox_state()
         err_now = _now_iso()
+        fails_prev = int(((st.get("items") or {}).get(item_id) or {}).get("failureCount") or 0)
+        fails = fails_prev + 1
+        if error_kind == "quota_exhausted" and quota_reset_candidates_sec:
+            wait_sec = min(quota_reset_candidates_sec) + 60
+        else:
+            wait_sec = min(360, 30 * (2 ** (fails - 1))) * 60
+        retry_iso = (_now_utc() + datetime.timedelta(seconds=wait_sec)).isoformat()
         if error_kind == "quota_exhausted":
             st["lastQuotaExhaustedAt"] = err_now
+            st["quotaRetryAfter"] = retry_iso
         if item_id in st.get("items", {}):
             it_err = st["items"][item_id]
             it_err["status"] = "queued"
@@ -2479,17 +2555,15 @@ def run_precompute_for_item(
             it_err["lastErrorKind"] = error_kind
             it_err["lastErrorAt"] = err_now
             it_err["lastErrorModels"] = tried_models
-            fails = int(it_err.get("failureCount") or 0) + 1
             it_err["failureCount"] = fails
             it_err["failedFingerprint"] = str(
                 it_err.get("currentFingerprint") or it_err.get("headSha") or it_err.get("updatedAt") or "fp"
             )
-            cooldown_min = min(360, 30 * (2 ** (fails - 1)))
-            it_err["retryAfter"] = (
-                _now_utc() + datetime.timedelta(minutes=cooldown_min)
-            ).isoformat()
+            it_err["retryAfter"] = retry_iso
             save_inbox_state(st)
         return {"ok": False, "error": str(exc), "errorKind": error_kind}
+
+    _update_daemon_active_run(None)
 
     st = load_inbox_state()
     if count_against_daily_budget:
@@ -2517,6 +2591,7 @@ def run_precompute_for_item(
         ):
             it.pop(k, None)
     st.pop("lastQuotaExhaustedAt", None)
+    st.pop("quotaRetryAfter", None)
     save_inbox_state(st)
     return {"ok": True, "itemId": item_id, "status": "ready"}
 
@@ -2581,18 +2656,37 @@ def select_eligible_items_for_cycle(
         cur_fp = str(
             item.get("currentFingerprint") or item.get("headSha") or item.get("updatedAt") or "fp"
         )
+        is_quota_err = bool(
+            item.get("lastErrorKind") == "quota_exhausted"
+            or re.search(r"code 3|quota|token|exhausted", str(item.get("lastError") or ""), re.I)
+        )
         if item.get("failedFingerprint") and item.get("failedFingerprint") != cur_fp:
-            for k in ("failureCount", "retryAfter", "failedFingerprint", "lastError"):
+            for k in (
+                "failureCount",
+                "retryAfter",
+                "failedFingerprint",
+                "lastError",
+                "lastErrorKind",
+                "lastErrorAt",
+                "lastErrorModels",
+            ):
                 item.pop(k, None)
-        elif int(item.get("failureCount") or 0) >= 3:
-            item["skipReason"] = "Paused auto-retry after 3 errors (click ⚡ to retry)"
-            continue
         elif item.get("retryAfter"):
             ra_dt = _parse_iso_dt(str(item["retryAfter"]))
             if ra_dt and ra_dt > now:
-                mins_left = max(1, int((ra_dt - now).total_seconds() // 60))
-                item["skipReason"] = f"Error cooldown ({mins_left}m left — click ⚡ to retry)"
+                wait_str = _format_duration_short((ra_dt - now).total_seconds())
+                if is_quota_err:
+                    item["skipReason"] = f"Out of tokens — waiting {wait_str} to retry"
+                else:
+                    item["skipReason"] = f"Error cooldown ({wait_str} left — click ⚡ to retry)"
                 continue
+            elif is_quota_err:
+                # Quota window has reset — automatically clear retry lock so it runs now!
+                for k in ("failureCount", "retryAfter", "skipReason"):
+                    item.pop(k, None)
+        if not is_quota_err and int(item.get("failureCount") or 0) >= 3:
+            item["skipReason"] = "Paused auto-retry after 3 non-quota errors (click ⚡ to retry)"
+            continue
         item.pop("skipReason", None)
         roles_set = set(get_item_roles(item))
         if item.get("updatedSinceLastReview") or item.get("changesRequested") or item.get("manualAutoReviewQueued"):
@@ -2624,6 +2718,11 @@ def select_eligible_items_for_cycle(
 
 def run_watch_cycle(force_sync_only: bool = False) -> Dict[str, Any]:
     settings = load_inbox_settings()
+    d_pre = load_daemon_status()
+    if d_pre.get("running"):
+        d_pre["phase"] = "syncing"
+        d_pre["phaseStartedAt"] = _now_iso()
+        save_daemon_status(d_pre)
     sync_res = sync_github_queue(settings=settings)
     if not sync_res.get("ok"):
         return sync_res
@@ -2667,6 +2766,8 @@ def run_watch_cycle(force_sync_only: bool = False) -> Dict[str, Any]:
         daemon_info = load_daemon_status()
         if daemon_info.get("running"):
             daemon_info["activeItemIds"] = []
+            daemon_info.pop("activeRun", None)
+            daemon_info["phase"] = "sleeping"
             save_daemon_status(daemon_info)
 
     return {"ok": True, "processed": results, "reason": reason}
@@ -2972,6 +3073,9 @@ def build_inbox_payload() -> Dict[str, Any]:
     state = load_inbox_state()
     daemon = load_daemon_status()
     authored_all_open = str(settings.get("authoredPrMode") or "feedback_only") == "all_open"
+    now_dt = _now_utc()
+    cutoff_days = int(settings.get("onlyUpdatedWithinDays") or 0)
+    sync_only_mode = settings.get("mode") == "sync_queue_only"
 
     items_list: List[Dict[str, Any]] = []
     for _, raw_item in (state.get("items") or {}).items():
@@ -3003,11 +3107,20 @@ def build_inbox_payload() -> Dict[str, Any]:
         it["autoReviewEnabled"] = auto_enabled
         it["roleLabel"] = format_item_roles_label(it)
         prev_skip = str(it.get("skipReason") or "")
+        over_cutoff = False
+        if cutoff_days > 0 and not it.get("manualAutoReviewQueued"):
+            u_dt = _parse_iso_dt(str(it.get("updatedAt") or ""))
+            if u_dt and (now_dt - u_dt).total_seconds() > cutoff_days * 86400:
+                over_cutoff = True
+
         if status == "queued":
             if not auto_enabled:
-                if not prev_skip or prev_skip.startswith("Inbox-only ("):
-                    it["skipReason"] = f"Inbox-only ({it['roleLabel']} auto-review is off)"
-            elif prev_skip.startswith("Inbox-only ("):
+                it["skipReason"] = f"Auto-review off ({it['roleLabel']})"
+            elif over_cutoff:
+                it["skipReason"] = f"Older than {cutoff_days}d cutoff"
+            elif sync_only_mode and not it.get("manualAutoReviewQueued"):
+                it["skipReason"] = "Sync-only mode"
+            elif prev_skip.startswith(("Inbox-only (", "Auto-review off (", "Older than ", "Sync-only")):
                 it.pop("skipReason", None)
 
         if status == "quarantined":
@@ -3022,6 +3135,8 @@ def build_inbox_payload() -> Dict[str, Any]:
             group = "deleted"
         elif status in ("waiting_on_author", "waiting_on_reviewers"):
             group = "waiting"
+        elif (not auto_enabled or over_cutoff or (sync_only_mode and not it.get("manualAutoReviewQueued"))) and not it.get("lastError"):
+            group = "inbox_only"
         else:
             group = "queued"
         it["inboxGroup"] = group
@@ -3033,8 +3148,9 @@ def build_inbox_payload() -> Dict[str, Any]:
         "author_action_needed": 2,
         "quarantined": 3,
         "queued": 4,
-        "waiting": 5,
-        "deleted": 6,
+        "inbox_only": 5,
+        "waiting": 6,
+        "deleted": 7,
     }
     items_list.sort(key=lambda x: str(x.get("updatedAt") or ""), reverse=True)
     # Surface erred items at the top of the Queued section so quota/timeout issues are immediately visible
@@ -3055,6 +3171,7 @@ def build_inbox_payload() -> Dict[str, Any]:
     )
     analyzing_count = sum(1 for i in items_list if i.get("inboxGroup") == "in_progress")
     queued_count = sum(1 for i in items_list if i.get("inboxGroup") == "queued")
+    inbox_only_group_count = sum(1 for i in items_list if i.get("inboxGroup") == "inbox_only")
     deleted_count = sum(1 for i in items_list if i.get("inboxGroup") == "deleted")
     error_count = sum(1 for i in items_list if i.get("inboxGroup") == "queued" and i.get("lastError"))
     quota_error_count = sum(
@@ -3065,9 +3182,145 @@ def build_inbox_payload() -> Dict[str, Any]:
 
     max_day = int(settings.get("maxReviewsPerDay") or 0)
     run_today = int(state.get("reviewsRunToday") or 0)
+    daily_cap_reached = bool(max_day > 0 and run_today >= max_day)
     cli_caps = discover_agy_models_and_agents(
         allow_subprocess=not os.path.isfile(INBOX_CLI_CAP_CACHE_PATH)
     )
+
+    # Compute exact live human-readable daemon status (`X min into review`, `X min until next review`, `Out of tokens waiting Xm`)
+    eligible_now_cnt = 0
+    inbox_only_cnt = inbox_only_group_count
+    quota_wait_secs: List[float] = []
+    for it_q in items_list:
+        if it_q.get("inboxGroup") != "queued":
+            continue
+        if not it_q.get("autoReviewEnabled"):
+            continue
+        if cutoff_days > 0 and not it_q.get("manualAutoReviewQueued"):
+            u_dt = _parse_iso_dt(str(it_q.get("updatedAt") or ""))
+            if u_dt and (now_dt - u_dt).total_seconds() > cutoff_days * 86400:
+                continue
+        ra_s = str(it_q.get("retryAfter") or "")
+        ra_dt = _parse_iso_dt(ra_s) if ra_s else None
+        is_q_err = bool(
+            it_q.get("lastErrorKind") == "quota_exhausted"
+            or re.search(r"code 3|quota|token|exhausted", str(it_q.get("lastError") or ""), re.I)
+        )
+        if ra_dt and ra_dt > now_dt:
+            if is_q_err:
+                quota_wait_secs.append((ra_dt - now_dt).total_seconds())
+            continue
+        if not is_q_err and int(it_q.get("failureCount") or 0) >= 3:
+            continue
+        eligible_now_cnt += 1
+
+    is_running = bool(daemon.get("running"))
+    active_run = daemon.get("activeRun") if (is_running and isinstance(daemon.get("activeRun"), dict)) else None
+    if not active_run and analyzing_count > 0:
+        first_an = next((x for x in items_list if x.get("inboxGroup") == "in_progress"), None)
+        if first_an:
+            active_run = {
+                "label": f"{first_an.get('repo')}#{first_an.get('number')}",
+                "title": str(first_an.get("title") or ""),
+                "startedAt": str(first_an.get("startedAt") or ""),
+                "effort": str(settings.get("effort") or "high"),
+                "model": str(settings.get("cliModel") or "auto"),
+            }
+
+    next_dt = _parse_iso_dt(str(daemon.get("nextCycleAt") or "")) if is_running else None
+    next_wait_str = (
+        _format_duration_short((next_dt - now_dt).total_seconds())
+        if (next_dt and next_dt > now_dt)
+        else "<1m"
+    )
+
+    if not is_running:
+        live_status = {
+            "state": "paused",
+            "headline": "Background Auto-Review is Paused / Off",
+            "detail": (
+                f"{eligible_now_cnt} eligible PR{'s' if eligible_now_cnt != 1 else ''} ready to auto-review when enabled"
+                if eligible_now_cnt > 0
+                else "Click to enable background pre-reviews or sync queue"
+            ),
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    elif active_run:
+        st_dt = _parse_iso_dt(str(active_run.get("startedAt") or ""))
+        elapsed_str = (
+            _format_duration_short((now_dt - st_dt).total_seconds()) if st_dt else "<1m"
+        )
+        m_lbl = str(active_run.get("model") or "auto")
+        live_status = {
+            "state": "reviewing",
+            "headline": f"{elapsed_str} into reviewing {active_run.get('label', 'PR')}",
+            "detail": f"Model: {m_lbl} • {str(active_run.get('effort', 'high')).upper()} effort",
+            "activeLabel": active_run.get("label", ""),
+            "elapsed": elapsed_str,
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    elif daemon.get("phase") == "syncing":
+        live_status = {
+            "state": "syncing",
+            "headline": "Syncing GitHub PR queue now...",
+            "detail": "Checking for new & updated PRs (0 LLM tokens)",
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    elif settings.get("mode") == "sync_queue_only":
+        live_status = {
+            "state": "sync_only",
+            "headline": f"Sync-Only Mode • {next_wait_str} until next queue check",
+            "detail": "0 LLM tokens spent automatically — click ⚡ on any PR to pre-review",
+            "nextCheckIn": next_wait_str,
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    elif daily_cap_reached:
+        live_status = {
+            "state": "daily_cap",
+            "headline": f"Daily cap reached ({run_today}/{max_day} today) • resets tomorrow",
+            "detail": f"Next queue sync in {next_wait_str} • manual ⚡ Pre-Review still works",
+            "nextCheckIn": next_wait_str,
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    elif quota_wait_secs and eligible_now_cnt == 0:
+        q_wait_str = _format_duration_short(min(quota_wait_secs))
+        live_status = {
+            "state": "quota_wait",
+            "headline": f"Out of tokens — waiting {q_wait_str} to retry ({len(quota_wait_secs)} PR{'s' if len(quota_wait_secs) != 1 else ''})",
+            "detail": "Click to switch CLI Model / Agent or ⚡ retry immediately",
+            "quotaWait": q_wait_str,
+            "nextCheckIn": next_wait_str,
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    elif eligible_now_cnt > 0:
+        live_status = {
+            "state": "waiting_next_cycle",
+            "headline": f"{next_wait_str} until next review ({eligible_now_cnt} eligible PR{'s' if eligible_now_cnt != 1 else ''} waiting)",
+            "detail": f"Runs ≤{settings.get('maxReviewsPerCycle', 1)}/cycle • {run_today}/{max_day if max_day > 0 else '∞'} today",
+            "nextCheckIn": next_wait_str,
+            "eligibleQueuedCount": eligible_now_cnt,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
+    else:
+        inbox_only_note = (
+            f"{inbox_only_cnt} Inbox-only PR{'s' if inbox_only_cnt != 1 else ''} (auto-review off)"
+            if inbox_only_cnt > 0
+            else "All eligible PRs pre-reviewed"
+        )
+        live_status = {
+            "state": "idle_caught_up",
+            "headline": f"Caught up • {next_wait_str} until next check (0 eligible PRs waiting)",
+            "detail": inbox_only_note,
+            "nextCheckIn": next_wait_str,
+            "eligibleQueuedCount": 0,
+            "inboxOnlyQueuedCount": inbox_only_cnt,
+        }
 
     return {
         "ok": True,
@@ -3075,6 +3328,7 @@ def build_inbox_payload() -> Dict[str, Any]:
         "availableModels": cli_caps.get("models") or [],
         "availableAgents": cli_caps.get("agents") or [],
         "daemon": daemon,
+        "liveStatus": live_status,
         "githubLogin": state.get("githubLogin") or "",
         "lastSyncedAt": state.get("lastSyncedAt"),
         "lastCycleAt": state.get("lastCycleAt"),
@@ -3092,6 +3346,7 @@ def build_inbox_payload() -> Dict[str, Any]:
             "unreadReady": unread_ready_count,
             "analyzing": analyzing_count,
             "queued": queued_count,
+            "inboxOnly": inbox_only_group_count,
             "deleted": deleted_count,
             "errors": error_count,
             "quotaErrors": quota_error_count,

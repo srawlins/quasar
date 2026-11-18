@@ -2,6 +2,20 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.1] - 2026-11-17
+
+### Added
+- **Live Background Auto-Review Status & Countdown Timers (`liveStatus`)**:
+  - Replaced the static Inbox status row across VS Code (`PR Inbox` header, auto-refreshing every 30s while visible), the standalone Flutter/Web app, and `quasar watch --status` with live phase & timer telemetry: `Xm into reviewing <PR>` (with active model & effort), `Xm until next review (N eligible PRs waiting)`, `Out of tokens — waiting Xh Ym to retry`, `Daily cap reached`, or `Caught up • Xm until next check`.
+- **Separate `⚡ Queued for Auto-Review` vs. `📥 Browse Only / Manual ⚡` Inbox Sections**:
+  - Split unreviewed Inbox PRs into **`⚡ Queued for Auto-Review`** (only PRs actually eligible for automatic background pre-review) and **`📥 Browse Only / Manual ⚡ (Auto-Review Off)`** (collapsed by default in VS Code so `Inbox-only` or >cutoff PRs never look stuck in the automatic queue while keeping 1-click `⚡` manual pre-review).
+
+### Fixed
+- **Automatic Recovery After Model Quota Resets**:
+  - Parses exact `"reset after XhYmZs"` durations from `agy` quota-exhaustion errors and automatically resumes reviewing once `retryAfter` elapses instead of permanently pausing PRs after 3 quota retries.
+- **Include Inline Thread Conversations in Agent Fix Prompts (`manage_fixes.py`)**:
+  - `--prepare-fix` now embeds follow-up inline Q&A / thread discussion messages directly into the fix agent prompt (filtering out pending placeholders and avoiding duplication of the primary finding card) and instructs the agent to honor decisions made in the inline conversation.
+
 ## [1.7.0] - 2026-11-17
 
 ### Added

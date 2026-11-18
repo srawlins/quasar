@@ -2009,6 +2009,16 @@ function getInboxItemRoles(it) {
   return out.length ? out : ['reviewer'];
 }
 
+function formatDurationShortJs(seconds) {
+  const sec = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (sec < 60) return '<1m';
+  const mins = Math.round(sec / 60);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem > 0 ? `${hrs}h ${rem}m` : `${hrs}h`;
+}
+
 function loadInboxPayloadSync() {
   let settings = { ...DEFAULT_INBOX_SETTINGS };
   if (fs.existsSync(INBOX_SETTINGS_PATH)) {
@@ -2094,12 +2104,28 @@ function loadInboxPayloadSync() {
     it.autoReviewEnabled = autoOn;
     it.roleLabel = roles.map((r) => INBOX_ROLE_SHORT_LABELS[r] || r).join(' + ');
     const prevSkip = String(it.skipReason || '');
+    const cutoffDaysCfg = Number(settings.onlyUpdatedWithinDays || 0);
+    let overCutoff = false;
+    if (cutoffDaysCfg > 0 && !it.manualAutoReviewQueued && it.updatedAt) {
+      const uMs = Date.parse(String(it.updatedAt));
+      if (!Number.isNaN(uMs) && Date.now() - uMs > cutoffDaysCfg * 86400000) {
+        overCutoff = true;
+      }
+    }
+    const isSyncOnlyMode = settings.mode === 'sync_queue_only' && !it.manualAutoReviewQueued;
     if (st === 'queued') {
       if (!autoOn) {
-        if (!prevSkip || prevSkip.startsWith('Inbox-only (')) {
-          it.skipReason = `Inbox-only (${it.roleLabel} auto-review is off)`;
-        }
-      } else if (prevSkip.startsWith('Inbox-only (')) {
+        it.skipReason = `Auto-review off (${it.roleLabel})`;
+      } else if (overCutoff) {
+        it.skipReason = `Older than ${cutoffDaysCfg}d cutoff`;
+      } else if (isSyncOnlyMode) {
+        it.skipReason = 'Sync-only mode';
+      } else if (
+        prevSkip.startsWith('Inbox-only (') ||
+        prevSkip.startsWith('Auto-review off (') ||
+        prevSkip.startsWith('Older than ') ||
+        prevSkip.startsWith('Sync-only')
+      ) {
         delete it.skipReason;
       }
     }
@@ -2110,6 +2136,7 @@ function loadInboxPayloadSync() {
     else if (st === 'ready') it.inboxGroup = 'ready_to_review';
     else if (st === 'deleted') it.inboxGroup = 'deleted';
     else if (st === 'waiting_on_author' || st === 'waiting_on_reviewers') it.inboxGroup = 'waiting';
+    else if ((!autoOn || overCutoff || isSyncOnlyMode) && !it.lastError) it.inboxGroup = 'inbox_only';
     else it.inboxGroup = 'queued';
     itemsList.push(it);
   }
@@ -2120,8 +2147,9 @@ function loadInboxPayloadSync() {
     author_action_needed: 2,
     quarantined: 3,
     queued: 4,
-    waiting: 5,
-    deleted: 6,
+    inbox_only: 5,
+    waiting: 6,
+    deleted: 7,
   };
   itemsList.sort((a, b) => {
     const ga = orderMap[a.inboxGroup] ?? 9;
@@ -2143,10 +2171,137 @@ function loadInboxPayloadSync() {
   const quotaErred = erredQueued.filter((i) => i.lastErrorKind === 'quota_exhausted');
   const maxDay = Number(settings.maxReviewsPerDay || 0);
   const runToday = state.budgetDate === today ? Number(state.reviewsRunToday || 0) : 0;
+  const dailyCapReached = maxDay > 0 && runToday >= maxDay;
+
+  const nowMs = Date.now();
+  const cutoffDays = Number(settings.onlyUpdatedWithinDays || 0);
+  let eligibleNowCnt = 0;
+  const inboxOnlyCnt = itemsList.filter((i) => i.inboxGroup === 'inbox_only').length;
+  const quotaWaitSecs = [];
+  for (const itQ of itemsList) {
+    if (itQ.inboxGroup !== 'queued') continue;
+    if (!itQ.autoReviewEnabled) {
+      continue;
+    }
+    if (cutoffDays > 0 && itQ.updatedAt) {
+      const uMs = Date.parse(String(itQ.updatedAt));
+      if (!Number.isNaN(uMs) && nowMs - uMs > cutoffDays * 86400000) {
+        continue;
+      }
+    }
+    const raMs = itQ.retryAfter ? Date.parse(String(itQ.retryAfter)) : NaN;
+    const isQErr =
+      itQ.lastErrorKind === 'quota_exhausted' ||
+      /code 3|quota|token|exhausted/i.test(String(itQ.lastError || ''));
+    if (!Number.isNaN(raMs) && raMs > nowMs) {
+      if (isQErr) quotaWaitSecs.push((raMs - nowMs) / 1000);
+      continue;
+    }
+    if (!isQErr && Number(itQ.failureCount || 0) >= 3) {
+      continue;
+    }
+    eligibleNowCnt++;
+  }
+
+  const isRunning = Boolean(daemon && daemon.running);
+  let activeRun =
+    isRunning && daemon.activeRun && typeof daemon.activeRun === 'object'
+      ? daemon.activeRun
+      : null;
+  if (!activeRun) {
+    const firstAn = itemsList.find((i) => i.inboxGroup === 'in_progress');
+    if (firstAn) {
+      activeRun = {
+        label: `${firstAn.repo}#${firstAn.number}`,
+        startedAt: firstAn.startedAt || '',
+        effort: settings.effort || 'high',
+        model: settings.cliModel || 'auto',
+      };
+    }
+  }
+
+  const nextMs = isRunning && daemon.nextCycleAt ? Date.parse(String(daemon.nextCycleAt)) : NaN;
+  const nextWaitStr =
+    !Number.isNaN(nextMs) && nextMs > nowMs
+      ? formatDurationShortJs((nextMs - nowMs) / 1000)
+      : '<1m';
+
+  let liveStatus;
+  if (!isRunning) {
+    liveStatus = {
+      state: 'paused',
+      headline: settings.enabled
+        ? 'Auto-Review: Enabled (Daemon Stopped)'
+        : 'Background Auto-Review is Paused / Off',
+      detail:
+        eligibleNowCnt > 0
+          ? `${eligibleNowCnt} eligible PR${eligibleNowCnt === 1 ? '' : 's'} ready when started`
+          : 'Click to configure scope, cadence & token caps',
+    };
+  } else if (activeRun) {
+    const stMs = activeRun.startedAt ? Date.parse(String(activeRun.startedAt)) : NaN;
+    const elapsedStr = !Number.isNaN(stMs)
+      ? formatDurationShortJs((nowMs - stMs) / 1000)
+      : '<1m';
+    liveStatus = {
+      state: 'reviewing',
+      headline: `${elapsedStr} into reviewing ${activeRun.label || 'PR'}`,
+      detail: `Model: ${activeRun.model || 'auto'} • ${String(
+        activeRun.effort || 'high'
+      ).toUpperCase()}`,
+    };
+  } else if (daemon.phase === 'syncing') {
+    liveStatus = {
+      state: 'syncing',
+      headline: 'Syncing GitHub PR queue now...',
+      detail: 'Checking for new & updated PRs (0 tokens)',
+    };
+  } else if (settings.mode === 'sync_queue_only') {
+    liveStatus = {
+      state: 'sync_only',
+      headline: `Sync-Only Mode • ${nextWaitStr} until next check`,
+      detail: '0 tokens spent automatically',
+    };
+  } else if (dailyCapReached) {
+    liveStatus = {
+      state: 'daily_cap',
+      headline: `Daily cap reached (${runToday}/${maxDay} today)`,
+      detail: `Resets tomorrow • next sync in ${nextWaitStr}`,
+    };
+  } else if (quotaWaitSecs.length > 0 && eligibleNowCnt === 0) {
+    const qWait = formatDurationShortJs(Math.min(...quotaWaitSecs));
+    liveStatus = {
+      state: 'quota_wait',
+      headline: `Out of tokens — waiting ${qWait} to retry`,
+      detail: `${quotaWaitSecs.length} PR${
+        quotaWaitSecs.length === 1 ? '' : 's'
+      } waiting • click to switch model`,
+    };
+  } else if (eligibleNowCnt > 0) {
+    liveStatus = {
+      state: 'waiting_next_cycle',
+      headline: `${nextWaitStr} until next review (${eligibleNowCnt} eligible PR${
+        eligibleNowCnt === 1 ? '' : 's'
+      })`,
+      detail: `${runToday}/${maxDay > 0 ? maxDay : '∞'} today • ≤${
+        settings.maxReviewsPerCycle || 1
+      }/cycle`,
+    };
+  } else {
+    liveStatus = {
+      state: 'idle_caught_up',
+      headline: `Caught up • ${nextWaitStr} until next check`,
+      detail:
+        inboxOnlyCnt > 0
+          ? `0 eligible PRs waiting (${inboxOnlyCnt} Inbox-only)`
+          : `${runToday}/${maxDay > 0 ? maxDay : '∞'} today • 0 eligible PRs waiting`,
+    };
+  }
 
   return {
     settings,
     daemon,
+    liveStatus,
     githubLogin: state.githubLogin || '',
     lastSyncedAt: state.lastSyncedAt || null,
     lastSyncError: state.lastSyncError || '',
@@ -2154,7 +2309,7 @@ function loadInboxPayloadSync() {
     budget: {
       reviewsRunToday: runToday,
       maxReviewsPerDay: maxDay,
-      dailyCapReached: maxDay > 0 && runToday >= maxDay,
+      dailyCapReached,
     },
     counts: {
       total: itemsList.length,
@@ -2162,6 +2317,7 @@ function loadInboxPayloadSync() {
       unreadReady: unreadReady.length,
       analyzing: itemsList.filter((i) => i.inboxGroup === 'in_progress').length,
       queued: itemsList.filter((i) => i.inboxGroup === 'queued').length,
+      inboxOnly: inboxOnlyCnt,
       deleted: itemsList.filter((i) => i.inboxGroup === 'deleted').length,
       errors: erredQueued.length,
       quotaErrors: quotaErred.length,
@@ -2291,51 +2447,63 @@ class InboxTreeProvider {
 
   getChildren(element) {
     const payload = loadInboxPayloadSync();
-    const { settings, daemon, budget, items, lastSyncedAt, lastSyncError } = payload;
+    const { settings, daemon, liveStatus, budget, items, lastSyncedAt, lastSyncError } = payload;
 
     if (!element) {
       const roots = [];
 
-      // Status / Setup Banner Row
+      // Live Status / Setup Banner Row
       const isDaemonRunning = Boolean(daemon && daemon.running);
-      const modeDesc =
-        settings.mode === 'sync_queue_only'
-          ? 'Sync-Only (0 tokens)'
-          : `${String(settings.effort || 'high').toUpperCase()} • ≤${settings.maxReviewsPerCycle || 1
-          }/cycle • ${budget.maxReviewsPerDay > 0
-            ? `${budget.reviewsRunToday}/${budget.maxReviewsPerDay} today`
-            : `${budget.reviewsRunToday} today`
-          }`;
-      const statusItem = new vscode.TreeItem(
-        isDaemonRunning
+      const ls = liveStatus || {
+        state: isDaemonRunning ? 'idle_caught_up' : 'paused',
+        headline: isDaemonRunning
           ? `Auto-Review: Active (Every ${settings.pollIntervalMinutes || 15}m)`
-          : settings.enabled
-            ? 'Auto-Review: Enabled (Daemon Stopped — Click to Configure)'
-            : 'Set Up Background Auto-Review & PR Inbox...',
-        vscode.TreeItemCollapsibleState.None
-      );
-      statusItem.description = isDaemonRunning ? modeDesc : 'Configure scope, cadence & token caps';
-      statusItem.iconPath = new vscode.ThemeIcon(
-        isDaemonRunning ? 'pulse' : 'settings-gear',
-        new vscode.ThemeColor(isDaemonRunning ? 'charts.green' : 'charts.blue')
-      );
+          : 'Set Up Background Auto-Review & PR Inbox...',
+        detail: 'Configure scope, cadence & token caps',
+      };
+      const statusItem = new vscode.TreeItem(ls.headline, vscode.TreeItemCollapsibleState.None);
+      statusItem.description = ls.detail;
+      const iconName =
+        ls.state === 'reviewing' || ls.state === 'syncing'
+          ? 'loading~spin'
+          : ls.state === 'quota_wait'
+          ? 'warning'
+          : ls.state === 'daily_cap'
+          ? 'watch'
+          : isDaemonRunning
+          ? 'pulse'
+          : 'settings-gear';
+      const iconColor =
+        ls.state === 'reviewing' || ls.state === 'syncing'
+          ? 'charts.blue'
+          : ls.state === 'quota_wait'
+          ? 'charts.red'
+          : ls.state === 'daily_cap'
+          ? 'charts.yellow'
+          : isDaemonRunning
+          ? 'charts.green'
+          : 'charts.blue';
+      statusItem.iconPath = new vscode.ThemeIcon(iconName, new vscode.ThemeColor(iconColor));
       statusItem.tooltip = new vscode.MarkdownString(
         `### 📥 Quasar Background Auto-Review & Multi-PR Inbox\n\n` +
+        `- **Live Status**: **${ls.headline}** (${ls.detail})\n` +
         `- **Daemon**: ${isDaemonRunning ? `Running (PID ${daemon.pid})` : 'Paused / Off'}\n` +
-        `- **Mode**: ${settings.mode === 'sync_queue_only'
-          ? 'Sync Queue Only (0 LLM tokens — manual Pre-Review)'
-          : 'Auto-Precompute Reviews in Background'
+        `- **CLI Model**: \`${settings.cliModel || 'auto'}\`${
+          settings.cliAgent ? ` • **Agent**: \`${settings.cliAgent}\`` : ''
         }\n` +
         `- **Cadence & Token Caps**: Every **${settings.pollIntervalMinutes || 15}m**, max **${settings.maxReviewsPerCycle || 1
         }** PR(s) per cycle, **${budget.maxReviewsPerDay > 0
           ? `${budget.reviewsRunToday}/${budget.maxReviewsPerDay}`
           : 'unlimited'
-        }** today, max concurrency **${settings.maxConcurrency || 1}**\n` +
+        }** today\n` +
         (lastSyncedAt ? `- **Last Synced**: ${lastSyncedAt}\n` : '') +
-        `\n*Click to configure scope, cadence, effort, and daily token caps.*`
+        `\n*Click to configure scope, model/agent, cadence, and daily token caps.*`
       );
       statusItem.command = {
-        command: 'quasar.configureInboxWatcher',
+        command:
+          ls.state === 'quota_wait'
+            ? 'quasar.configureInboxModel'
+            : 'quasar.configureInboxWatcher',
         title: 'Configure PR Inbox & Auto-Review Settings',
       };
       roots.push(statusItem);
@@ -2432,9 +2600,15 @@ class InboxTreeProvider {
         },
         {
           key: 'queued',
-          label: '📋 Queued in GitHub (Not Pre-Reviewed Yet)',
-          icon: 'git-pull-request',
+          label: '⚡ Queued for Auto-Review',
+          icon: 'zap',
           expanded: true,
+        },
+        {
+          key: 'inbox_only',
+          label: '📥 Browse Only / Manual ⚡ (Auto-Review Off)',
+          icon: 'inbox',
+          expanded: false,
         },
         {
           key: 'waiting',
@@ -2532,11 +2706,25 @@ class InboxTreeProvider {
             new vscode.ThemeColor(isQuota ? 'charts.red' : 'charts.yellow')
           );
           node.contextValue = 'inbox-item-queued';
+        } else if (it.inboxGroup === 'inbox_only') {
+          const reasonShort =
+            it.skipReason && it.skipReason.startsWith('Older than ')
+              ? it.skipReason
+              : it.roleLabel || `@${it.author || ''}`;
+          node.description = `${hasDiffStats ? `${diffStats} • ` : ''}${reasonShort}`;
+          node.iconPath = new vscode.ThemeIcon(
+            'git-pull-request',
+            new vscode.ThemeColor('descriptionForeground')
+          );
+          node.contextValue = 'inbox-item-queued';
         } else {
           node.description = it.skipReason
             ? `${hasDiffStats ? `${diffStats} • ` : ''}${it.skipReason}`
             : `@${it.author || ''}${hasDiffStats ? ` • ${diffStats}` : ''}`;
-          node.iconPath = new vscode.ThemeIcon('git-pull-request');
+          node.iconPath = new vscode.ThemeIcon(
+            'zap',
+            new vscode.ThemeColor('charts.yellow')
+          );
           node.contextValue = 'inbox-item-queued';
         }
 
@@ -2567,10 +2755,12 @@ class InboxTreeProvider {
         }
         if (it.status === 'ready') {
           tipLines.push('', '*Click to open this pre-computed review in **0 seconds**.*');
-        } else if (it.inboxGroup === 'queued') {
+        } else if (it.inboxGroup === 'queued' || it.inboxGroup === 'inbox_only') {
           tipLines.push(
             '',
-            '*Click ⚡ inline to pre-review in the background, or click this row to open/review now.*'
+            it.inboxGroup === 'inbox_only'
+              ? `*Auto-review is off for this PR (${it.skipReason || 'manual only'}). Click ⚡ inline to pre-review now, or click this row to open.*`
+              : '*Queued for automatic background pre-review. Click ⚡ inline to run immediately, or click this row to open.*'
           );
         }
         node.tooltip = new vscode.MarkdownString(tipLines.join('\n'));
@@ -4929,6 +5119,12 @@ function activate(context) {
     showCollapseAll: true,
   });
   context.subscriptions.push(inboxTreeView);
+  const inboxCountdownTick = setInterval(() => {
+    if (inboxTreeView.visible) {
+      inboxProvider.refresh();
+    }
+  }, 30000);
+  context.subscriptions.push({ dispose: () => clearInterval(inboxCountdownTick) });
 
   vscode.window.registerTreeDataProvider('quasar.cliffsNotesTree', cliffsProvider);
   const commentsTreeView = vscode.window.createTreeView('quasar.commentsTree', {

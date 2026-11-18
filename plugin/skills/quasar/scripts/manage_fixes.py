@@ -220,6 +220,64 @@ def apply_solution_selection_to_thread(
         t.pop("fixStatus", None)
 
 
+def extract_clean_thread_messages(t: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Returns non-empty, non-pending messages from a thread."""
+    cleaned: List[Dict[str, str]] = []
+    for m in (t.get("messages") or []):
+        if m.get("pending"):
+            continue
+        body = str(m.get("body") or "").strip()
+        if not body or "⏳ Quasar is " in body:
+            continue
+        cleaned.append(
+            {
+                "author": str(m.get("author") or "Comment"),
+                "body": body,
+            }
+        )
+    return cleaned
+
+
+def extract_followup_discussion(
+    t: Dict[str, Any], clean_messages: List[Dict[str, str]]
+) -> List[Dict[str, str]]:
+    """Extracts inline follow-up conversation messages not already captured in draftComment."""
+    draft = str(t.get("draftComment") or "").strip()
+    if not draft or not clean_messages:
+        return []
+    first_body = clean_messages[0]["body"].strip()
+    is_primary_card = t.get("kind") in ("ai_candidate", "user_staged") and any(
+        marker in first_body
+        for marker in (
+            "**Draft GitHub Comment**:",
+            "**Candidate GitHub Comment (if kept)**:",
+            "**Staged GitHub Comment**:",
+        )
+    )
+    is_same_as_draft = first_body == draft
+    if is_primary_card or is_same_as_draft:
+        return clean_messages[1:]
+    return clean_messages
+
+
+def format_discussion_block(followup_messages: List[Dict[str, str]]) -> str:
+    """Formats inline follow-up discussion messages for inclusion in the fix agent prompt."""
+    bullets: List[str] = []
+    for m in followup_messages:
+        author = str(m.get("author") or "Comment")
+        body_lines = str(m.get("body") or "").strip().splitlines()
+        if not body_lines:
+            continue
+        indented_body = "\n       ".join(body_lines)
+        bullets.append(f"     - **{author}**: {indented_body}")
+    if not bullets:
+        return ""
+    return (
+        "\n   - **💬 Inline Thread Discussion (IMPORTANT — take this conversation into account when fixing)**:\n"
+        + "\n".join(bullets)
+    )
+
+
 def parse_thread_ids(raw_ids: Optional[str], session: Dict[str, Any]) -> List[str]:
     if raw_ids:
         return [x.strip() for x in raw_ids.split(",") if x.strip()]
@@ -393,11 +451,11 @@ def main() -> None:
             start_l = int(t.get("startLine") or 1)
             end_l = int(t.get("endLine") or start_l)
 
+            clean_messages = extract_clean_thread_messages(t)
             all_messages = [
-                f"{m.get('author', 'Comment')}: {m.get('body', '')}"
-                for m in (t.get("messages") or [])
-                if m.get("body")
+                f"{m['author']}: {m['body']}" for m in clean_messages
             ]
+            followup_discussion = extract_followup_discussion(t, clean_messages)
             fix_items.append(
                 {
                     "index": idx,
@@ -416,6 +474,7 @@ def main() -> None:
                     "selectedSolutionId": t.get("selectedSolutionId") or "",
                     "selectedSolution": t.get("selectedSolution") or "",
                     "threadDiscussion": all_messages,
+                    "followupDiscussion": followup_discussion,
                     "codeSnippet": read_code_snippet(
                         abs_repo_path if os.path.isfile(abs_repo_path) else snap_path,
                         start_l,
@@ -461,11 +520,13 @@ def main() -> None:
                     f"\n   - **🧭 Possible Solution Options (No option selected yet — ask user via `ask_question` before editing)**:\n"
                     f"{opts_bullets}"
                 )
+            discussion_block = format_discussion_block(item.get("followupDiscussion") or [])
             item_lines.append(
                 f"{item['index']}. **[{item['severity']}] {item['title']}** (Thread ID: `{item['threadId']}`)\n"
                 f"   - **Editable File**: `{item['editableFilePath']}` (Lines {item['startLine']}–{item['endLine']})\n"
                 + (f"   - **Context / Why It Matters**: {item['whyItMatters']}\n" if item["whyItMatters"] else "")
                 + f"   - **Comment / Issue to Fix**: {item['commentToAddress']}"
+                + discussion_block
                 + sol_block
             )
 
@@ -477,9 +538,9 @@ def main() -> None:
 
         ws_arg = f' --workspace-dir "{session.get("workspaceDir") or repo_dir}"' if (session.get("workspaceDir") or repo_dir) else ""
         solution_policy_step = (
-            "1. **Honor Selected Solutions & Present Options When Multiple Valid Fixes Exist**: "
-            "If a comment above includes **✅ User-Selected Solution Approach**, implement that exact chosen approach. "
-            "Because this review is owned by the user, if a comment does **not** have a selected approach yet and has multiple meaningfully different ways to solve it (listed under **Possible Solution Options** or discovered when inspecting the code), **do NOT guess**—call `ask_question` first to present the solution options so the user can select how they want it solved before you edit the code.\n"
+            "1. **Honor Selected Solutions, Inline Discussions, & Present Options When Multiple Valid Fixes Exist**: "
+            "If a comment above includes **✅ User-Selected Solution Approach** or decisions/constraints agreed upon in **💬 Inline Thread Discussion**, follow that chosen approach and incorporate that context. "
+            "Because this review is owned by the user, if a comment does **not** have a selected approach yet (and the inline discussion did not already settle on one) and has multiple meaningfully different ways to solve it (listed under **Possible Solution Options** or discovered when inspecting the code), **do NOT guess**—call `ask_question` first to present the solution options so the user can select how they want it solved before you edit the code.\n"
             if is_owned
             else ""
         )

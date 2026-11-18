@@ -310,11 +310,32 @@ class InboxItem {
   bool get isReadyToOpen => status == 'ready' || status == 'quarantined';
 }
 
+class InboxLiveStatus {
+  const InboxLiveStatus({
+    this.state = 'paused',
+    this.headline = '',
+    this.detail = '',
+  });
+
+  factory InboxLiveStatus.fromJson(Map<String, dynamic> json) {
+    return InboxLiveStatus(
+      state: '${json['state'] ?? 'paused'}',
+      headline: '${json['headline'] ?? ''}',
+      detail: '${json['detail'] ?? ''}',
+    );
+  }
+
+  final String state;
+  final String headline;
+  final String detail;
+}
+
 class InboxPayload {
   const InboxPayload({
     required this.settings,
     required this.daemonRunning,
     required this.daemonPid,
+    this.liveStatus = const InboxLiveStatus(),
     required this.reviewsRunToday,
     required this.maxReviewsPerDay,
     required this.readyCount,
@@ -334,6 +355,9 @@ class InboxPayload {
     final Map<String, dynamic> rawDaemon =
         (json['daemon'] as Map<String, dynamic>?) ??
             const <String, dynamic>{};
+    final Map<String, dynamic> rawLive =
+        (json['liveStatus'] as Map<String, dynamic>?) ??
+            const <String, dynamic>{};
     final Map<String, dynamic> rawBudget =
         (json['budget'] as Map<String, dynamic>?) ??
             const <String, dynamic>{};
@@ -350,6 +374,7 @@ class InboxPayload {
       settings: InboxSettings.fromJson(rawCfg),
       daemonRunning: rawDaemon['running'] == true,
       daemonPid: (rawDaemon['pid'] as num?)?.toInt(),
+      liveStatus: InboxLiveStatus.fromJson(rawLive),
       reviewsRunToday: (rawBudget['reviewsRunToday'] as num?)?.toInt() ?? 0,
       maxReviewsPerDay: (rawBudget['maxReviewsPerDay'] as num?)?.toInt() ?? 6,
       readyCount: (rawCounts['ready'] as num?)?.toInt() ?? 0,
@@ -375,6 +400,7 @@ class InboxPayload {
   final InboxSettings settings;
   final bool daemonRunning;
   final int? daemonPid;
+  final InboxLiveStatus liveStatus;
   final int reviewsRunToday;
   final int maxReviewsPerDay;
   final int readyCount;

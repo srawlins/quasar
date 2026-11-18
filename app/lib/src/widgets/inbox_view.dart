@@ -655,8 +655,13 @@ class InboxView extends StatelessWidget {
       ),
       (
         key: 'queued',
-        label: '📋 QUEUED IN GITHUB (NOT PRE-REVIEWED YET)',
-        color: Color(0xFFE6EDF3),
+        label: '⚡ QUEUED FOR AUTO-REVIEW',
+        color: Color(0xFFE3B341),
+      ),
+      (
+        key: 'inbox_only',
+        label: '📥 BROWSE ONLY / MANUAL ⚡ (AUTO-REVIEW OFF)',
+        color: Color(0xFF8B949E),
       ),
       (
         key: 'waiting',
@@ -775,6 +780,56 @@ class InboxView extends StatelessWidget {
                     _MetaChip(text: 'Agent: ${cfg.cliAgent}'),
                 ],
               ),
+              if (inbox.liveStatus.headline.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D1117),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: inbox.liveStatus.state == 'quota_wait'
+                          ? const Color(0xFFF85149)
+                          : inbox.liveStatus.state == 'reviewing'
+                              ? const Color(0xFF58A6FF)
+                              : const Color(0xFF30363D),
+                    ),
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      Icon(
+                        inbox.liveStatus.state == 'reviewing' ||
+                                inbox.liveStatus.state == 'syncing'
+                            ? Icons.autorenew
+                            : inbox.liveStatus.state == 'quota_wait'
+                                ? Icons.warning_amber_rounded
+                                : Icons.schedule,
+                        size: 15,
+                        color: inbox.liveStatus.state == 'quota_wait'
+                            ? const Color(0xFFFFA198)
+                            : inbox.liveStatus.state == 'reviewing'
+                                ? const Color(0xFF58A6FF)
+                                : const Color(0xFF7EE787),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          inbox.liveStatus.detail.isNotEmpty
+                              ? '${inbox.liveStatus.headline}  •  ${inbox.liveStatus.detail}'
+                              : inbox.liveStatus.headline,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFE6EDF3),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (inbox.errorCount > 0) ...<Widget>[
                 const SizedBox(height: 10),
                 Container(
@@ -978,7 +1033,8 @@ class InboxView extends StatelessWidget {
                                       style: TextStyle(fontSize: 12),
                                     ),
                                   ),
-                                if (it.inboxGroup == 'queued')
+                                if (it.inboxGroup == 'queued' ||
+                                    it.inboxGroup == 'inbox_only')
                                   OutlinedButton(
                                     onPressed: () => onPrecomputeItem(it),
                                     child: Text(

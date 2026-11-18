@@ -1813,7 +1813,8 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
         { key: 'ready_to_review', title: '🟢 Ready to Review (0-Second Open)', cls: 'text-emerald-300' },
         { key: 'author_action_needed', title: '🛠️ Your PRs — Action Needed (0-Second Open)', cls: 'text-amber-300' },
         { key: 'quarantined', title: '🚨 Quarantined by Security Gate', cls: 'text-red-300' },
-        { key: 'queued', title: '📋 Queued in GitHub (Not Pre-Reviewed Yet)', cls: 'text-[var(--q-fg)]' },
+        { key: 'queued', title: '⚡ Queued for Auto-Review', cls: 'text-amber-200' },
+        { key: 'inbox_only', title: '📥 Browse Only / Manual ⚡ (Auto-Review Off)', cls: 'text-[var(--q-muted)]' },
         { key: 'waiting', title: '⏸️ Waiting on Author / Reviewers', cls: 'text-[var(--q-muted)]' },
         { key: 'deleted', title: '🗑️ Deleted Reviews (Re-Queue or Re-Review)', cls: 'text-[var(--q-muted)]' },
       ];
@@ -1858,7 +1859,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
               </div>
               <div class="flex items-center gap-1.5 flex-wrap">
                 ${isReady ? `<button class="q-btn q-btn-success" onclick="activateInboxItem('${esc(it.id)}')">📖 Open in 0s</button>` : ''}
-                ${it.inboxGroup === 'queued' ? `<button class="q-btn q-btn-primary" onclick="precomputeInboxItem('${esc(it.id)}')">⚡ Pre-Review</button>` : ''}
+                ${(it.inboxGroup === 'queued' || it.inboxGroup === 'inbox_only') ? `<button class="q-btn q-btn-primary" onclick="precomputeInboxItem('${esc(it.id)}')">⚡ Pre-Review</button>` : ''}
                 ${it.inboxGroup === 'deleted' ? `
                   <button class="q-btn q-btn-primary" onclick="inboxItemAction('${esc(it.id)}', 'requeue')">➕ Re-Add to Queue</button>
                   <button class="q-btn" onclick="precomputeInboxItem('${esc(it.id)}')">⚡ Re-Review Now</button>
