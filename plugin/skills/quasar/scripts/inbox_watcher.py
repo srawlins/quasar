@@ -2158,6 +2158,24 @@ def _extract_session_metrics(session_path: str) -> Dict[str, Any]:
         return {}
 
 
+def _check_pr_not_open(
+    pr_meta: Optional[Dict[str, Any]],
+    *,
+    include_drafts: bool = False,
+) -> Optional[str]:
+    """Returns a non-empty reason ('merged', 'closed', 'abandoned', 'draft') if a PR/CL should not be auto-reviewed."""
+    if not isinstance(pr_meta, dict):
+        return None
+    if pr_meta.get("merged") is True:
+        return "merged"
+    state = str(pr_meta.get("state") or "").strip().lower()
+    if state in ("merged", "closed", "abandoned"):
+        return state
+    if pr_meta.get("draft") is True and not include_drafts:
+        return "draft"
+    return None
+
+
 def run_precompute_for_item(
     item_id: str,
     settings: Optional[Dict[str, Any]] = None,
@@ -2175,33 +2193,48 @@ def run_precompute_for_item(
             item.pop(k, None)
         save_inbox_state(st)
 
-    # Only dig into `/pulls/{num}` ahead of `collect_pr_context.py` if local completed sessions exist
-    # (so we can adopt a matching manual review for 0 tokens or stage an incremental delta base).
-    # Otherwise, `collect_pr_context.py` fetches PR metadata once in Step 1 with zero duplicate calls!
+    # Pre-flight live GitHub check before burning any AI tokens (and also refreshes headSha for manual-review adoption):
+    # GitHub Search can lag or return 304 ETag responses, and PRs can close/merge while earlier PRs in the cycle ran.
     local_manual_cands = _scan_completed_sessions_for_pr(
         str(item.get("owner") or ""),
         str(item.get("repo") or ""),
         int(item.get("number") or 0),
         include_inbox=False,
     )
-    if (
-        local_manual_cands
-        and not item.get("headSha")
-        and item.get("provider") != "gerrit"
+    need_live_gh_check = (
+        item.get("provider") != "gerrit"
         and item.get("owner")
         and item.get("repo")
         and item.get("number")
-    ):
+        and (count_against_daily_budget or (local_manual_cands and not item.get("headSha")))
+    )
+    if need_live_gh_check:
         gh_tok = get_github_token()
         if gh_tok:
             try:
                 pr_live = _gh_api_get(f"/repos/{item['owner']}/{item['repo']}/pulls/{item['number']}", gh_tok)
-                live_sha = str(((pr_live or {}).get("head") or {}).get("sha") or "")
-                if live_sha:
-                    item["headSha"] = live_sha
-                    if item.get("role") != "author":
-                        item["currentFingerprint"] = live_sha
-                    save_inbox_state(st)
+                if isinstance(pr_live, dict):
+                    if count_against_daily_budget:
+                        not_open_reason = _check_pr_not_open(
+                            pr_live, include_drafts=bool(cfg.get("includeDrafts"))
+                        )
+                        if not_open_reason:
+                            item["openInQueue"] = False
+                            item.pop("manualAutoReviewQueued", None)
+                            item["skipReason"] = f"Skipped auto-review: PR is {not_open_reason}"
+                            save_inbox_state(st)
+                            return {
+                                "ok": True,
+                                "skipped": True,
+                                "reason": f"pr_{not_open_reason}",
+                                "itemId": item_id,
+                            }
+                    live_sha = str((pr_live.get("head") or {}).get("sha") or "")
+                    if live_sha and (not item.get("headSha") or item.get("headSha") != live_sha):
+                        item["headSha"] = live_sha
+                        if item.get("role") != "author":
+                            item["currentFingerprint"] = live_sha
+                        save_inbox_state(st)
             except Exception:
                 pass
 
@@ -2315,6 +2348,40 @@ def run_precompute_for_item(
             st["items"][item_id]["lastError"] = str(exc)[:300]
             save_inbox_state(st)
         return {"ok": False, "error": str(exc)}
+
+    # Guard: verify the freshly collected PR/CL is still open before invoking `agy` (covers Gerrit & unauthenticated GitHub PRs)
+    if count_against_daily_budget:
+        collected_pr_meta: Dict[str, Any] = {}
+        for meta_path in (os.path.join(item_dir, "pr_context.json"), session_file):
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as mf:
+                        meta_doc = json.load(mf)
+                    if isinstance(meta_doc.get("pr"), dict):
+                        collected_pr_meta = meta_doc["pr"]
+                        break
+                except Exception:
+                    pass
+        not_open_reason = _check_pr_not_open(
+            collected_pr_meta, include_drafts=bool(cfg.get("includeDrafts"))
+        )
+        if not_open_reason:
+            if has_prior_backup and os.path.isfile(prior_backup_path):
+                shutil.copy2(prior_backup_path, session_file)
+            st = load_inbox_state()
+            if item_id in st.get("items", {}):
+                it = st["items"][item_id]
+                it["openInQueue"] = False
+                it.pop("manualAutoReviewQueued", None)
+                it["status"] = "ready" if has_prior_backup else "queued"
+                it["skipReason"] = f"Skipped auto-review: PR is {not_open_reason}"
+                save_inbox_state(st)
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": f"pr_{not_open_reason}",
+                "itemId": item_id,
+            }
 
     # Circuit-breaker: if Security Gate flagged `halt_llm_review`, quarantine without invoking `agy`!
     if ctx_out.get("halt_llm_review"):
