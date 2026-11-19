@@ -1337,6 +1337,38 @@ function inspectConversationFixState(convId) {
     }
     if (parsedSteps.length === 0) return 'unknown';
 
+    // Track background tasks / subagents launched in this conversation that haven't reported completion yet.
+    // When an agent starts a background command (e.g. `dart test` or `tool/generate.dart`) and ends its turn
+    // to wait for the completion SYSTEM_MESSAGE, the conversation is still actively working—not idle!
+    const pendingBgTasks = new Set();
+    for (let i = 0; i < parsedSteps.length; i++) {
+      const step = parsedSteps[i];
+      if (!step) continue;
+      const content = String(step.content || '');
+      if (step.type === 'GENERIC') {
+        const isBgStart =
+          step.status === 'RUNNING' ||
+          content.includes('Tool is running as a background task');
+        if (isBgStart) {
+          const mTask = content.match(/task id:\s*([^\s\n]+)/i);
+          pendingBgTasks.add(mTask ? mTask[1] : `bg-step-${step.step_index ?? i}`);
+        }
+      } else if (step.type === 'SYSTEM_MESSAGE') {
+        if (content.includes('All your subagents and background tasks have been stopped')) {
+          pendingBgTasks.clear();
+        } else {
+          for (const tid of Array.from(pendingBgTasks)) {
+            if (content.includes(tid)) {
+              pendingBgTasks.delete(tid);
+            }
+          }
+        }
+      }
+    }
+    if (pendingBgTasks.size > 0 && ageMs < 900000) {
+      return 'working';
+    }
+
     let lastPlannerIdx = -1;
     let lastPlannerToolCalls = [];
     for (let i = parsedSteps.length - 1; i >= 0; i--) {
@@ -4159,6 +4191,28 @@ class CommentsTreeProvider {
               `The fix agent asked a question (such as choosing a solution approach) before editing your files. Answer in the Antigravity chat pane to continue.`
           );
           return waitNode;
+        }
+        if (needsAttentionFixes.length > 0) {
+          const retryCount = needsAttentionFixes.length + queuedOnly.length;
+          const retryNode = new vscode.TreeItem(
+            `🔄 Retry ${needsAttentionFixes.length} Unfinished Fix${needsAttentionFixes.length === 1 ? '' : 'es'}${queuedOnly.length > 0 ? ` (+${queuedOnly.length} Queued)` : ''}...`,
+            vscode.TreeItemCollapsibleState.None
+          );
+          retryNode.description = 'Click to re-send to Agent';
+          retryNode.iconPath = new vscode.ThemeIcon(
+            'debug-restart',
+            new vscode.ThemeColor('charts.orange')
+          );
+          retryNode.tooltip = new vscode.MarkdownString(
+            `### 🔄 Retry Unfinished Fixes (${retryCount} Selected)\n\n` +
+              `${needsAttentionFixes.length} comment(s) ended without a detected working-tree edit and need attention. ` +
+              `Click to re-send them (along with any newly checked comments) to the Quasar Agent to fix.`
+          );
+          retryNode.command = {
+            command: 'quasar.fixSelectedComments',
+            title: 'Retry Unfinished Fixes with Agent',
+          };
+          return retryNode;
         }
         if (fixableCount === 0 && fixedThreads.length > 0) {
           const allDoneNode = new vscode.TreeItem(
@@ -8704,6 +8758,83 @@ function activate(context) {
       if (!itemId) return;
       await runInboxWatcher(['--mark-reviewed', '--item-id', itemId], 15000);
       refreshInboxUI(false);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.openPrInBrowser', async (arg) => {
+      const resolveUrlFromMeta = (m) => {
+        if (!m || typeof m !== 'object') return '';
+        const direct = String(m.url || m.htmlUrl || m.html_url || '').trim();
+        if (/^https?:\/\//i.test(direct)) return direct;
+        const num = Number(m.number || 0);
+        let owner = String(m.owner || '').trim();
+        let repo = String(m.repo || '').trim();
+        if (!owner && repo.includes('/')) {
+          const parts = repo.split('/');
+          owner = parts[0];
+          repo = parts.slice(1).join('/');
+        } else if (owner && repo.toLowerCase().startsWith(`${owner.toLowerCase()}/`)) {
+          repo = repo.slice(owner.length + 1);
+        }
+        if (owner && repo && num > 0 && String(m.provider || '').toLowerCase() !== 'gerrit') {
+          return `https://github.com/${owner}/${repo}/pull/${num}`;
+        }
+        return '';
+      };
+
+      let url = '';
+      if (typeof arg === 'string' && /^https?:\/\//i.test(arg.trim())) {
+        url = arg.trim();
+      } else if (arg && typeof arg === 'object') {
+        url =
+          resolveUrlFromMeta(arg.inboxItem) ||
+          resolveUrlFromMeta(arg.pastReviewEntry && arg.pastReviewEntry.session && arg.pastReviewEntry.session.pr) ||
+          resolveUrlFromMeta(arg.pr) ||
+          resolveUrlFromMeta(arg);
+      }
+      if (!url) {
+        const sess = loadActiveSession();
+        url = resolveUrlFromMeta(sess && sess.pr);
+      }
+      if (!url) {
+        vscode.window.showInformationMessage('No GitHub / remote PR URL found for this review item.');
+        return;
+      }
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('quasar.markActiveReviewComplete', async () => {
+      const sess = loadActiveSession();
+      if (!sess) {
+        vscode.window.showInformationMessage('No active Quasar review to mark complete.');
+        return;
+      }
+      const wsDir = sess.workspaceDir || sess.repoDir || getWindowWorkspaceRoot() || '';
+      const cliArgs = ['--mark-reviewed'];
+      if (wsDir) {
+        cliArgs.push('--workspace-dir', wsDir);
+      } else if (sess.inboxItemId) {
+        cliArgs.push('--item-id', String(sess.inboxItemId));
+      }
+      const res = await runInboxWatcher(cliArgs, 15000);
+      refreshAllUI(false);
+      refreshInboxUI(false);
+      const prTitle = (sess.pr && sess.pr.title) || sess.sessionId || 'Active review';
+      const markedOk = Boolean(res && (!res.markedComplete || res.markedComplete.ok !== false));
+      if (!markedOk) {
+        vscode.window.showWarningMessage('Could not mark the active review complete.');
+        return;
+      }
+      const choice = await vscode.window.showInformationMessage(
+        `✅ Marked "${prTitle}" complete (Waiting on Author). It will resurface automatically if new commits are pushed.`,
+        'Close Active Review'
+      );
+      if (choice === 'Close Active Review') {
+        await vscode.commands.executeCommand('quasar.closeReview');
+      }
     })
   );
 

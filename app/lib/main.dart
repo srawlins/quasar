@@ -1184,6 +1184,31 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),
+              if (sess != null && (sess.pr.number ?? 0) > 0)
+                Tooltip(
+                  message:
+                      'Mark review complete (Waiting on Author) — moves PR out of Ready until new commits are pushed',
+                  child: OutlinedButton.icon(
+                    onPressed: () async {
+                      try {
+                        await _api.markReviewComplete(
+                          sessionId: sess.sessionId,
+                        );
+                        _showSnack(
+                          '✅ Marked review complete (Waiting on Author). It will resurface if new commits are pushed.',
+                        );
+                        await _refreshState(silent: true);
+                      } catch (e) {
+                        _showSnack('$e', isError: true);
+                      }
+                    },
+                    icon: const Icon(Icons.check_circle_outline, size: 15),
+                    label: const Text(
+                      'Mark Complete',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ),
               OutlinedButton(
                 onPressed: _showGithubTokenDialog,
                 child: Text(

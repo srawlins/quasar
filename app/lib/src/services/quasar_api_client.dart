@@ -153,6 +153,14 @@ class QuasarApiClient {
     return '${res['threadId'] ?? ''}';
   }
 
+  Future<Map<String, dynamic>> markReviewComplete({
+    required String sessionId,
+  }) async {
+    return _postJson('/api/mark-review-complete', <String, dynamic>{
+      'sessionId': sessionId,
+    });
+  }
+
   Future<int> fixSelected({
     required String sessionId,
     Map<String, String>? solutionChoices,

@@ -2790,8 +2790,24 @@ def run_watch_cycle(force_sync_only: bool = False) -> Dict[str, Any]:
         d_pre["phase"] = "syncing"
         d_pre["phaseStartedAt"] = _now_iso()
         save_daemon_status(d_pre)
+    def _set_daemon_sleeping_if_idle(cur_state: Optional[Dict[str, Any]] = None) -> None:
+        d_end = load_daemon_status()
+        if not d_end.get("running"):
+            return
+        st_check = cur_state if isinstance(cur_state, dict) else load_inbox_state()
+        any_analyzing = any(
+            str((v or {}).get("status") or "") == "analyzing"
+            for v in (st_check.get("items") or {}).values()
+        )
+        if not any_analyzing:
+            d_end["activeItemIds"] = []
+            d_end.pop("activeRun", None)
+            d_end["phase"] = "sleeping"
+            save_daemon_status(d_end)
+
     sync_res = sync_github_queue(settings=settings)
     if not sync_res.get("ok"):
+        _set_daemon_sleeping_if_idle()
         return sync_res
 
     st = load_inbox_state()
@@ -2799,11 +2815,13 @@ def run_watch_cycle(force_sync_only: bool = False) -> Dict[str, Any]:
     save_inbox_state(st)
 
     if force_sync_only or settings.get("mode") == "sync_queue_only":
+        _set_daemon_sleeping_if_idle(st)
         return {"ok": True, "syncedOnly": True, "discoveredCount": sync_res.get("discoveredCount", 0)}
 
     chosen_ids, reason = select_eligible_items_for_cycle(settings, st)
     save_inbox_state(st)
     if not chosen_ids:
+        _set_daemon_sleeping_if_idle(st)
         return {"ok": True, "processed": [], "reason": reason}
 
     max_conc = max(1, min(4, int(settings.get("maxConcurrency") or 1)))
@@ -3283,6 +3301,11 @@ def build_inbox_payload() -> Dict[str, Any]:
 
     is_running = bool(daemon.get("running"))
     active_run = daemon.get("activeRun") if (is_running and isinstance(daemon.get("activeRun"), dict)) else None
+    if active_run:
+        ar_id = str(active_run.get("itemId") or "")
+        ar_item = (st.get("items") or {}).get(ar_id) if ar_id else None
+        if analyzing_count == 0 or (ar_item is not None and str(ar_item.get("status") or "") != "analyzing"):
+            active_run = None
     if not active_run and analyzing_count > 0:
         first_an = next((x for x in items_list if x.get("inboxGroup") == "in_progress"), None)
         if first_an:
@@ -3814,6 +3837,142 @@ def delete_stored_review(
     }
 
 
+def mark_review_complete(
+    item_id: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+    session_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Marks an active review (and/or Inbox PR) as Complete / Waiting on Author.
+
+    Updates both:
+    - `active_session.json` (`reviewOutcome = "waiting_on_author"`, `reviewCompletedAt`)
+    - `inbox/state.json` (`status = "waiting_on_author"`, `reviewedHeadSha = headSha`, `unread = False`)
+      so the PR moves out of Ready/Queued and automatically resurfaces if the author pushes new commits.
+    """
+    now_iso = _now_iso()
+    resolved_session_path = (session_path or "").strip()
+    if not resolved_session_path and workspace_dir:
+        try:
+            _, resolved_session_path, _ = get_session_paths(workspace_dir)
+        except Exception:
+            resolved_session_path = ""
+
+    session_obj: Optional[Dict[str, Any]] = None
+    if resolved_session_path and os.path.isfile(resolved_session_path):
+        try:
+            with open(resolved_session_path, "r", encoding="utf-8") as sf:
+                session_obj = json.load(sf)
+        except Exception:
+            session_obj = None
+
+    st = load_inbox_state()
+    items = st.setdefault("items", {})
+    iid = (item_id or "").strip()
+    pr_meta = (session_obj.get("pr") or {}) if isinstance(session_obj, dict) else {}
+    head_sha = str(pr_meta.get("headSha") or pr_meta.get("headOid") or "")
+    provider = str(pr_meta.get("provider") or "github").lower()
+    pr_url = str(pr_meta.get("url") or "")
+    pr_title = str(pr_meta.get("title") or "")
+    pr_num = int(pr_meta.get("number") or 0)
+    owner = str(pr_meta.get("owner") or "")
+    repo = str(pr_meta.get("repo") or "")
+    if not owner and "/" in repo:
+        owner, repo = repo.split("/", 1)
+    elif "/" in repo and owner and repo.lower().startswith(owner.lower() + "/"):
+        repo = repo.split("/", 1)[1]
+
+    if not iid and isinstance(session_obj, dict):
+        iid = str(session_obj.get("inboxItemId") or "").strip()
+    if not iid and isinstance(session_obj, dict):
+        canon = _canonical_review_id(session_obj)
+        if canon and canon in items:
+            iid = canon
+    if not iid and owner and repo and pr_num > 0:
+        owner_l = owner.lower()
+        repo_l = repo.lower()
+        for cand_id, cand in items.items():
+            if (
+                str(cand.get("provider") or "github").lower() == provider
+                and str(cand.get("owner") or "").lower() == owner_l
+                and str(cand.get("repo") or "").lower() == repo_l
+                and int(cand.get("number") or 0) == pr_num
+            ):
+                iid = cand_id
+                break
+
+    # If the user reviewed a remote PR manually (not yet in inbox/state.json), record a waiting_on_author entry
+    # so future inbox syncs know this SHA was reviewed and will wake it up when new commits arrive.
+    if not iid and owner and repo and pr_num > 0 and provider in ("github", "gerrit"):
+        iid = (
+            _canonical_review_id(session_obj)
+            if isinstance(session_obj, dict)
+            else f"{owner.lower()}__{repo.lower()}__{pr_num}"
+        )
+        if iid:
+            items[iid] = {
+                "id": iid,
+                "provider": provider,
+                "owner": owner,
+                "repo": repo,
+                "number": pr_num,
+                "title": pr_title or f"PR #{pr_num}",
+                "url": pr_url,
+                "role": "reviewer",
+                "matchedRoles": ["reviewer"],
+                "headSha": head_sha,
+                "currentFingerprint": head_sha,
+                "analyzedFingerprint": head_sha,
+                "openInQueue": True,
+                "dismissed": False,
+                "unread": False,
+                "status": "waiting_on_author",
+                "reviewedHeadSha": head_sha,
+                "updatedAt": now_iso,
+            }
+
+    if iid and iid in items:
+        it = items[iid]
+        effective_sha = head_sha or str(it.get("headSha") or "")
+        it["reviewedHeadSha"] = effective_sha
+        if effective_sha and not it.get("headSha"):
+            it["headSha"] = effective_sha
+        it["status"] = "waiting_on_author"
+        it["unread"] = False
+        it["updatedSinceLastReview"] = False
+        it.pop("manualAutoReviewQueued", None)
+        it.pop("skipReason", None)
+        save_inbox_state(st)
+
+    updated_session = False
+    if isinstance(session_obj, dict) and resolved_session_path:
+        session_obj["reviewOutcome"] = "waiting_on_author"
+        session_obj["reviewCompletedAt"] = now_iso
+        session_obj["updatedAt"] = now_iso
+        if iid:
+            session_obj["inboxItemId"] = iid
+        try:
+            with open(resolved_session_path, "w", encoding="utf-8") as sf:
+                json.dump(session_obj, sf, indent=2)
+            updated_session = True
+            try:
+                archive_review_session(session_obj)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    payload = build_inbox_payload()
+    payload["markedComplete"] = {
+        "ok": bool(iid or updated_session),
+        "itemId": iid,
+        "status": "waiting_on_author",
+        "reviewedHeadSha": head_sha or (items.get(iid, {}).get("reviewedHeadSha") if iid else ""),
+        "title": pr_title or (items.get(iid, {}).get("title") if iid else ""),
+        "updatedSession": updated_session,
+    }
+    return payload
+
+
 def requeue_inbox_item(item_id: str) -> Dict[str, Any]:
     """Moves a `deleted` or `dismissed` Inbox PR back into `queued` so the auto-review daemon can review it."""
     st = load_inbox_state()
@@ -4127,16 +4286,12 @@ def main() -> None:
         print(json.dumps(res, indent=2))
         return
 
-    if args.mark_reviewed and args.item_id:
-        st = load_inbox_state()
-        iid = args.item_id.strip()
-        if iid in st.get("items", {}):
-            it = st["items"][iid]
-            it["reviewedHeadSha"] = it.get("headSha")
-            it["status"] = "waiting_on_author"
-            it["unread"] = False
-            save_inbox_state(st)
-        print(json.dumps(build_inbox_payload(), indent=2))
+    if args.mark_reviewed and (args.item_id or args.workspace_dir):
+        res = mark_review_complete(
+            item_id=(args.item_id or "").strip() or None,
+            workspace_dir=args.workspace_dir,
+        )
+        print(json.dumps(res, indent=2))
         return
 
     if args.list_reviews:

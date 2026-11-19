@@ -126,6 +126,61 @@ class TestInboxWatcherOpenGuard(unittest.TestCase):
             self.assertFalse(state["items"][item_id]["openInQueue"])
             self.assertEqual(state["items"][item_id]["status"], "queued")
 
+    def test_mark_review_complete_updates_session_and_inbox_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess_path = Path(tmp) / "active_session.json"
+            sess_path.write_text(
+                json.dumps(
+                    {
+                        "sessionId": "owner-repo-pr-77",
+                        "pr": {
+                            "provider": "github",
+                            "owner": "owner",
+                            "repo": "repo",
+                            "number": 77,
+                            "title": "Add cool feature",
+                            "url": "https://github.com/owner/repo/pull/77",
+                            "headSha": "deadbeef1234",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state = {
+                "items": {
+                    "owner__repo__77": {
+                        "id": "owner__repo__77",
+                        "provider": "github",
+                        "owner": "owner",
+                        "repo": "repo",
+                        "number": 77,
+                        "status": "ready",
+                        "unread": True,
+                        "updatedSinceLastReview": True,
+                        "headSha": "deadbeef1234",
+                    }
+                }
+            }
+
+            with mock.patch.object(inbox_watcher, "load_inbox_state", return_value=state), \
+                 mock.patch.object(inbox_watcher, "save_inbox_state") as save_mock, \
+                 mock.patch.object(inbox_watcher, "build_inbox_payload", return_value={"ok": True}), \
+                 mock.patch.object(inbox_watcher, "archive_review_session"):
+                res = inbox_watcher.mark_review_complete(session_path=str(sess_path))
+
+            self.assertTrue(res["markedComplete"]["ok"])
+            self.assertEqual(res["markedComplete"]["itemId"], "owner__repo__77")
+            self.assertEqual(state["items"]["owner__repo__77"]["status"], "waiting_on_author")
+            self.assertEqual(state["items"]["owner__repo__77"]["reviewedHeadSha"], "deadbeef1234")
+            self.assertFalse(state["items"]["owner__repo__77"]["unread"])
+            self.assertFalse(state["items"]["owner__repo__77"]["updatedSinceLastReview"])
+            save_mock.assert_called_once()
+
+            updated_sess = json.loads(sess_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_sess["reviewOutcome"], "waiting_on_author")
+            self.assertTrue(updated_sess.get("reviewCompletedAt"))
+            self.assertEqual(updated_sess["inboxItemId"], "owner__repo__77")
+
 
 if __name__ == "__main__":
     unittest.main()

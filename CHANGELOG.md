@@ -2,6 +2,23 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [NEXT]
+
+### Added
+- **Open PR on GitHub / Browser from Right-Click Menu (`quasar.openPrInBrowser`)**:
+  - Added **Open PR on GitHub / Browser** to the right-click context menu on all PR Inbox items (`ready`, `queued`, `analyzing`, `quarantined`, `waiting`, `deleted`), Past Reviews, and the active PR header (plus the Command Palette).
+- **Mark Active Review Complete (Waiting on Author)**:
+  - Added `quasar.markActiveReviewComplete` (`$(pass)` toolbar button in **CliffsNotes & Reading Tour**, `⋯` session/action menus, and Command Palette) in VS Code, `POST /api/mark-review-complete` in `quasar-web`, a **`Mark Complete`** header button in the standalone Flutter app, and `mark_review_complete()` / `--mark-reviewed --workspace-dir` in `inbox_watcher.py`.
+  - Records `reviewedHeadSha` and sets `status = "waiting_on_author"` in `inbox/state.json` (creating a tracked entry even for manually opened PRs so future commits automatically resurface them), stamps `active_session.json`, and offers a 1-click **Close Active Review** toast action.
+- **1-Click `🔄 Retry Unfinished Fixes` Action**:
+  - Added a prominent **`🔄 Retry N Unfinished Fix(es)...`** action row at the top of the VS Code **Review Comments & Cart** sidebar whenever fixes land in `needs_attention` (`⚠️ Check Fix`), wired directly to `quasar.fixSelectedComments`.
+
+### Fixed
+- **Premature `⚠️ Check Fix` While Fix Agent Waits on Background Tasks**:
+  - Updated `inspectConversationFixState()` (`extension.js`) to track in-flight background tasks (`GENERIC` `RUNNING` / `task id: ...`) against completion `SYSTEM_MESSAGE` steps so long-running `tool/generate.dart`, `dart test`, or `xcodebuild` commands keep the status `'working'` instead of prematurely triggering `--reconcile-fixes --agent-idle`.
+- **Stale Phantom Background Review Timer in PR Inbox Header**:
+  - Updated `build_inbox_payload()` (`inbox_watcher.py`) to ignore stale `daemon.activeRun` entries when no items are actually `analyzing` (or the referenced item is already `ready`), and updated `run_watch_cycle()` to clear `activeRun` and reset `phase = "sleeping"` on early-return idle cycles.
+
 ## [1.7.4] - 2026-11-18
 
 ### Fixed

@@ -4559,6 +4559,25 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": str(exc)})
             return
 
+        if pathname == "/api/mark-review-complete":
+            try:
+                import inbox_watcher  # type: ignore
+
+                session, session_path = load_target_session(data.get("sessionId"))
+                if not session:
+                    self._send_json(404, {"ok": False, "error": "No active session"})
+                    return
+                ws_dir = session.get("workspaceDir") or session.get("repoDir")
+                res = inbox_watcher.mark_review_complete(
+                    item_id=str(data.get("itemId") or session.get("inboxItemId") or "").strip() or None,
+                    workspace_dir=ws_dir,
+                    session_path=session_path,
+                )
+                self._send_json(200, {"ok": True, "inbox": res, "markedComplete": res.get("markedComplete")})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
         if pathname == "/api/inbox-item-action":
             try:
                 import inbox_watcher  # type: ignore
