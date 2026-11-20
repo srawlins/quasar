@@ -488,6 +488,7 @@ def dispatch_via_agy_cli(
     cmd.append(f"--settings={session_settings}")
     cmd.append(f"--print={prompt}")
 
+    cli_bin_name = os.path.basename(agy_bin)
     ACTIVE_AGENT_JOB.clear()
     ACTIVE_AGENT_JOB.update({
         "active": True,
@@ -495,9 +496,9 @@ def dispatch_via_agy_cli(
         "promptPreview": prompt.splitlines()[0][:120] if prompt else title,
         "startedAt": time.time(),
         "baselineMtime": baseline_mtime,
-        "conversationId": conversation_id or "",
+        "conversationId": "",
         "mode": "agy-cli",
-        "cliStage": "🚀 Running Antigravity CLI (`agy`)...",
+        "cliStage": f"🚀 Running {cli_bin_name} CLI...",
         "cliDetail": f"Starting {title} ({eff} effort)...",
         "subagents": [],
         "completedAt": None,
@@ -558,55 +559,76 @@ def dispatch_via_agy_cli(
                     bufsize=1,
                 )
                 ACTIVE_AGENT_JOB["pid"] = proc.pid
-                if proc.stdout:
-                    for raw_line in proc.stdout:
-                        ln = raw_line.strip()
-                        if not ln:
-                            continue
-                        m_uuid = re.search(
-                            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
-                            ln,
-                        )
-                        if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
-                            ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
-                        if ln.startswith("{") and ln.endswith("}"):
-                            try:
-                                ev = json.loads(ln)
-                                cid_cand = (
-                                    ev.get("conversation_id")
-                                    or ev.get("conversationId")
-                                    or ev.get("session_id")
-                                    or ""
-                                )
-                                if cid_cand:
-                                    ACTIVE_AGENT_JOB["conversationId"] = str(cid_cand)
-                                su = ev.get("step_update") or {}
-                                if su.get("step_type") and su.get("step_type") != "user_input":
-                                    saw_execution = True
-                                    if su.get("step_type") == "agent_response" and isinstance(su.get("text_delta"), str):
-                                        agent_text_chunks.append(su["text_delta"])
-                                if ev.get("event") == "result" and isinstance(ev.get("result"), dict) and ev["result"].get("status") == "ERROR":
-                                    stream_err = str(ev["result"].get("error") or "")
-                                if "collect_pr_context" in ln:
-                                    ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
-                                    ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
-                                elif "invoke_subagent" in ln or "review-" in ln:
-                                    ACTIVE_AGENT_JOB["cliStage"] = "🔬 Phase 2/3 — Running specialist review lenses"
-                                    for m_ag in re.findall(r"review-[a-z-]+", ln):
-                                        subs = ACTIVE_AGENT_JOB.setdefault("subagents", [])
-                                        if m_ag not in subs:
-                                            subs.append(m_ag)
-                                    ACTIVE_AGENT_JOB["cliDetail"] = "Analyzing architecture, bugs, & edge cases..."
-                                elif "publish_review_session" in ln:
-                                    ACTIVE_AGENT_JOB["cliStage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
-                                    ACTIVE_AGENT_JOB["cliDetail"] = "Writing session & rendering diffs..."
-                                elif "answer_comment_question" in ln:
-                                    ACTIVE_AGENT_JOB["cliStage"] = "💬 Posting inline answer to thread"
-                                    ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
-                            except Exception:
-                                pass
-                        elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity", ln, re.I):
-                            stream_err = ln[:300]
+                cli_log_file = None
+                try:
+                    os.makedirs(STATE_DIR, exist_ok=True)
+                    cli_log_file = open(os.path.join(STATE_DIR, "last_cli_run.log"), "w", encoding="utf-8")
+                    cli_log_file.write(f"[quasar-web] pid={proc.pid} bin={agy_bin} cwd={run_cwd}\n")
+                    cli_log_file.flush()
+                except Exception:
+                    cli_log_file = None
+                try:
+                    if proc.stdout:
+                        for raw_line in proc.stdout:
+                            if cli_log_file is not None:
+                                try:
+                                    cli_log_file.write(raw_line)
+                                    cli_log_file.flush()
+                                except Exception:
+                                    pass
+                            ln = raw_line.strip()
+                            if not ln:
+                                continue
+                            m_uuid = re.search(
+                                r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+                                ln,
+                            )
+                            if m_uuid and not ACTIVE_AGENT_JOB.get("conversationId"):
+                                ACTIVE_AGENT_JOB["conversationId"] = m_uuid.group(1)
+                            if ln.startswith("{") and ln.endswith("}"):
+                                try:
+                                    ev = json.loads(ln)
+                                    cid_cand = (
+                                        ev.get("conversation_id")
+                                        or ev.get("conversationId")
+                                        or ev.get("session_id")
+                                        or ""
+                                    )
+                                    if cid_cand:
+                                        ACTIVE_AGENT_JOB["conversationId"] = str(cid_cand)
+                                    su = ev.get("step_update") or {}
+                                    if su.get("step_type") and su.get("step_type") != "user_input":
+                                        saw_execution = True
+                                        if su.get("step_type") == "agent_response" and isinstance(su.get("text_delta"), str):
+                                            agent_text_chunks.append(su["text_delta"])
+                                    if ev.get("event") == "result" and isinstance(ev.get("result"), dict) and ev["result"].get("status") == "ERROR":
+                                        stream_err = str(ev["result"].get("error") or "")
+                                    if "collect_pr_context" in ln:
+                                        ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
+                                        ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
+                                    elif "invoke_subagent" in ln or "review-" in ln:
+                                        ACTIVE_AGENT_JOB["cliStage"] = "🔬 Phase 2/3 — Running specialist review lenses"
+                                        for m_ag in re.findall(r"review-[a-z-]+", ln):
+                                            subs = ACTIVE_AGENT_JOB.setdefault("subagents", [])
+                                            if m_ag not in subs:
+                                                subs.append(m_ag)
+                                        ACTIVE_AGENT_JOB["cliDetail"] = "Analyzing architecture, bugs, & edge cases..."
+                                    elif "publish_review_session" in ln:
+                                        ACTIVE_AGENT_JOB["cliStage"] = "📖 Phase 3/3 — Publishing CliffsNotes & comments"
+                                        ACTIVE_AGENT_JOB["cliDetail"] = "Writing session & rendering diffs..."
+                                    elif "answer_comment_question" in ln:
+                                        ACTIVE_AGENT_JOB["cliStage"] = "💬 Posting inline answer to thread"
+                                        ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
+                                except Exception:
+                                    pass
+                            elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity", ln, re.I):
+                                stream_err = ln[:300]
+                finally:
+                    if cli_log_file is not None:
+                        try:
+                            cli_log_file.close()
+                        except Exception:
+                            pass
                 rc = proc.wait()
                 if not saw_execution and (
                     rc == 3 or re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity", stream_err, re.I)
@@ -970,10 +992,11 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
     if ACTIVE_AGENT_JOB.get("active"):
         started_at = float(ACTIVE_AGENT_JOB.get("startedAt") or now)
         baseline_mtime = float(ACTIVE_AGENT_JOB.get("baselineMtime") or 0.0)
-        if ACTIVE_AGENT_JOB.get("mode") != "agy-cli" and current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
+        is_cli_job = ACTIVE_AGENT_JOB.get("mode") == "agy-cli"
+        if not is_cli_job and current_max_mtime > baseline_mtime + 0.5 and (now - started_at) > 1.0:
             ACTIVE_AGENT_JOB["active"] = False
             ACTIVE_AGENT_JOB["completedAt"] = now
-        elif (now - started_at) > 600:
+        elif (now - started_at) > (1800 if is_cli_job else 600):
             ACTIVE_AGENT_JOB["active"] = False
 
     if not ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("completedAt"):
@@ -1001,11 +1024,14 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
                 "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
             }
 
-    # Inspect recent transcript activity across all ~/.gemini/*/brain directories
+    # Inspect recent transcript activity across all ~/.gemini/*/brain directories.
+    # For an active `agy-cli` job, ONLY inspect its own spawned conversationId so we never
+    # cross-contaminate the banner with an unrelated IDE/CLI conversation running in parallel.
+    is_active_cli_job = bool(ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("mode") == "agy-cli")
     target_cid = (
-        ACTIVE_AGENT_JOB.get("conversationId")
-        or (session or {}).get("conversationId")
-        or ""
+        ACTIVE_AGENT_JOB.get("conversationId") or ""
+        if is_active_cli_job
+        else (ACTIVE_AGENT_JOB.get("conversationId") or (session or {}).get("conversationId") or "")
     ).strip()
 
     transcript_path = None
@@ -1016,7 +1042,7 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
             if os.path.isfile(cand):
                 transcript_path = cand
 
-    if not transcript_path:
+    if not transcript_path and not is_active_cli_job:
         recent: List[Tuple[float, str]] = []
         for bdir in list_all_brain_dirs():
             try:

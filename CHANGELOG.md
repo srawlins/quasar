@@ -2,6 +2,12 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.7] - 2026-11-20
+
+### Fixed
+- **Fix Web Banner Cross-Contamination During CLI Reviews (`server.py`)**:
+  - Stopped `dispatch_via_agy_cli` from seeding `ACTIVE_AGENT_JOB["conversationId"]` with an unrelated prior chat ID and stopped `get_live_agent_status()` from scanning arbitrary brain directories during an active `agy-cli` job—preventing the web progress banner from showing steps from a different parallel Jetski/IDE conversation. Also added rolling CLI output logging to `~/.gemini/quasar/last_cli_run.log` and raised the CLI job timeout from 10m to 30m.
+
 ## [1.7.6] - 2026-11-20
 
 ### Fixed
