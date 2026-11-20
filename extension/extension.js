@@ -699,6 +699,16 @@ function dispatchViaAgyCli(prompt, title, effectiveWsRoot, env, options = {}) {
       'command(sort)',
       'command(uniq)',
       'command(true)',
+      'command(false)',
+      'command(test)',
+      'command([)',
+      'command(echo)',
+      'command(printf)',
+      'command(basename)',
+      'command(dirname)',
+      'command(realpath)',
+      'command(tr)',
+      'command(cut)',
       `read_file(${realStateDir}/)`,
       `write_file(${realStateDir}/)`,
       `read_file(${realPluginDir}/)`,
@@ -11437,8 +11447,14 @@ function activate(context) {
           : []),
         {
           label: '$(pin) Keep this comment for this PR only (do not save a global rule)',
-          description: 'Moves finding to Candidate without changing long-term preferences',
+          description: 'Stages finding for this review without changing long-term preferences',
           action: 'calibrate_once',
+          defaultRule: '',
+        },
+        {
+          label: '$(debug-step-over) Skip this comment for this PR only (do not save a global rule)',
+          description: 'Dismisses finding for this review without changing long-term preferences',
+          action: 'calibrate_skip_once',
           defaultRule: '',
         },
         {
@@ -11463,7 +11479,7 @@ function activate(context) {
       }
 
       let ruleText = picked.defaultRule;
-      if (picked.action !== 'calibrate_once') {
+      if (picked.action !== 'calibrate_once' && picked.action !== 'calibrate_skip_once') {
         const refinedRule = await vscode.window.showInputBox({
           title: picked.subagent
             ? `Confirm Learned Rule for ${picked.subagent}`

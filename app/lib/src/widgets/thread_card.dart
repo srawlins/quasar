@@ -448,6 +448,13 @@ class _ThreadCardState extends State<ThreadCard> {
                         ),
                       ),
                       _SmallActionBtn(
+                        label: 'Skip Once',
+                        onTap: () => widget.onThreadAction(
+                          'calibrate',
+                          <String, dynamic>{'decision': 'skip_once'},
+                        ),
+                      ),
+                      _SmallActionBtn(
                         label: '🚫 Dismiss & Skip in Future',
                         onTap: () => widget.onThreadAction(
                           'calibrate',

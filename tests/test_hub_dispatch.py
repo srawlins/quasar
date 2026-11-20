@@ -142,6 +142,166 @@ class TestHubDiscoveryAndDispatch(unittest.TestCase):
 
             self.assertEqual(chosen, str(fake_jetski))
 
+    def test_headless_cli_allow_rules_cover_readonly_probes_and_quasar_scripts(self) -> None:
+        captured_cmd = []
+
+        class FakeProc:
+            pid = 12345
+            stdout = iter(
+                [
+                    json.dumps({"event": "init", "conversation_id": "22222222-3333-4444-5555-666666666666"}) + "\n",
+                    json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "OK"}}) + "\n",
+                ]
+            )
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as ws_dir, \
+             mock.patch.object(server, "find_agy_binary", return_value="/usr/local/bin/agy"), \
+             mock.patch.object(server.subprocess, "Popen", side_effect=fake_popen):
+            res = server.dispatch_via_agy_cli(
+                prompt="Review PR #1",
+                title="Quasar Code Review",
+                workspace_dir=ws_dir,
+                effort="low",
+                allow_edits=False,
+            )
+            self.assertTrue(res["ok"])
+            # Wait briefly for background stream thread to finish
+            import time
+            for _ in range(50):
+                if not server.ACTIVE_AGENT_JOB.get("active"):
+                    break
+                time.sleep(0.02)
+
+        settings_arg = next((a for a in captured_cmd if a.startswith("--settings=")), "")
+        self.assertTrue(settings_arg, "Expected --settings=... argument")
+        allow_rules = json.loads(settings_arg.split("=", 1)[1])["permissions"]["allow"]
+
+        for required_cmd in (
+            "command(git)",
+            "command(ls)",
+            "command(cat)",
+            "command(test)",
+            "command([)",
+            "command(echo)",
+            "command(true)",
+            "command(rg)",
+            "command(find)",
+        ):
+            self.assertIn(required_cmd, allow_rules)
+
+        # Least-privilege guarantee: read-only review must NOT grant write_file on workspace
+        real_ws = os.path.realpath(ws_dir)
+        self.assertIn(f"read_file({real_ws}/)", allow_rules)
+        self.assertNotIn(f"write_file({real_ws}/)", allow_rules)
+
+        # Verify script regex matches both direct and env-prefixed Quasar script invocations
+        import re
+        script_rules = [r for r in allow_rules if r.startswith("command(regex:") and r.endswith(")")]
+        self.assertTrue(script_rules)
+        rx = re.compile(script_rules[0][len("command(regex:") : -1])
+        self.assertIsNotNone(rx.search("python3 ~/.gemini/config/plugins/quasar/skills/quasar/scripts/collect_pr_context.py --pr 1"))
+        self.assertIsNotNone(rx.search("QUASAR_SESSION_DIR=/tmp/s python3 /x/skills/quasar/scripts/publish_review_session.py --input a.json"))
+
+    def test_headless_cli_surfaces_denied_actions_even_on_success_rc_zero(self) -> None:
+        class FakeDeniedProc:
+            pid = 23456
+            stdout = iter(
+                [
+                    json.dumps({"event": "init", "conversation_id": "33333333-4444-5555-6666-777777777777"}) + "\n",
+                    "cli: no output produced — a tool required the \"command\" permission that headless mode cannot prompt for, so it was auto-denied.\n",
+                    json.dumps(
+                        {
+                            "event": "result",
+                            "result": {
+                                "status": "SUCCESS",
+                                "response": "",
+                                "denied_actions": [{"action": "command", "display_name": "RunCommand"}],
+                            },
+                        }
+                    )
+                    + "\n",
+                ]
+            )
+
+            def wait(self) -> int:
+                return 0
+
+        with tempfile.TemporaryDirectory() as ws_dir, \
+             mock.patch.object(server, "find_agy_binary", return_value="/usr/local/bin/agy"), \
+             mock.patch.object(server.subprocess, "Popen", return_value=FakeDeniedProc()):
+            server.dispatch_via_agy_cli(
+                prompt="Review PR #1",
+                title="Quasar Code Review",
+                workspace_dir=ws_dir,
+                effort="low",
+                allow_edits=False,
+            )
+            import time
+            for _ in range(50):
+                if not server.ACTIVE_AGENT_JOB.get("active"):
+                    break
+                time.sleep(0.02)
+
+        self.assertTrue(server.ACTIVE_AGENT_JOB.get("cliError"))
+        self.assertIn("RunCommand", server.ACTIVE_AGENT_JOB["cliError"])
+        status = server.get_live_agent_status(None, [])
+        self.assertIn("error", status)
+        self.assertIn("RunCommand", status["error"])
+        self.assertNotIn("Agent finished", status.get("stage", ""))
+
+    @unittest.skipUnless(
+        os.environ.get("QUASAR_LIVE_CLI_TEST") == "1",
+        "Set QUASAR_LIVE_CLI_TEST=1 to run live strict-permission headless CLI smoke test",
+    )
+    def test_live_headless_cli_strict_permissions_readonly_probe(self) -> None:
+        cli_bin = server.find_agy_binary()
+        self.assertIsNotNone(cli_bin, "No headless CLI binary found")
+        real_state_dir = os.path.realpath(os.path.expanduser("~/.gemini/quasar"))
+        settings = json.dumps(
+            {
+                "permissions": {
+                    "allow": [
+                        r"command(regex:^([^\n]*\s)?python3\s+.*skills/quasar/scripts/.*)",
+                        "command(git)",
+                        "command(ls)",
+                        "command(test)",
+                        "command([)",
+                        "command(echo)",
+                        "command(true)",
+                        f"read_file({real_state_dir}/)",
+                    ]
+                }
+            }
+        )
+        prompt = (
+            "Run this exact shell command: "
+            "`ls -la ~/.gemini/quasar >/dev/null && test -d ~/.gemini/quasar && echo OK || echo FAIL` "
+            "and reply ONLY with OK if it succeeded."
+        )
+        import subprocess
+        proc = subprocess.run(
+            [
+                cli_bin,
+                "--output-format=stream-json",
+                "--mode=auto",
+                f"--add-dir={real_state_dir}",
+                f"--settings={settings}",
+                f"--print={prompt}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn('"denied_actions"', proc.stdout)
+
     def test_extension_js_does_not_skip_agentapi_new_conversation_without_project_id(self) -> None:
         ext_text = (REPO_ROOT / "extension" / "extension.js").read_text(encoding="utf-8")
         self.assertNotIn("if (!env.ANTIGRAVITY_PROJECT_ID) {\n        tryDirectHttpFallback(null);", ext_text)

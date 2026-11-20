@@ -1038,12 +1038,21 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
               segments: <ButtonSegment<_MainTab>>[
                 const ButtonSegment<_MainTab>(
                   value: _MainTab.studyGuide,
-                  label: Text('📖 Study Guide', style: TextStyle(fontSize: 12)),
+                  label: Text(
+                    '📖 Study Guide',
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 12),
+                  ),
                 ),
                 ButtonSegment<_MainTab>(
                   value: _MainTab.diff,
                   label: Text(
                     '🔀 Diff (${_state?.filesDiff.length ?? 0})',
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),
@@ -1051,6 +1060,9 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                   value: _MainTab.comments,
                   label: Text(
                     '💬 Comments (${sess.activeThreads.length})',
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),
@@ -1058,6 +1070,9 @@ class _QuasarHomeShellState extends State<QuasarHomeShell> {
                   value: _MainTab.inbox,
                   label: Text(
                     '📥 Inbox (${_state?.inbox.readyCount ?? 0})',
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 12),
                   ),
                 ),

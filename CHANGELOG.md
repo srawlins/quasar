@@ -2,6 +2,25 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.8.0] - 2026-11-20
+
+### Added
+- **`Skip Once` Preference Calibration Option Across All UIs (`calibrate_skip_once`)**:
+  - Added **`Skip Once`** alongside `Keep Once` in uncertain-finding preference calibration across VS Code (`quasar.calibrateFindingPreference`), the standalone Flutter Web/Desktop app (`thread_card.dart`), `quasar-web` (`server.py`), and `manage_preferences.py`—dismissing the finding for the current PR without saving a global suppression rule.
+- **Editor-Style Syntax Highlighting in Flutter Web/Desktop (`re_highlight`)**:
+  - Integrated `re_highlight` (Highlight.js v11.9 grammars + `githubDarkTheme`) via `app/lib/src/utils/syntax_highlighter.dart` covering 25+ languages (Dart, Swift, Kotlin, Java, C/C++, Obj-C, Python, JS/TS, Rust, Go, YAML, JSON, Bash, CMake, Gradle, etc.) across both fenced markdown code blocks (`RichMarkdownBlock`) and side-by-side/unified diffs (`DiffViewer`).
+
+### Fixed
+- **Headless CLI Read-Only Shell Coverage, `denied_actions` Error Surfacing, & `showModal` Fix**:
+  - Added `test`, `[`, `echo`, `printf`, `basename`, `dirname`, `realpath`, `tr`, `cut`, and `false` to the base read-only `allow_rules` across `server.py`, `inbox_watcher.py`, and `extension.js` so headless reviews don't auto-deny harmless shell checks (`test -f ... && echo ...`).
+  - Updated `server.py` (`dispatch_via_agy_cli`) to detect `result.denied_actions` (even when `status == "SUCCESS"` and `rc == 0`) and `"headless mode cannot prompt for"` / `"auto-denied"` messages so permission denials surface immediately instead of showing `"✅ Agent finished"`.
+  - Fixed 3 `openModal(...)` → `showModal(...)` typos in `WEB_UI_HTML` (`server.py`) and expanded `auto_detect_repo_dir()` (`collect_pr_context.py`) to scan `~/code/`, `<owner>-<repo>`, and sibling directories.
+- **Render Markdown SVG Badges & Links Cleanly in Flutter Web/Desktop Comments (`markdown_text.dart`)**:
+  - Updated `InlineMarkdownText` (`app/lib/src/widgets/markdown_text.dart`) to render markdown image badges (such as `![critical](https://www.gstatic.com/codereviewagent/critical.svg)`) as styled severity pills instead of raw `![...](...)` text, with raster image support + pill fallback and clean `[label](url)` link rendering.
+- **Flutter Web/Desktop Diff Toolbar Crushing Viewport on Narrower Windows**:
+  - Replaced the rigid `Row` + unconstrained `SelectableText` in `DiffViewer`'s file toolbar (`app/lib/src/widgets/diff_viewer.dart`) with a responsive `Wrap` and single-line ellipsized path with full-path `Tooltip`, preventing long file paths from wrapping 1–2 characters per line and pushing the scrollable diff `ListView` off-screen (especially in `Unified` mode).
+  - Kept the top tab switcher labels (`Study Guide`, `Diff`, `Comments`, `Inbox`) single-line (`maxLines: 1, softWrap: false`) in `app/lib/main.dart`.
+
 ## [1.7.8] - 2026-11-20
 
 ### Fixed

@@ -816,6 +816,16 @@ def update_active_session_thread(
                     "timestamp": now_iso,
                 }
             )
+        elif action == "calibrate_skip_once":
+            target_thread["status"] = "dismissed"
+            target_thread["uncertaintyResolved"] = True
+            msgs.append(
+                {
+                    "author": learner_author,
+                    "body": "⏭️ **Skipped for this review only** (no global rule saved).",
+                    "timestamp": now_iso,
+                }
+            )
         elif action == "meta_feedback":
             target_thread["feedbackRating"] = "calibrated"
             note = learned_rule or user_feedback
@@ -871,6 +881,7 @@ def main() -> None:
             "calibrate_keep",
             "calibrate_skip",
             "calibrate_once",
+            "calibrate_skip_once",
             "meta_feedback",
             "edit_draft",
             "stage",
@@ -1041,7 +1052,7 @@ def main() -> None:
         if not rule_to_save and args.reason and args.action in ("upvote", "downvote", "calibrate_keep", "calibrate_skip", "meta_feedback"):
             rule_to_save = args.reason.strip()
 
-        if rule_to_save and args.action != "calibrate_once":
+        if rule_to_save and args.action not in ("calibrate_once", "calibrate_skip_once"):
             inferred_sentiment = args.sentiment
             if not inferred_sentiment:
                 if args.action in ("upvote", "calibrate_keep"):

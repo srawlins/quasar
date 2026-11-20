@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/quasar_models.dart';
+import '../utils/syntax_highlighter.dart';
 import 'thread_card.dart';
 
 class DiffScrollRequest {
@@ -549,8 +550,9 @@ class _DiffViewerState extends State<DiffViewer> {
                   },
                 ),
 
-              // File toolbar
+              // File toolbar (responsive Wrap so long file paths never squeeze vertically on narrower viewports)
               Container(
+                width: double.infinity,
                 padding:
                     const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                 decoration: const BoxDecoration(
@@ -559,60 +561,74 @@ class _DiffViewerState extends State<DiffViewer> {
                     bottom: BorderSide(color: Color(0xFF21262D)),
                   ),
                 ),
-                child: Row(
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 6,
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: <Widget>[
-                    Expanded(
-                      child: SelectableText(
-                        activeFile.path,
-                        style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
-                          color: Color(0xFFE6EDF3),
+                    Tooltip(
+                      message: activeFile.path,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 520),
+                        child: Text(
+                          activeFile.path,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFFE6EDF3),
+                          ),
                         ),
                       ),
                     ),
-                    FilterChip(
-                      label: const Text(
-                        'Fold Unchanged',
-                        style: TextStyle(fontSize: 11.5),
-                      ),
-                      selected: _foldUnchanged,
-                      visualDensity: VisualDensity.compact,
-                      onSelected: (bool v) =>
-                          setState(() => _foldUnchanged = v),
-                    ),
-                    const SizedBox(width: 8),
-                    SegmentedButton<bool>(
-                      segments: const <ButtonSegment<bool>>[
-                        ButtonSegment<bool>(
-                          value: true,
-                          label: Text('Split', style: TextStyle(fontSize: 11.5)),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: <Widget>[
+                        FilterChip(
+                          label: const Text(
+                            'Fold Unchanged',
+                            style: TextStyle(fontSize: 11.5),
+                          ),
+                          selected: _foldUnchanged,
+                          visualDensity: VisualDensity.compact,
+                          onSelected: (bool v) =>
+                              setState(() => _foldUnchanged = v),
                         ),
-                        ButtonSegment<bool>(
-                          value: false,
-                          label:
-                              Text('Unified', style: TextStyle(fontSize: 11.5)),
+                        SegmentedButton<bool>(
+                          segments: const <ButtonSegment<bool>>[
+                            ButtonSegment<bool>(
+                              value: true,
+                              label: Text('Split', style: TextStyle(fontSize: 11.5)),
+                            ),
+                            ButtonSegment<bool>(
+                              value: false,
+                              label: Text('Unified', style: TextStyle(fontSize: 11.5)),
+                            ),
+                          ],
+                          selected: <bool>{_splitMode},
+                          style: const ButtonStyle(
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onSelectionChanged: (Set<bool> s) =>
+                              setState(() => _splitMode = s.first),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: () => widget.onOpenInExternalEditor(
+                            activeFile.path,
+                            _highlightedLine ?? 1,
+                          ),
+                          icon: const Icon(Icons.open_in_new, size: 14),
+                          label: const Text(
+                            'Open in Editor',
+                            style: TextStyle(fontSize: 11.5),
+                          ),
                         ),
                       ],
-                      selected: <bool>{_splitMode},
-                      style: const ButtonStyle(
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      onSelectionChanged: (Set<bool> s) =>
-                          setState(() => _splitMode = s.first),
-                    ),
-                    const SizedBox(width: 8),
-                    OutlinedButton.icon(
-                      onPressed: () => widget.onOpenInExternalEditor(
-                        activeFile.path,
-                        _highlightedLine ?? 1,
-                      ),
-                      icon: const Icon(Icons.open_in_new, size: 14),
-                      label: const Text(
-                        'Open in Editor',
-                        style: TextStyle(fontSize: 11.5),
-                      ),
                     ),
                   ],
                 ),
@@ -667,6 +683,9 @@ class _DiffViewerState extends State<DiffViewer> {
                       children: <Widget>[
                         _DiffCodeRow(
                           row: row,
+                          language: QuasarSyntaxHighlighter.languageFromPath(
+                            activeFile.path,
+                          ),
                           splitMode: _splitMode,
                           highlighted: isTargetLine,
                           onAskTap: () => setState(() {
@@ -902,12 +921,14 @@ class _DisplaySlice {
 class _DiffCodeRow extends StatelessWidget {
   const _DiffCodeRow({
     required this.row,
+    required this.language,
     required this.splitMode,
     required this.highlighted,
     required this.onAskTap,
   });
 
   final DiffRow row;
+  final String language;
   final bool splitMode;
   final bool highlighted;
   final VoidCallback onAskTap;
@@ -969,7 +990,7 @@ class _DiffCodeRow extends StatelessWidget {
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
-                child: _SyntaxLine(code: code),
+                child: _SyntaxLine(code: code, language: language),
               ),
             ),
           ],
@@ -1014,7 +1035,7 @@ class _DiffCodeRow extends StatelessWidget {
                         vertical: 2,
                         horizontal: 6,
                       ),
-                      child: _SyntaxLine(code: row.baseText),
+                      child: _SyntaxLine(code: row.baseText, language: language),
                     ),
                   ),
                 ],
@@ -1038,7 +1059,7 @@ class _DiffCodeRow extends StatelessWidget {
                         vertical: 2,
                         horizontal: 6,
                       ),
-                      child: _SyntaxLine(code: row.headText),
+                      child: _SyntaxLine(code: row.headText, language: language),
                     ),
                   ),
                 ],
@@ -1086,56 +1107,26 @@ class _LineGutter extends StatelessWidget {
 }
 
 class _SyntaxLine extends StatelessWidget {
-  const _SyntaxLine({required this.code});
+  const _SyntaxLine({required this.code, this.language = ''});
 
   final String code;
-
-  static final RegExp _tokRe = RegExp(
-    r'(//.*$|#.*$|"(?:\\.|[^"\\])*"|'
-    r"'(?:\\.|[^'\\])*'"
-    r'|@[A-Za-z_]\w*|\b(?:class|struct|enum|extension|func|fun|def|void|int|double|bool|String|final|const|var|val|let|if|else|for|while|switch|case|return|async|await|import|package|private|public|internal|static|override|try|catch|throw|null|nil|true|false)\b|\b\d+\b)',
-  );
+  final String language;
 
   @override
   Widget build(BuildContext context) {
     if (code.isEmpty) {
       return const SizedBox(height: 16);
     }
-    final List<TextSpan> spans = <TextSpan>[];
-    int cursor = 0;
-    for (final RegExpMatch m in _tokRe.allMatches(code)) {
-      if (m.start > cursor) {
-        spans.add(TextSpan(text: code.substring(cursor, m.start)));
-      }
-      final String tok = m.group(0)!;
-      Color tokColor = const Color(0xFFE6EDF3);
-      if (tok.startsWith('//') || tok.startsWith('#')) {
-        tokColor = const Color(0xFF8B949E);
-      } else if (tok.startsWith('"') || tok.startsWith("'")) {
-        tokColor = const Color(0xFFA5D6FF);
-      } else if (tok.startsWith('@')) {
-        tokColor = const Color(0xFFD2A8FF);
-      } else if (RegExp(r'^\d+$').hasMatch(tok)) {
-        tokColor = const Color(0xFF79C0FF);
-      } else {
-        tokColor = const Color(0xFFFF7B72);
-      }
-      spans.add(TextSpan(text: tok, style: TextStyle(color: tokColor)));
-      cursor = m.end;
-    }
-    if (cursor < code.length) {
-      spans.add(TextSpan(text: code.substring(cursor)));
-    }
-
     return SelectableText.rich(
-      TextSpan(
-        style: const TextStyle(
+      QuasarSyntaxHighlighter.highlightSpan(
+        code,
+        language: language,
+        baseStyle: const TextStyle(
           fontFamily: 'monospace',
           fontSize: 12,
           height: 1.38,
-          color: Color(0xFFE6EDF3),
+          color: QuasarSyntaxHighlighter.defaultColor,
         ),
-        children: spans,
       ),
     );
   }

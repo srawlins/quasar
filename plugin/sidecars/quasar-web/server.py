@@ -423,6 +423,16 @@ def dispatch_via_agy_cli(
         "command(sort)",
         "command(uniq)",
         "command(true)",
+        "command(false)",
+        "command(test)",
+        "command([)",
+        "command(echo)",
+        "command(printf)",
+        "command(basename)",
+        "command(dirname)",
+        "command(realpath)",
+        "command(tr)",
+        "command(cut)",
         f"read_file({real_state_dir}/)",
         f"write_file({real_state_dir}/)",
         f"read_file({real_plugin_dir}/)",
@@ -602,8 +612,21 @@ def dispatch_via_agy_cli(
                                         saw_execution = True
                                         if su.get("step_type") == "agent_response" and isinstance(su.get("text_delta"), str):
                                             agent_text_chunks.append(su["text_delta"])
-                                    if ev.get("event") == "result" and isinstance(ev.get("result"), dict) and ev["result"].get("status") == "ERROR":
-                                        stream_err = str(ev["result"].get("error") or "")
+                                    if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+                                        res_ev = ev["result"]
+                                        if res_ev.get("status") == "ERROR":
+                                            stream_err = str(res_ev.get("error") or "")
+                                        elif isinstance(res_ev.get("denied_actions"), list) and res_ev["denied_actions"]:
+                                            denied_names = [
+                                                str(a.get("display_name") or a.get("action") or "tool")
+                                                for a in res_ev["denied_actions"]
+                                                if isinstance(a, dict)
+                                            ]
+                                            stream_err = (
+                                                f"Headless CLI auto-denied tool permission(s): "
+                                                f"{', '.join(denied_names) or 'RunCommand'} "
+                                                f"(see ~/.gemini/quasar/last_cli_run.log)"
+                                            )
                                     if "collect_pr_context" in ln:
                                         ACTIVE_AGENT_JOB["cliStage"] = "📥 Phase 1/3 — Fetching PR context & snapshots"
                                         ACTIVE_AGENT_JOB["cliDetail"] = "Materializing base/head file snapshots..."
@@ -622,7 +645,7 @@ def dispatch_via_agy_cli(
                                         ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
                                 except Exception:
                                     pass
-                            elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity|soft-denying tool confirmation", ln, re.I):
+                            elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity|soft-denying tool confirmation|headless mode cannot prompt for|auto-denied", ln, re.I):
                                 stream_err = ln[:300]
                 finally:
                     if cli_log_file is not None:
@@ -2149,7 +2172,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       } else if (res && res.staleSessionAvailable) {
         const cShort = String(res.cachedHeadSha || '').slice(0, 7);
         const lShort = String(res.liveHeadSha || '').slice(0, 7);
-        openModal(`
+        showModal(`
           <h3>🔄 Stale Review Detected (${esc(cShort)} → ${esc(lShort)})</h3>
           <p style="font-size:12.5px;color:var(--muted);margin-bottom:14px;">
             An earlier review exists at <code>${esc(cShort)}</code>, and the PR HEAD is now at <code>${esc(lShort)}</code>.
@@ -2688,6 +2711,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
                 <span class="text-amber-300 font-medium">🤔 Calibrate Preference:</span>
                 <button class="q-btn q-btn-primary" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'keep_always' })">✅ Stage & Always Flag Similar</button>
                 <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'keep_once' })">Keep Once</button>
+                <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'skip_once' })">Skip Once</button>
                 <button class="q-btn" onclick="threadAction('${esc(t.id)}', 'calibrate', { decision: 'dismiss_skip' })">🚫 Dismiss & Skip Pattern in Future</button>
               </div>
             </div>` : ''}
@@ -3500,7 +3524,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
       const statusBadge = ex.isUpToDate
         ? `<span class="badge low">Up to date${cachedShort ? ' @ ' + esc(cachedShort) : ''}</span>`
         : `<span class="badge medium">New commits pushed (${esc(cachedShort || '?')} → ${esc(liveShort || 'HEAD')})</span>`;
-      openModal(`
+      showModal(`
         <h3>⚡ Completed Review Already Available</h3>
         <p style="font-size:13px;color:var(--muted);line-height:1.5;margin-bottom:10px;">
           <strong>${esc(ex.owner || '')}/${esc(ex.repo || '')}#${esc(String(ex.number || ''))}</strong> — ${esc(ex.title || '')}
@@ -3580,7 +3604,7 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
           <button class="q-btn" onclick="deleteReviewWeb('${esc(s.sessionId || s.id)}')">🗑️ Delete</button>
         </div>
       `).join('');
-      openModal(`
+      showModal(`
         <h3>🗑️ Delete / Prune Saved Reviews (${sessions.length})</h3>
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;">
           <button class="q-btn" onclick="pruneReviewsWeb(30)">Prune &gt; 30d</button>
@@ -3917,6 +3941,11 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                     target["stagedForGithub"] = False
                     cal_act = "calibrate_skip"
                     msg = "Dismissed & saved preference to skip this pattern in future reviews"
+                elif decision == "skip_once":
+                    target["status"] = "dismissed"
+                    target["stagedForGithub"] = False
+                    cal_act = "calibrate_skip_once"
+                    msg = "Skipped for this review (no global rule saved)"
                 else:
                     target["status"] = "staged"
                     target["stagedForGithub"] = True
