@@ -181,6 +181,80 @@ class TestInboxWatcherOpenGuard(unittest.TestCase):
             self.assertTrue(updated_sess.get("reviewCompletedAt"))
             self.assertEqual(updated_sess["inboxItemId"], "owner__repo__77")
 
+    def test_run_precompute_fast_forwards_zero_delta_merge_main_without_agy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            item_id = "owner__repo__55"
+            state = {
+                "items": {
+                    item_id: {
+                        "id": item_id,
+                        "provider": "github",
+                        "owner": "owner",
+                        "repo": "repo",
+                        "number": 55,
+                        "role": "reviewer",
+                        "url": "https://github.com/owner/repo/pull/55",
+                        "headSha": "newsha999",
+                        "currentFingerprint": "newsha999",
+                        "status": "queued",
+                        "openInQueue": True,
+                    }
+                }
+            }
+
+            def fake_subprocess_run(cmd, env=None, capture_output=True, text=True, timeout=90):
+                script_name = Path(cmd[1]).name if len(cmd) > 1 else ""
+                item_dir = Path(tmp) / item_id
+                item_dir.mkdir(parents=True, exist_ok=True)
+                proc = mock.Mock()
+                proc.returncode = 0
+                proc.stderr = ""
+                if script_name == "collect_pr_context.py":
+                    (item_dir / "pr_context.json").write_text(
+                        json.dumps({"pr": {"state": "open", "number": 55}}),
+                        encoding="utf-8",
+                    )
+                    (item_dir / "incremental_base.json").write_text(
+                        json.dumps(
+                            {
+                                "previousHeadSha": "oldsha111",
+                                "newHeadSha": "newsha999",
+                                "rebased": False,
+                                "deltaFiles": [],
+                                "priorFindingsToRecheck": [],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    proc.stdout = json.dumps({"ok": True, "halt_llm_review": False, "is_incremental": True})
+                elif script_name == "publish_review_session.py":
+                    proc.stdout = json.dumps({"ok": True})
+                else:
+                    raise AssertionError(f"Unexpected subprocess script: {cmd}")
+                return proc
+
+            with mock.patch.object(inbox_watcher, "INBOX_ITEMS_DIR", tmp), \
+                 mock.patch.object(inbox_watcher, "load_inbox_state", return_value=state), \
+                 mock.patch.object(inbox_watcher, "save_inbox_state"), \
+                 mock.patch.object(inbox_watcher, "_scan_completed_sessions_for_pr", return_value=[]), \
+                 mock.patch.object(inbox_watcher, "get_github_token", return_value=""), \
+                 mock.patch.object(inbox_watcher, "adopt_completed_session_into_inbox", return_value=False), \
+                 mock.patch.object(inbox_watcher, "find_agy_binary", return_value="/usr/local/bin/agy"), \
+                 mock.patch.object(inbox_watcher, "_extract_session_metrics", return_value={}), \
+                 mock.patch.object(inbox_watcher.subprocess, "run", side_effect=fake_subprocess_run), \
+                 mock.patch.object(inbox_watcher.subprocess, "Popen", side_effect=AssertionError("should not invoke agy on 0-delta merge")):
+                res = inbox_watcher.run_precompute_for_item(
+                    item_id,
+                    settings={"includeDrafts": False, "effort": "high", "incrementalUpdates": True},
+                    count_against_daily_budget=True,
+                )
+
+            self.assertTrue(res["ok"])
+            self.assertTrue(res.get("fastForwardedZeroDelta"))
+            self.assertEqual(state["items"][item_id]["status"], "ready")
+            self.assertEqual(state["items"][item_id]["analyzedFingerprint"], "newsha999")
+            self.assertFalse(state["items"][item_id]["updatedSinceLastReview"])
+
 
 if __name__ == "__main__":
     unittest.main()

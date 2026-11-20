@@ -2,8 +2,7 @@
 
 All notable changes to **Quasar** are documented in this file.
 
-## [NEXT]
-
+## [1.7.5] - 2026-11-20
 ### Added
 - **Open PR on GitHub / Browser from Right-Click Menu (`quasar.openPrInBrowser`)**:
   - Added **Open PR on GitHub / Browser** to the right-click context menu on all PR Inbox items (`ready`, `queued`, `analyzing`, `quarantined`, `waiting`, `deleted`), Past Reviews, and the active PR header (plus the Command Palette).
@@ -14,6 +13,12 @@ All notable changes to **Quasar** are documented in this file.
   - Added a prominent **`🔄 Retry N Unfinished Fix(es)...`** action row at the top of the VS Code **Review Comments & Cart** sidebar whenever fixes land in `needs_attention` (`⚠️ Check Fix`), wired directly to `quasar.fixSelectedComments`.
 
 ### Fixed
+- **Remote / Standalone Web UI No Longer Gets Stuck on `"Initializing Quasar Agent..."` Waiting on Desktop IDE**:
+  - Updated `server.py --standalone-daemon` (`STANDALONE_WEB_MODE`) to dispatch directly via `agy` CLI streaming (`dispatch_via_agy_cli`) with pre-authorized Quasar script/read permissions instead of silently sending conversations to a remote desktop Antigravity IDE hub that web users cannot see or approve (opt-in override via `QUASAR_PREFER_IDE_HUB=1`).
+  - Updated `get_agent_status()` in `server.py` to surface `cliError` failures cleanly (instead of showing `"✅ Agent finished — Review updated!"`) and to detect IDE turns that end in plain text without updating `active_session.json` rather than spinning for 10 minutes.
+- **0-Token Fast-Forward on Pure `merge main` / Clean Rebase Updates**:
+  - Updated `collect_pr_context.py` to compare net PR patches against the base branch on both merge commits and rebases (not just rebases), so upstream `main` edits in PR-touched files don't produce false delta noise.
+  - Updated `inbox_watcher.py` (`run_precompute_for_item`) to automatically fast-forward zero-delta incremental updates (`deltaFiles == []` and no `priorFindingsToRecheck`) via `publish_review_session.py`—preserving remapped line numbers, chapters, and findings with **0 AI tokens** and **0 daily budget burn**.
 - **Premature `⚠️ Check Fix` While Fix Agent Waits on Background Tasks**:
   - Updated `inspectConversationFixState()` (`extension.js`) to track in-flight background tasks (`GENERIC` `RUNNING` / `task id: ...`) against completion `SYSTEM_MESSAGE` steps so long-running `tool/generate.dart`, `dart test`, or `xcodebuild` commands keep the status `'working'` instead of prematurely triggering `--reconcile-fixes --agent-idle`.
 - **Stale Phantom Background Review Timer in PR Inbox Header**:

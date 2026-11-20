@@ -36,6 +36,7 @@ HISTORY_DIR = os.path.join(STATE_DIR, "history")
 GITHUB_AUTH_PATH = os.path.join(STATE_DIR, "github_auth.json")
 STANDALONE_PORT = 49341
 PORT = int(os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT") or os.environ.get("PORT") or STANDALONE_PORT)
+STANDALONE_WEB_MODE = False
 
 
 def find_mermaid_js_path() -> Optional[str]:
@@ -609,7 +610,11 @@ def dispatch_to_agent(
     all_sess = list_all_sessions()
     baseline_mtime = max((s["mtime"] for s in all_sess), default=0.0)
 
-    if os.environ.get("QUASAR_PREFER_AGY_CLI") == "1":
+    prefer_agy_cli = (
+        os.environ.get("QUASAR_PREFER_AGY_CLI") == "1"
+        or (STANDALONE_WEB_MODE and os.environ.get("QUASAR_PREFER_IDE_HUB") != "1")
+    )
+    if prefer_agy_cli:
         return dispatch_via_agy_cli(
             prompt=prompt,
             title=title,
@@ -931,7 +936,19 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
 
     if not ACTIVE_AGENT_JOB.get("active") and ACTIVE_AGENT_JOB.get("completedAt"):
         comp_at = float(ACTIVE_AGENT_JOB["completedAt"])
-        if (now - comp_at) <= 8.0:
+        cli_err = str(ACTIVE_AGENT_JOB.get("cliError") or "").strip()
+        if cli_err and (now - comp_at) <= 30.0:
+            return {
+                "active": False,
+                "completedJustNow": True,
+                "error": cli_err,
+                "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
+                "stage": "⚠️ Quasar Agent could not complete this run",
+                "detail": cli_err,
+                "percent": 100,
+                "elapsedSeconds": int(comp_at - float(ACTIVE_AGENT_JOB.get("startedAt") or comp_at)),
+            }
+        if not cli_err and (now - comp_at) <= 8.0:
             return {
                 "active": False,
                 "completedJustNow": True,
@@ -1045,6 +1062,46 @@ def get_live_agent_status(session: Optional[Dict[str, Any]], all_sessions: List[
                             percent = max(percent, 80)
                 if not saw_quasar and not ACTIVE_AGENT_JOB.get("active"):
                     transcript_is_running = False
+
+                # If an IDE-hub-dispatched turn already ended with a plain-text reply (no tool calls,
+                # no running background tasks) without updating active_session.json, stop spinning and
+                # surface the agent's message immediately instead of waiting 10 minutes.
+                job_started = float(ACTIVE_AGENT_JOB.get("startedAt") or 0.0)
+                if (
+                    ACTIVE_AGENT_JOB.get("active")
+                    and ACTIVE_AGENT_JOB.get("mode") != "agy-cli"
+                    and last_type == "PLANNER_RESPONSE"
+                    and not last_tools
+                    and t_mtime >= job_started
+                    and (now - t_mtime) > 15.0
+                ):
+                    has_running_bg = any(
+                        s.get("type") == "GENERIC"
+                        and (
+                            s.get("status") == "RUNNING"
+                            or "Tool is running as a background task" in str(s.get("content") or "")
+                        )
+                        for s in recent_slice
+                    )
+                    if not has_running_bg:
+                        reply_txt = " ".join(str(last_step.get("content") or "").split())[:240]
+                        ACTIVE_AGENT_JOB["active"] = False
+                        ACTIVE_AGENT_JOB["completedAt"] = now
+                        ACTIVE_AGENT_JOB["cliError"] = (
+                            reply_txt
+                            or "Agent turn ended in Antigravity IDE without updating the review session."
+                        )
+                        transcript_is_running = False
+                        return {
+                            "active": False,
+                            "completedJustNow": True,
+                            "error": ACTIVE_AGENT_JOB["cliError"],
+                            "title": ACTIVE_AGENT_JOB.get("title") or "Quasar Agent Task",
+                            "stage": "⚠️ Agent turn ended without updating review",
+                            "detail": ACTIVE_AGENT_JOB["cliError"],
+                            "percent": 100,
+                            "elapsedSeconds": int(now - job_started) if job_started else 0,
+                        }
         except Exception:
             pass
 
@@ -4667,6 +4724,9 @@ def main() -> None:
         out = export_standalone_html(args.export_html, args.session_id)
         print(json.dumps({"ok": True, "exportedHtml": out}))
         return
+
+    global STANDALONE_WEB_MODE
+    STANDALONE_WEB_MODE = bool(args.standalone_daemon)
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), QuasarWebHandler)
     if PORT != STANDALONE_PORT:

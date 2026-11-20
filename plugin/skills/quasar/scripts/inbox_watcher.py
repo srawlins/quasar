@@ -2398,6 +2398,83 @@ def run_precompute_for_item(
             save_inbox_state(st)
         return {"ok": True, "quarantined": True, "itemId": item_id}
 
+    publish_script = os.path.join(SCRIPT_DIR, "publish_review_session.py")
+    is_inc_run = bool(ctx_out.get("is_incremental"))
+
+    # 0-Token Fast-Forward: when an incremental update has ZERO net PR diff changes (e.g. pure `merge main`
+    # or clean rebase with no edits to the PR's own patch) and no prior findings need re-checking, carry
+    # forward the completed review to the new headSha via `publish_review_session.py` without invoking `agy`!
+    if is_inc_run and count_against_daily_budget and item.get("role") != "author":
+        inc_base_path = os.path.join(item_dir, "incremental_base.json")
+        if os.path.isfile(inc_base_path):
+            try:
+                with open(inc_base_path, "r", encoding="utf-8") as ibf:
+                    inc_base_doc = json.load(ibf)
+                delta_files = inc_base_doc.get("deltaFiles") or []
+                recheck_findings = inc_base_doc.get("priorFindingsToRecheck") or []
+                if len(delta_files) == 0 and len(recheck_findings) == 0:
+                    old_s = str(inc_base_doc.get("previousHeadSha") or "")[:7]
+                    new_s = str(inc_base_doc.get("newHeadSha") or "")[:7]
+                    synth_path = os.path.join(item_dir, "review_synthesis.json")
+                    zero_delta_payload = {
+                        "cliffsNotes": {
+                            "deltaSummary": {
+                                "summary": (
+                                    f"Fast-forwarded review from {old_s} to {new_s} (0 AI tokens): "
+                                    f"the PR's net diff against its base branch is unchanged (pure base-branch merge/rebase). "
+                                    f"All chapters, remapped line numbers, and findings were carried forward."
+                                )
+                            }
+                        },
+                        "chapters": [],
+                        "findings": [],
+                        "priorFindingUpdates": [],
+                    }
+                    with open(synth_path, "w", encoding="utf-8") as zf:
+                        json.dump(zero_delta_payload, zf, indent=2)
+                    pub_cmd = [
+                        sys.executable,
+                        publish_script,
+                        "--input",
+                        synth_path,
+                        "--session-dir",
+                        item_dir,
+                    ]
+                    if comments_only:
+                        pub_cmd.append("--comments-only")
+                    pub_proc = subprocess.run(pub_cmd, env=env, capture_output=True, text=True, timeout=30)
+                    if pub_proc.returncode == 0:
+                        if os.path.isfile(prior_backup_path):
+                            try:
+                                os.unlink(prior_backup_path)
+                            except Exception:
+                                pass
+                        st = load_inbox_state()
+                        if item_id in st.get("items", {}):
+                            it = st["items"][item_id]
+                            it.update(_extract_session_metrics(session_file))
+                            new_full_sha = str(inc_base_doc.get("newHeadSha") or it.get("headSha") or "")
+                            if new_full_sha:
+                                it["headSha"] = new_full_sha
+                                if it.get("role") != "author":
+                                    it["currentFingerprint"] = new_full_sha
+                            it["status"] = "ready"
+                            it["analyzedFingerprint"] = it.get("currentFingerprint") or new_full_sha
+                            it["updatedSinceLastReview"] = False
+                            it["completedAt"] = _now_iso()
+                            it.pop("lastError", None)
+                            it.pop("errorKind", None)
+                            it.pop("manualAutoReviewQueued", None)
+                            save_inbox_state(st)
+                        return {
+                            "ok": True,
+                            "itemId": item_id,
+                            "status": "ready",
+                            "fastForwardedZeroDelta": True,
+                        }
+            except Exception:
+                pass
+
     # Step 2: Headless `agy` synthesis strictly isolated to `--session-dir <item_dir>`
     real_state_dir = os.path.realpath(REVIEW_STATE_DIR)
     real_item_dir = os.path.realpath(item_dir)
@@ -2418,9 +2495,7 @@ def run_precompute_for_item(
         allow_rules.append(f"read_file({real_repo}/)")
     session_settings = json.dumps({"permissions": {"allow": allow_rules}})
 
-    publish_script = os.path.join(SCRIPT_DIR, "publish_review_session.py")
     co_flag = " --comments-only" if comments_only else ""
-    is_inc_run = bool(ctx_out.get("is_incremental"))
     inc_note = (
         f"- Incremental Delta Diff (`oldSha -> newSha`): `{item_dir}/delta.diff` (see `incremental_context` in `{item_dir}/pr_context.json` — audit ONLY the delta changes + `priorFindingsToRecheck`, emit `priorFindingUpdates` and `cliffsNotes.deltaSummary`, and emit delta `chapters` covering only `deltaFiles`!)\n"
         if is_inc_run

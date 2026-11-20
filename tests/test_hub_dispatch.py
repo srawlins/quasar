@@ -94,6 +94,28 @@ class TestHubDiscoveryAndDispatch(unittest.TestCase):
         self.assertEqual(len(captured_cmds), 1)
         self.assertEqual(captured_cmds[0][:3], ["/bin/agentapi", "new-conversation", "--title=Quasar Fix"])
 
+    def test_standalone_web_mode_dispatches_via_agy_cli_not_desktop_ide_hub(self) -> None:
+        with mock.patch.object(server, "STANDALONE_WEB_MODE", True), \
+             mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(server, "resolve_conversation_context", return_value=("", "", "/work/repo", {})), \
+             mock.patch.object(server, "list_all_sessions", return_value=[]), \
+             mock.patch.object(
+                 server,
+                 "dispatch_via_agy_cli",
+                 return_value={"ok": True, "mode": "agy-cli", "conversationId": ""},
+             ) as cli_mock, \
+             mock.patch.object(
+                 server.subprocess,
+                 "run",
+                 side_effect=AssertionError("standalone web mode should not invoke desktop IDE agentapi"),
+             ):
+            os.environ.pop("QUASAR_PREFER_IDE_HUB", None)
+            res = server.dispatch_to_agent("Review PR #1", title="Quasar Code Review", workspace_dir="/work/repo")
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["mode"], "agy-cli")
+        cli_mock.assert_called_once()
+
     def test_extension_js_does_not_skip_agentapi_new_conversation_without_project_id(self) -> None:
         ext_text = (REPO_ROOT / "extension" / "extension.js").read_text(encoding="utf-8")
         self.assertNotIn("if (!env.ANTIGRAVITY_PROJECT_ID) {\n        tryDirectHttpFallback(null);", ext_text)

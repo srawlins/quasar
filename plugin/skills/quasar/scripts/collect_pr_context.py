@@ -751,8 +751,8 @@ def build_incremental_delta_package(
                 unchanged_files.append(rel_path)
             continue
 
-        # Filter pure rebase upstream changes where the PR's net patch vs base didn't change
-        if rebased and prior_base_root and rel_path in old_paths and rel_path in new_paths:
+        # Filter pure rebase or merge-main upstream changes where the PR's net patch vs base didn't change
+        if prior_base_root and rel_path in old_paths and rel_path in new_paths:
             old_b_path = os.path.join(prior_base_root, rel_path)
             new_b_path = os.path.join(base_root, rel_path)
             if os.path.isfile(old_b_path) and os.path.isfile(new_b_path):
