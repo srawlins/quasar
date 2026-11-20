@@ -2,6 +2,12 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.6] - 2026-11-20
+
+### Fixed
+- **Headless CLI Discovery (`find_agy_binary` / `findAgyBinary`) Rejects IDE Launchers & Supports `jetski` CLI**:
+  - Updated `find_agy_binary()` (`server.py`, `inbox_watcher.py`) and `findAgyBinary()` (`extension.js`) to validate each candidate via `--help` (`--output-format` + `--print`, cached in-process) so older Antigravity IDE launcher symlinks (`~/.antigravity/antigravity/bin/agy`) are skipped in favor of a real headless CLI (`agy` or `jetski`, e.g. `/usr/local/bin/jetski`).
+
 ## [1.7.5] - 2026-11-20
 ### Added
 - **Open PR on GitHub / Browser from Right-Click Menu (`quasar.openPrInBrowser`)**:

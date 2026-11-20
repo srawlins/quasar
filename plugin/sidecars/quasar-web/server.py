@@ -64,16 +64,58 @@ def find_flutter_web_dir() -> Optional[str]:
     return None
 
 
+_AGY_CLI_SUPPORT_CACHE: Dict[str, bool] = {}
+
+
+def _is_headless_agy_cli(bin_path: str) -> bool:
+    """Verifies that a candidate `agy`/`jetski` binary is the headless CLI (not an IDE launcher)."""
+    try:
+        real_p = os.path.realpath(bin_path)
+    except Exception:
+        real_p = bin_path
+    if real_p in _AGY_CLI_SUPPORT_CACHE:
+        return _AGY_CLI_SUPPORT_CACHE[real_p]
+    try:
+        proc = subprocess.run(
+            [bin_path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        help_txt = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        supported = ("--output-format" in help_txt and "--print" in help_txt)
+    except Exception:
+        supported = False
+    _AGY_CLI_SUPPORT_CACHE[real_p] = supported
+    return supported
+
+
 def find_agy_binary() -> Optional[str]:
     import shutil
 
+    explicit = (os.environ.get("AGY_BIN") or "").strip()
+    if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+        return explicit
+
     candidates = [
-        os.environ.get("AGY_BIN") or "",
         os.path.expanduser("~/.gemini/bin/agy"),
+        "/opt/homebrew/bin/agy",
+        "/usr/local/bin/agy",
         shutil.which("agy") or "",
+        os.path.expanduser("~/.gemini/bin/jetski"),
+        "/opt/homebrew/bin/jetski",
+        "/usr/local/bin/jetski",
+        shutil.which("jetski") or "",
     ]
+    seen_real = set()
     for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+        if not c or not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        real_c = os.path.realpath(c)
+        if real_c in seen_real:
+            continue
+        seen_real.add(real_c)
+        if _is_headless_agy_cli(c):
             return c
     return None
 
@@ -362,7 +404,7 @@ def dispatch_via_agy_cli(
     )
 
     allow_rules = [
-        r"command(regex:^python3\s+.*quasar/skills/quasar/scripts/.*)",
+        r"command(regex:^([^\n]*\s)?python3\s+.*skills/quasar/scripts/.*)",
         "command(git)",
         f"read_file({real_state_dir}/)",
         f"write_file({real_state_dir}/)",

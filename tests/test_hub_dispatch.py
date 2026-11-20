@@ -116,6 +116,32 @@ class TestHubDiscoveryAndDispatch(unittest.TestCase):
         self.assertEqual(res["mode"], "agy-cli")
         cli_mock.assert_called_once()
 
+    def test_find_agy_binary_skips_ide_launcher_and_selects_jetski_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_agy = Path(tmp) / "agy"
+            fake_jetski = Path(tmp) / "jetski"
+            fake_agy.write_text("#!/bin/sh\necho 'Antigravity IDE launcher'\n", encoding="utf-8")
+            fake_jetski.write_text("#!/bin/sh\necho '--output-format --print --mode'\n", encoding="utf-8")
+            fake_agy.chmod(0o755)
+            fake_jetski.chmod(0o755)
+
+            def fake_which(name: str):
+                if name == "agy":
+                    return str(fake_agy)
+                if name == "jetski":
+                    return str(fake_jetski)
+                return None
+
+            server._AGY_CLI_SUPPORT_CACHE.clear()
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                 mock.patch.object(os.path, "expanduser", side_effect=lambda p: p.replace("~", tmp)), \
+                 mock.patch("shutil.which", side_effect=fake_which), \
+                 mock.patch.object(os.path, "isfile", side_effect=lambda p: p in (str(fake_agy), str(fake_jetski))):
+                os.environ.pop("AGY_BIN", None)
+                chosen = server.find_agy_binary()
+
+            self.assertEqual(chosen, str(fake_jetski))
+
     def test_extension_js_does_not_skip_agentapi_new_conversation_without_project_id(self) -> None:
         ext_text = (REPO_ROOT / "extension" / "extension.js").read_text(encoding="utf-8")
         self.assertNotIn("if (!env.ANTIGRAVITY_PROJECT_ID) {\n        tryDirectHttpFallback(null);", ext_text)

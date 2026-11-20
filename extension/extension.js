@@ -516,28 +516,74 @@ function getAgentApiBinary() {
  * embedded `language_server` (`ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`) is present
  * (e.g. inside standard VS Code or alongside Antigravity 2.0).
  */
+const agyCliSupportCache = new Map();
+
+function isHeadlessAgyCli(binPath) {
+  const realP = safeRealpath(binPath);
+  if (agyCliSupportCache.has(realP)) {
+    return agyCliSupportCache.get(realP);
+  }
+  let supported = false;
+  try {
+    const out = execFileSync(binPath, ['--help'], {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    supported = out.includes('--output-format') && out.includes('--print');
+  } catch (err) {
+    const combined = `${(err && err.stdout) || ''}\n${(err && err.stderr) || ''}`;
+    supported = combined.includes('--output-format') && combined.includes('--print');
+  }
+  agyCliSupportCache.set(realP, supported);
+  return supported;
+}
+
 function findAgyBinary() {
+  const explicit = String(process.env.AGY_BIN || '').trim();
+  if (explicit && fs.existsSync(explicit)) {
+    try {
+      fs.accessSync(explicit, fs.constants.X_OK);
+      return explicit;
+    } catch (_) {}
+  }
+
+  const whichBin = (name) => {
+    try {
+      const out = execFileSync('/usr/bin/which', [name], {
+        encoding: 'utf8',
+        timeout: 2000,
+      }).trim();
+      return out || '';
+    } catch (_) {
+      return '';
+    }
+  };
+
   const candidates = [
-    process.env.AGY_BIN || '',
     path.join(os.homedir(), '.gemini', 'bin', 'agy'),
     '/opt/homebrew/bin/agy',
     '/usr/local/bin/agy',
+    whichBin('agy'),
+    path.join(os.homedir(), '.gemini', 'bin', 'jetski'),
+    '/opt/homebrew/bin/jetski',
+    '/usr/local/bin/jetski',
+    whichBin('jetski'),
   ];
+  const seenReal = new Set();
   for (const cand of candidates) {
-    if (cand && fs.existsSync(cand)) {
-      try {
-        fs.accessSync(cand, fs.constants.X_OK);
-        return cand;
-      } catch (_) {}
+    if (!cand || !fs.existsSync(cand)) continue;
+    try {
+      fs.accessSync(cand, fs.constants.X_OK);
+    } catch (_) {
+      continue;
+    }
+    const realC = safeRealpath(cand);
+    if (seenReal.has(realC)) continue;
+    seenReal.add(realC);
+    if (isHeadlessAgyCli(cand)) {
+      return cand;
     }
   }
-  try {
-    const whichOut = execFileSync('/usr/bin/which', ['agy'], {
-      encoding: 'utf8',
-      timeout: 2000,
-    }).trim();
-    if (whichOut && fs.existsSync(whichOut)) return whichOut;
-  } catch (_) {}
   return null;
 }
 
