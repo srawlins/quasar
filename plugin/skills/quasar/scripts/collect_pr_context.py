@@ -291,14 +291,38 @@ def auto_detect_repo_dir(owner: str, repo: str, provided_dir: Optional[str]) -> 
             return abs_prov
 
     home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, "work", repo),
-        os.path.join(home, "work", owner, repo),
-        os.path.join(home, "dev", repo),
-        os.path.join(home, "src", repo),
-        os.path.join(home, "projects", repo),
-        os.path.join(home, repo),
+    owner_dash_repo = f"{owner}-{repo}" if owner and repo else ""
+    base_roots = [
+        os.path.join(home, "work"),
+        os.path.join(home, "code"),
+        os.path.join(home, "dev"),
+        os.path.join(home, "src"),
+        os.path.join(home, "projects"),
+        os.path.join(home, "repos"),
+        os.path.join(home, "Developer"),
     ]
+    candidates = []
+    for root in base_roots:
+        candidates.append(os.path.join(root, repo))
+        if owner:
+            candidates.append(os.path.join(root, owner, repo))
+            candidates.append(os.path.join(root, owner_dash_repo))
+    candidates.append(os.path.join(home, repo))
+    if owner_dash_repo:
+        candidates.append(os.path.join(home, owner_dash_repo))
+
+    # Also check sibling directories of provided_dir (e.g. ~/code/quasar -> ~/code/flutter-devtools)
+    if provided_dir:
+        parent_d = os.path.dirname(os.path.abspath(os.path.expanduser(provided_dir)))
+        if os.path.isdir(parent_d):
+            try:
+                for entry in os.listdir(parent_d):
+                    cand_sib = os.path.join(parent_d, entry)
+                    if cand_sib not in candidates and os.path.isdir(os.path.join(cand_sib, ".git")):
+                        candidates.append(cand_sib)
+            except Exception:
+                pass
+
     for cand in candidates:
         if repo_matches_remote(cand, owner, repo):
             return os.path.abspath(cand)

@@ -4518,9 +4518,14 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                     if not matches_local:
                         detected = ""
                         try:
-                            from collect_pr_context import auto_detect_repo_dir as _auto_detect_repo
+                            from collect_pr_context import (
+                                auto_detect_repo_dir as _auto_detect_repo,
+                                repo_matches_remote as _repo_matches_remote,
+                            )
 
-                            detected = _auto_detect_repo(pr_owner, pr_repo_name, None) or ""
+                            cand_det = _auto_detect_repo(pr_owner, pr_repo_name, repo_dir or None) or ""
+                            if cand_det and _repo_matches_remote(cand_det, pr_owner, pr_repo_name):
+                                detected = cand_det
                         except Exception:
                             detected = ""
                         effective_repo_dir = detected
