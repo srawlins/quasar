@@ -406,6 +406,23 @@ def dispatch_via_agy_cli(
     allow_rules = [
         r"command(regex:^([^\n]*\s)?python3\s+.*skills/quasar/scripts/.*)",
         "command(git)",
+        "command(ls)",
+        "command(find)",
+        "command(rg)",
+        "command(grep)",
+        "command(cat)",
+        "command(head)",
+        "command(tail)",
+        "command(wc)",
+        "command(diff)",
+        "command(pwd)",
+        "command(which)",
+        "command(stat)",
+        "command(sed)",
+        "command(awk)",
+        "command(sort)",
+        "command(uniq)",
+        "command(true)",
         f"read_file({real_state_dir}/)",
         f"write_file({real_state_dir}/)",
         f"read_file({real_plugin_dir}/)",
@@ -419,22 +436,6 @@ def dispatch_via_agy_cli(
             allow_rules.extend(
                 [
                     f"write_file({real_ws}/)",
-                    "command(ls)",
-                    "command(find)",
-                    "command(rg)",
-                    "command(grep)",
-                    "command(cat)",
-                    "command(head)",
-                    "command(tail)",
-                    "command(wc)",
-                    "command(diff)",
-                    "command(pwd)",
-                    "command(which)",
-                    "command(stat)",
-                    "command(sed)",
-                    "command(awk)",
-                    "command(sort)",
-                    "command(uniq)",
                     "command(flutter)",
                     "command(dart)",
                     "command(swift)",
@@ -621,7 +622,7 @@ def dispatch_via_agy_cli(
                                         ACTIVE_AGENT_JOB["cliDetail"] = "Updating comment thread in place..."
                                 except Exception:
                                     pass
-                            elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity", ln, re.I):
+                            elif re.search(r"RESOURCE_EXHAUSTED|exhausted your capacity|soft-denying tool confirmation", ln, re.I):
                                 stream_err = ln[:300]
                 finally:
                     if cli_log_file is not None:
@@ -4494,6 +4495,36 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 except Exception:
                     safe_inc_from = incremental_from
 
+            # For remote GitHub PRs, don't pass an unrelated `--repo-dir` (e.g. ~/code/quasar when
+            # reviewing flutter/devtools); instead verify the git remote matches or auto-detect a matching checkout.
+            effective_repo_dir = repo_dir
+            if pr_url:
+                m_gh_pr = re.search(r"github\.com/([^/]+)/([^/]+)/pull/\d+", pr_url, re.I)
+                if m_gh_pr:
+                    pr_owner, pr_repo_name = m_gh_pr.group(1), m_gh_pr.group(2)
+                    matches_local = False
+                    if repo_dir and os.path.isdir(repo_dir):
+                        try:
+                            rem_out = subprocess.check_output(
+                                ["git", "-C", repo_dir, "remote", "-v"],
+                                text=True,
+                                stderr=subprocess.DEVNULL,
+                                timeout=3,
+                            ).lower()
+                            if f"/{pr_repo_name.lower()}" in rem_out or f":{pr_owner.lower()}/{pr_repo_name.lower()}" in rem_out:
+                                matches_local = True
+                        except Exception:
+                            pass
+                    if not matches_local:
+                        detected = ""
+                        try:
+                            from collect_pr_context import auto_detect_repo_dir as _auto_detect_repo
+
+                            detected = _auto_detect_repo(pr_owner, pr_repo_name, None) or ""
+                        except Exception:
+                            detected = ""
+                        effective_repo_dir = detected
+
             # Run deterministic `collect_pr_context.py` pre-scan BEFORE invoking any LLM agent!
             collect_script = os.path.join(SCRIPTS_DIR, "collect_pr_context.py")
             cmd = [
@@ -4503,7 +4534,7 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 effort,
                 "--comments-only" if comments_only else "--full-guide",
                 "--workspace-dir",
-                repo_dir,
+                effective_repo_dir or repo_dir,
             ]
             if safe_inc_from:
                 cmd.extend(["--incremental-from", safe_inc_from])
@@ -4511,8 +4542,8 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 cmd.append("--incremental")
             if pr_url:
                 cmd.extend(["--pr", pr_url])
-                if os.path.isdir(repo_dir):
-                    cmd.extend(["--repo-dir", repo_dir])
+                if effective_repo_dir and os.path.isdir(effective_repo_dir):
+                    cmd.extend(["--repo-dir", effective_repo_dir])
             else:
                 cmd.extend(["--branch", branch_name or "HEAD", "--repo-dir", repo_dir])
 
@@ -4542,16 +4573,17 @@ class QuasarWebHandler(BaseHTTPRequestHandler):
                 if is_inc_ctx
                 else (f" (context initialized in \"{saved_ctx_p}\" — do NOT re-run `collect_pr_context.py`)" if saved_ctx_p else "")
             )
+            target_ws = effective_repo_dir or repo_dir
             if pr_url:
-                prompt = f"Using the `quasar` skill, review {pr_url} on {effort} effort{mode_str} with --workspace-dir \"{repo_dir}\"{inc_prompt_note}"
+                prompt = f"Using the `quasar` skill, review {pr_url} on {effort} effort{mode_str} with --workspace-dir \"{target_ws}\"{inc_prompt_note}"
             else:
                 branch_part = f" branch `{branch_name}`" if branch_name else " local branch"
-                prompt = f"Using the `quasar` skill, review{branch_part} in {repo_dir} on {effort} effort{mode_str}{inc_prompt_note}"
+                prompt = f"Using the `quasar` skill, review{branch_part} in {target_ws} on {effort} effort{mode_str}{inc_prompt_note}"
             res = dispatch_to_agent(
                 prompt,
                 title="Quasar Code Review",
                 conversation_id=conv_id,
-                workspace_dir=repo_dir,
+                workspace_dir=target_ws,
                 effort=effort,
                 allow_edits=False,
             )

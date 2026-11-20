@@ -2,6 +2,15 @@
 
 All notable changes to **Quasar** are documented in this file.
 
+## [1.7.8] - 2026-11-20
+
+### Fixed
+- **Headless Reviews No Longer Soft-Deny Read-Only Shell Commands (`ls`, `cat`, `rg`, `find`, etc.)**:
+  - Moved standard read-only inspection commands (`ls`, `find`, `rg`, `grep`, `cat`, `head`, `tail`, `wc`, `diff`, `pwd`, `which`, `stat`, `sed`, `awk`, `sort`, `uniq`, `true`) into the base `allow_rules` of `dispatch_via_agy_cli` (`server.py`), `run_precompute_for_item` (`inbox_watcher.py`), and `dispatchViaAgyCli` (`extension.js`) so read-only reviews (`allow_edits=False`) don't abort with `Print mode: soft-denying tool confirmation "RunCommand"`.
+  - Updated `server.py` stream parsing to surface `soft-denying tool confirmation` errors directly in the web UI.
+- **Avoid Passing an Unrelated Local `--repo-dir` for Remote GitHub PRs (`/api/start-review`)**:
+  - Verified that `repo_dir`'s `git remote` actually matches the PR's `<owner>/<repo>` before passing `--repo-dir` (falling back to `auto_detect_repo_dir()` or GitHub snapshots), preventing a mismatch when launching `quasar <PR_URL>` from a different directory (such as `~/code/quasar`).
+
 ## [1.7.7] - 2026-11-20
 
 ### Fixed
